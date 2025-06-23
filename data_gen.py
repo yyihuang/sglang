@@ -153,6 +153,7 @@ def main():
         tp_size=8,
         context_length=65536,
         disable_cuda_graph=True,
+        disable_radix_cache=True,
     )
     sampling_params = {
         "temperature": 0,
