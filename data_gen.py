@@ -199,7 +199,9 @@ def main():
 
         tgt_hs = torch.stack(tgt_hs_list).cpu()  # (S, D)
         hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu()  # (3, S, D)
-        print("target shape ", hs.shape)
+        print("input_ids shape ", row["input_ids"].shape, hs.shape)
+        if row["input_ids"].shape[0] != hs.shape[0]:
+            continue
         buffer.append(
             {
                 "input_ids": row["input_ids"],
