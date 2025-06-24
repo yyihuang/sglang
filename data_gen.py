@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import os
 import queue
 import re
@@ -168,6 +169,7 @@ def main():
     chunk_size = 100
 
     def producer():
+        asyncio.set_event_loop(asyncio.new_event_loop())
         for idx, row in tqdm(enumerate(dataset), total=len(dataset)):
             # 推理得到 hidden_states / target_hidden_states
             outputs = llm.generate(
