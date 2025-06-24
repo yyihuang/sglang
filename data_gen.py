@@ -1,123 +1,14 @@
 import argparse
-import asyncio
 import os
+import queue
 import re
+import threading
 
 import numpy as np
 import torch
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-
-def save_chunk(buffer, outdir, chunk_idx):
-    # 转为HF datasets支持的格式
-    records = []
-    for item in buffer:
-        records.append(
-            {
-                "input_ids": item["input_ids"].tolist(),
-                "loss_mask": item["loss_mask"].tolist(),
-                "hidden_state": item["hidden_state"].float().numpy().tolist(),
-                "target_hidden_states": item["target_hidden_states"]
-                .float()
-                .numpy()
-                .tolist(),
-            }
-        )
-    ds = Dataset.from_dict({k: [rec[k] for rec in records] for k in records[0]})
-    ds.save_to_disk(f"{outdir}/chunk_{chunk_idx}")
-
-
-def run_sglang_generate_in_thread(llm, **kwargs):
-    # This function will be executed in a separate thread by asyncio.to_thread
-    # Create and set a new event loop for this thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    # sglang's generate is a sync function that internally runs an async generator,
-    # so we call it directly.
-    result = llm.generate(**kwargs)
-    return result
-
-
-async def producer(queue, dataset, llm, sampling_params):
-    for row in dataset:
-        # 推理得到 hidden_states / target_hidden_states
-        # Workaround for sglang's event loop issue:
-        # run the blocking `llm.generate` in a separate thread.
-        # Inside that thread, a new event loop is created for sglang to use.
-        outputs = await asyncio.to_thread(
-            run_sglang_generate_in_thread,
-            llm,
-            input_ids=[row["input_ids"].tolist()],
-            sampling_params=sampling_params,
-            return_hidden_states=True,
-        )
-        await queue.put((row, outputs))
-    await queue.put(None)  # Sentinel to signal completion
-
-
-async def consumer(queue, outdir, index, total_rows):
-    outdir = f"{outdir}/{index}"
-    os.makedirs(outdir, exist_ok=True)
-
-    buffer = []
-    chunk_size = 100
-    chunk_idx = 0
-
-    with tqdm(total=total_rows, desc="Processing rows") as pbar:
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-
-            row, outputs = item
-            hs_all = outputs[0]["meta_info"]["hidden_states"][
-                0
-            ]  # List of length of input_ids, each element is 4*5120 concatenated
-
-            # 每个元素是 4*5120 维度的向量
-            # 前 5120 维度是 tgt_hs，后面 3*5120 维度分成 3 份是 hs
-            hidden_dim = 5120
-            tgt_hs_list = []
-            hs_list = [[], [], []]  # 3 layers
-
-            for token_hiddens in hs_all:
-                # token_hiddens 是 4*5120 维度
-                token_hiddens = torch.tensor(token_hiddens, dtype=torch.bfloat16)
-
-                # 前 5120 维度是 tgt_hs
-                tgt_hs_list.append(token_hiddens[:hidden_dim])
-
-                # 后面 3*5120 维度分成 3 份
-                remaining = token_hiddens[hidden_dim:]
-                for i in range(3):
-                    start_idx = i * hidden_dim
-                    end_idx = (i + 1) * hidden_dim
-                    hs_list[i].append(remaining[start_idx:end_idx])
-
-            tgt_hs = torch.stack(tgt_hs_list).cpu()  # (S, D)
-            hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu()  # (3, S, D)
-            print("input_ids shape ", row["input_ids"].shape, hs.shape)
-
-            buffer.append(
-                {
-                    "input_ids": row["input_ids"],
-                    "loss_mask": row["loss_mask"],
-                    "hidden_state": hs,  # 最后一层的 hidden_state，算 logit
-                    "target_hidden_states": tgt_hs,  # hs_list = [[], [], []] 三个 hidden。 L,M,H
-                }
-            )
-
-            if len(buffer) >= chunk_size:
-                save_chunk(buffer, outdir, chunk_idx)
-                buffer.clear()
-                chunk_idx += 1
-
-            pbar.update(1)
-
-    if buffer:
-        save_chunk(buffer, outdir, chunk_idx)
 
 
 def main():
@@ -271,20 +162,104 @@ def main():
         "max_new_tokens": 0,
     }
 
-    async def run_async():
-        queue = asyncio.Queue(maxsize=10)
-        producer_task = asyncio.create_task(
-            producer(queue, dataset, llm, sampling_params)
-        )
-        consumer_task = asyncio.create_task(
-            consumer(queue, args.outdir, args.index, len(dataset))
-        )
-        await asyncio.gather(producer_task, consumer_task)
+    outdir = f"{args.outdir}/{args.index}"
+    os.makedirs(outdir, exist_ok=True)
+    data_queue = queue.Queue(maxsize=200)
+    chunk_size = 100
 
-    asyncio.run(run_async())
+    def producer():
+        for idx, row in tqdm(enumerate(dataset), total=len(dataset)):
+            # 推理得到 hidden_states / target_hidden_states
+            outputs = llm.generate(
+                input_ids=[row["input_ids"].tolist()],
+                sampling_params=sampling_params,
+                return_hidden_states=True,
+            )
+            hs_all = outputs[0]["meta_info"]["hidden_states"][
+                0
+            ]  # List of length of input_ids, each element is 4*5120 concatenated
+
+            # 每个元素是 4*5120 维度的向量
+            # 前 5120 维度是 tgt_hs，后面 3*5120 维度分成 3 份是 hs
+            hidden_dim = 5120
+            tgt_hs_list = []
+            hs_list = [[], [], []]  # 3 layers
+
+            for token_hiddens in hs_all:
+                # token_hiddens 是 4*5120 维度
+                token_hiddens = torch.tensor(token_hiddens, dtype=torch.bfloat16)
+
+                # 前 5120 维度是 tgt_hs
+                tgt_hs_list.append(token_hiddens[:hidden_dim])
+
+                # 后面 3*5120 维度分成 3 份
+                remaining = token_hiddens[hidden_dim:]
+                for i in range(3):
+                    start_idx = i * hidden_dim
+                    end_idx = (i + 1) * hidden_dim
+                    hs_list[i].append(remaining[start_idx:end_idx])
+
+            tgt_hs = torch.stack(tgt_hs_list).cpu()  # (S, D)
+            hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu()  # (3, S, D)
+            print("input_ids shape ", row["input_ids"].shape, hs.shape)
+            data_queue.put(
+                {
+                    "input_ids": row["input_ids"],
+                    "loss_mask": row["loss_mask"],
+                    "hidden_state": hs,  # 最后一层的 hidden_state，算 logit
+                    "target_hidden_states": tgt_hs,  # hs_list = [[], [], []] 三个 hidden。 L,M,H
+                }
+            )
+        data_queue.put(None)  # Signal end of production
+        print("Producer finished.")
+
+    def consumer():
+        buffer = []
+        chunk_idx = 0
+
+        def save_chunk(buf, out_dir, c_idx):
+            if not buf:
+                return
+            records = [
+                {
+                    "input_ids": item["input_ids"].tolist(),
+                    "loss_mask": item["loss_mask"].tolist(),
+                    "hidden_state": item["hidden_state"].float().numpy().tolist(),
+                    "target_hidden_states": item["target_hidden_states"]
+                    .float()
+                    .numpy()
+                    .tolist(),
+                }
+                for item in buf
+            ]
+            ds = Dataset.from_dict({k: [r[k] for r in records] for k in records[0]})
+            ds.save_to_disk(f"{out_dir}/chunk_{c_idx}")
+
+        while True:
+            item = data_queue.get()
+            if item is None:
+                break
+            buffer.append(item)
+
+            if len(buffer) >= chunk_size:
+                save_chunk(buffer, outdir, chunk_idx)
+                buffer.clear()
+                chunk_idx += 1
+
+        save_chunk(buffer, outdir, chunk_idx)
+        print("Consumer finished.")
+
+    producer_thread = threading.Thread(target=producer)
+    consumer_thread = threading.Thread(target=consumer)
+
+    producer_thread.start()
+    consumer_thread.start()
+
+    producer_thread.join()
+    consumer_thread.join()
 
     llm.shutdown()
-    print(f"✅ Done! 数据已写入 {args.outdir}/{args.index}")
+    print(f"✅ Done! 数据已写入 {outdir}")
 
 
 if __name__ == "__main__":
