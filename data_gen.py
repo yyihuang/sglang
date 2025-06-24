@@ -244,11 +244,11 @@ def main():
             buffer.append(item)
 
             if len(buffer) >= chunk_size:
-                save_chunk(buffer, outdir, chunk_idx)
+                # save_chunk(buffer, outdir, chunk_idx)
                 buffer.clear()
                 chunk_idx += 1
 
-        save_chunk(buffer, outdir, chunk_idx)
+        # save_chunk(buffer, outdir, chunk_idx)
         print("Consumer finished.")
 
     producer_thread = threading.Thread(target=producer)
@@ -258,9 +258,12 @@ def main():
     consumer_thread.start()
 
     producer_thread.join()
+
+    # Shutdown the engine as soon as the producer is done to free up GPU memory
+    llm.shutdown()
+
     consumer_thread.join()
 
-    llm.shutdown()
     print(f"✅ Done! 数据已写入 {outdir}")
 
 
