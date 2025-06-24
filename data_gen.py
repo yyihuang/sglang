@@ -29,11 +29,26 @@ def save_chunk(buffer, outdir, chunk_idx):
     ds.save_to_disk(f"{outdir}/chunk_{chunk_idx}")
 
 
+def run_sglang_generate_in_thread(llm, **kwargs):
+    # This function will be executed in a separate thread by asyncio.to_thread
+    # Create and set a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    # sglang's generate is a sync function that internally runs an async generator,
+    # so we call it directly.
+    result = llm.generate(**kwargs)
+    return result
+
+
 async def producer(queue, dataset, llm, sampling_params):
     for row in dataset:
         # 推理得到 hidden_states / target_hidden_states
+        # Workaround for sglang's event loop issue:
+        # run the blocking `llm.generate` in a separate thread.
+        # Inside that thread, a new event loop is created for sglang to use.
         outputs = await asyncio.to_thread(
-            llm.generate,
+            run_sglang_generate_in_thread,
+            llm,
             input_ids=[row["input_ids"].tolist()],
             sampling_params=sampling_params,
             return_hidden_states=True,
