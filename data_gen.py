@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import os
 import re
 
@@ -7,6 +8,101 @@ import torch
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def save_chunk(buffer, outdir, chunk_idx):
+    # 转为HF datasets支持的格式
+    records = []
+    for item in buffer:
+        records.append(
+            {
+                "input_ids": item["input_ids"].tolist(),
+                "loss_mask": item["loss_mask"].tolist(),
+                "hidden_state": item["hidden_state"].float().numpy().tolist(),
+                "target_hidden_states": item["target_hidden_states"]
+                .float()
+                .numpy()
+                .tolist(),
+            }
+        )
+    ds = Dataset.from_dict({k: [rec[k] for rec in records] for k in records[0]})
+    ds.save_to_disk(f"{outdir}/chunk_{chunk_idx}")
+
+
+async def producer(queue, dataset, llm, sampling_params):
+    for row in dataset:
+        # 推理得到 hidden_states / target_hidden_states
+        outputs = await asyncio.to_thread(
+            llm.generate,
+            input_ids=[row["input_ids"].tolist()],
+            sampling_params=sampling_params,
+            return_hidden_states=True,
+        )
+        await queue.put((row, outputs))
+    await queue.put(None)  # Sentinel to signal completion
+
+
+async def consumer(queue, outdir, index, total_rows):
+    outdir = f"{outdir}/{index}"
+    os.makedirs(outdir, exist_ok=True)
+
+    buffer = []
+    chunk_size = 100
+    chunk_idx = 0
+
+    with tqdm(total=total_rows, desc="Processing rows") as pbar:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+
+            row, outputs = item
+            hs_all = outputs[0]["meta_info"]["hidden_states"][
+                0
+            ]  # List of length of input_ids, each element is 4*5120 concatenated
+
+            # 每个元素是 4*5120 维度的向量
+            # 前 5120 维度是 tgt_hs，后面 3*5120 维度分成 3 份是 hs
+            hidden_dim = 5120
+            tgt_hs_list = []
+            hs_list = [[], [], []]  # 3 layers
+
+            for token_hiddens in hs_all:
+                # token_hiddens 是 4*5120 维度
+                token_hiddens = torch.tensor(token_hiddens, dtype=torch.bfloat16)
+
+                # 前 5120 维度是 tgt_hs
+                tgt_hs_list.append(token_hiddens[:hidden_dim])
+
+                # 后面 3*5120 维度分成 3 份
+                remaining = token_hiddens[hidden_dim:]
+                for i in range(3):
+                    start_idx = i * hidden_dim
+                    end_idx = (i + 1) * hidden_dim
+                    hs_list[i].append(remaining[start_idx:end_idx])
+
+            tgt_hs = torch.stack(tgt_hs_list).cpu()  # (S, D)
+            hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu()  # (3, S, D)
+            print("input_ids shape ", row["input_ids"].shape, hs.shape)
+
+            buffer.append(
+                {
+                    "input_ids": row["input_ids"],
+                    "loss_mask": row["loss_mask"],
+                    "hidden_state": hs,  # 最后一层的 hidden_state，算 logit
+                    "target_hidden_states": tgt_hs,  # hs_list = [[], [], []] 三个 hidden。 L,M,H
+                }
+            )
+
+            if len(buffer) >= chunk_size:
+                save_chunk(buffer, outdir, chunk_idx)
+                buffer.clear()
+                chunk_idx += 1
+
+            pbar.update(1)
+
+    if buffer:
+        save_chunk(buffer, outdir, chunk_idx)
 
 
 def main():
@@ -160,95 +256,20 @@ def main():
         "max_new_tokens": 0,
     }
 
-    outdir = f"{args.outdir}/{args.index}"
-    os.makedirs(outdir, exist_ok=True)
-
-    buffer = []
-    chunk_size = 100
-    chunk_idx = 0
-
-    for idx, row in tqdm(enumerate(dataset), total=len(dataset)):
-        # 推理得到 hidden_states / target_hidden_states
-        outputs = llm.generate(
-            input_ids=[row["input_ids"].tolist()],
-            sampling_params=sampling_params,
-            return_hidden_states=True,
+    async def run_async():
+        queue = asyncio.Queue(maxsize=10)
+        producer_task = asyncio.create_task(
+            producer(queue, dataset, llm, sampling_params)
         )
-        hs_all = outputs[0]["meta_info"]["hidden_states"][
-            0
-        ]  # List of length of input_ids, each element is 4*5120 concatenated
-
-        # 每个元素是 4*5120 维度的向量
-        # 前 5120 维度是 tgt_hs，后面 3*5120 维度分成 3 份是 hs
-        hidden_dim = 5120
-        tgt_hs_list = []
-        hs_list = [[], [], []]  # 3 layers
-
-        for token_hiddens in hs_all:
-            # token_hiddens 是 4*5120 维度
-            token_hiddens = torch.tensor(token_hiddens, dtype=torch.bfloat16)
-
-            # 前 5120 维度是 tgt_hs
-            tgt_hs_list.append(token_hiddens[:hidden_dim])
-
-            # 后面 3*5120 维度分成 3 份
-            remaining = token_hiddens[hidden_dim:]
-            for i in range(3):
-                start_idx = i * hidden_dim
-                end_idx = (i + 1) * hidden_dim
-                hs_list[i].append(remaining[start_idx:end_idx])
-
-        tgt_hs = torch.stack(tgt_hs_list).cpu()  # (S, D)
-        hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu()  # (3, S, D)
-        print("input_ids shape ", row["input_ids"].shape, hs.shape)
-        buffer.append(
-            {
-                "input_ids": row["input_ids"],
-                "loss_mask": row["loss_mask"],
-                "hidden_state": hs,  # 最后一层的 hidden_state，算 logit
-                "target_hidden_states": tgt_hs,  # hs_list = [[], [], []] 三个 hidden。 L,M,H
-            }
+        consumer_task = asyncio.create_task(
+            consumer(queue, args.outdir, args.index, len(dataset))
         )
+        await asyncio.gather(producer_task, consumer_task)
 
-        if len(buffer) >= chunk_size:
-            # 转为HF datasets支持的格式
-            records = []
-            for item in buffer:
-                records.append(
-                    {
-                        "input_ids": item["input_ids"].tolist(),
-                        "loss_mask": item["loss_mask"].tolist(),
-                        "hidden_state": item["hidden_state"].float().numpy().tolist(),
-                        "target_hidden_states": item["target_hidden_states"]
-                        .float()
-                        .numpy()
-                        .tolist(),
-                    }
-                )
-            ds = Dataset.from_dict({k: [rec[k] for rec in records] for k in records[0]})
-            ds.save_to_disk(f"{outdir}/chunk_{chunk_idx}")
-            buffer.clear()
-            chunk_idx += 1
-
-    if buffer:
-        records = []
-        for item in buffer:
-            records.append(
-                {
-                    "input_ids": item["input_ids"].tolist(),
-                    "loss_mask": item["loss_mask"].tolist(),
-                    "hidden_state": item["hidden_state"].float().numpy().tolist(),
-                    "target_hidden_states": item["target_hidden_states"]
-                    .float()
-                    .numpy()
-                    .tolist(),
-                }
-            )
-        ds = Dataset.from_dict({k: [rec[k] for rec in records] for k in records[0]})
-        ds.save_to_disk(f"{outdir}/chunk_{chunk_idx}")
+    asyncio.run(run_async())
 
     llm.shutdown()
-    print(f"✅ Done! 数据已写入 {outdir}")
+    print(f"✅ Done! 数据已写入 {args.outdir}/{args.index}")
 
 
 if __name__ == "__main__":
