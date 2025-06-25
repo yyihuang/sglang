@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 def main():
     parser = argparse.ArgumentParser(description="sglang data gen")
     parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--end", type=int, default=2)
+    parser.add_argument("--end", type=int, default=10)
     parser.add_argument("--index", type=int, default=1)
     parser.add_argument("--gpu_index", type=int, nargs="+", default=list(range(8)))
     parser.add_argument("--outdir", type=str, default="/root/.cache/hidden_states_dump")
@@ -208,6 +208,8 @@ def main():
 
         await data_queue.put(None)  # Signal end of production
         print("Producer finished.")
+        llm_engine.shutdown()
+        print("LLM shutdown")
 
     def save_chunk_sync(buf, out_dir, c_idx):
         """Synchronous function to save a chunk of data to disk."""
@@ -279,7 +281,6 @@ def main():
         await producer_task
         await consumer_task
 
-        llm.shutdown()
         print(f"✅ Done! 数据已写入 {outdir}")
 
     asyncio.run(async_main())
