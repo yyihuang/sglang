@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 def main():
     parser = argparse.ArgumentParser(description="sglang data gen")
     parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--end", type=int, default=10)
+    parser.add_argument("--end", type=int, default=20)
     parser.add_argument("--index", type=int, default=1)
     parser.add_argument("--gpu_index", type=int, nargs="+", default=list(range(8)))
     parser.add_argument("--outdir", type=str, default="/root/.cache/hidden_states_dump")
@@ -174,8 +174,12 @@ def main():
             # Process outputs and put them in the queue
             for i in range(len(outputs)):
                 output_row = outputs[i]
+                # print("output_row: ", output_row)
                 input_row = batch_rows[i]
                 hs_all = output_row["meta_info"]["hidden_states"][0]
+
+                if not hs_all:
+                    continue
 
                 hidden_dim = 5120
                 tgt_hs_list = []
