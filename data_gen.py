@@ -149,123 +149,147 @@ def main():
     # ------------------------ 3. Compute hidden states ------------------------
     import sglang as sgl
 
-    llm = sgl.Engine(
-        model_path=args.model_name,
-        skip_tokenizer_init=True,
-        enable_return_hidden_states=True,
-        tp_size=8,
-        context_length=65536,
-        disable_cuda_graph=True,
-        disable_radix_cache=True,
-    )
-    sampling_params = {
-        "temperature": 0,
-        "max_new_tokens": 0,
-    }
-
-    outdir = f"{args.outdir}/{args.index}"
-    os.makedirs(outdir, exist_ok=True)
-    data_queue = queue.Queue(maxsize=200)
+    # Batching is crucial for performance. This will make the producer much faster.
+    producer_batch_size = 16
     chunk_size = 100
 
-    def producer():
-        asyncio.set_event_loop(asyncio.new_event_loop())
+    async def producer(data_queue, llm_engine, sampling_params):
+        batch_input_ids = []
+        batch_rows = []
+
         for idx, row in tqdm(enumerate(dataset), total=len(dataset)):
-            # 推理得到 hidden_states / target_hidden_states
-            outputs = llm.generate(
-                input_ids=[row["input_ids"].tolist()],
+            batch_input_ids.append(row["input_ids"].tolist())
+            batch_rows.append(row)
+
+            if len(batch_input_ids) < producer_batch_size and idx < len(dataset) - 1:
+                continue
+
+            # Process the batch asynchronously
+            outputs = await llm_engine.async_generate(
+                input_ids=batch_input_ids,
                 sampling_params=sampling_params,
                 return_hidden_states=True,
             )
-            hs_all = outputs[0]["meta_info"]["hidden_states"][
-                0
-            ]  # List of length of input_ids, each element is 4*5120 concatenated
 
-            # 每个元素是 4*5120 维度的向量
-            # 前 5120 维度是 tgt_hs，后面 3*5120 维度分成 3 份是 hs
-            hidden_dim = 5120
-            tgt_hs_list = []
-            hs_list = [[], [], []]  # 3 layers
+            # Process outputs and put them in the queue
+            for i in range(len(outputs)):
+                output_row = outputs[i]
+                input_row = batch_rows[i]
+                hs_all = output_row["meta_info"]["hidden_states"][0]
 
-            for token_hiddens in hs_all:
-                # token_hiddens 是 4*5120 维度
-                token_hiddens = torch.tensor(token_hiddens, dtype=torch.bfloat16)
+                hidden_dim = 5120
+                tgt_hs_list = []
+                hs_list = [[], [], []]
 
-                # 前 5120 维度是 tgt_hs
-                tgt_hs_list.append(token_hiddens[:hidden_dim])
+                for token_hiddens in hs_all:
+                    token_hiddens = torch.tensor(token_hiddens, dtype=torch.bfloat16)
+                    tgt_hs_list.append(token_hiddens[:hidden_dim])
+                    remaining = token_hiddens[hidden_dim:]
+                    for j in range(3):
+                        start_idx = j * hidden_dim
+                        end_idx = (j + 1) * hidden_dim
+                        hs_list[j].append(remaining[start_idx:end_idx])
 
-                # 后面 3*5120 维度分成 3 份
-                remaining = token_hiddens[hidden_dim:]
-                for i in range(3):
-                    start_idx = i * hidden_dim
-                    end_idx = (i + 1) * hidden_dim
-                    hs_list[i].append(remaining[start_idx:end_idx])
+                tgt_hs = torch.stack(tgt_hs_list).cpu()
+                hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu() # (3, S, D)
 
-            tgt_hs = torch.stack(tgt_hs_list).cpu()  # (S, D)
-            hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu()  # (3, S, D)
-            print("input_ids shape ", row["input_ids"].shape, hs.shape)
-            data_queue.put(
-                {
-                    "input_ids": row["input_ids"],
-                    "loss_mask": row["loss_mask"],
-                    "hidden_state": hs,  # 最后一层的 hidden_state，算 logit
-                    "target_hidden_states": tgt_hs,  # hs_list = [[], [], []] 三个 hidden。 L,M,H
-                }
-            )
-        data_queue.put(None)  # Signal end of production
+                await data_queue.put(
+                    {
+                        "input_ids": input_row["input_ids"],
+                        "loss_mask": input_row["loss_mask"],
+                        "hidden_state": hs,
+                        "target_hidden_states": tgt_hs,
+                    }
+                )
+
+            # Clear batch
+            batch_input_ids.clear()
+            batch_rows.clear()
+
+        await data_queue.put(None)  # Signal end of production
         print("Producer finished.")
 
-    def consumer():
+    def save_chunk_sync(buf, out_dir, c_idx):
+        """Synchronous function to save a chunk of data to disk."""
+        if not buf:
+            return
+        print(f"Saving chunk {c_idx} with {len(buf)} records...")
+        records = [
+            {
+                "input_ids": item["input_ids"].tolist(),
+                "loss_mask": item["loss_mask"].tolist(),
+                "hidden_state": item["hidden_state"].float().numpy().tolist(),
+                "target_hidden_states": item["target_hidden_states"]
+                .float()
+                .numpy()
+                .tolist(),
+            }
+            for item in buf
+        ]
+        ds = Dataset.from_dict({k: [r[k] for r in records] for k in records[0]})
+        ds.save_to_disk(f"{out_dir}/chunk_{c_idx}")
+        print(f"Finished saving chunk {c_idx}.")
+
+    async def consumer(data_queue, outdir):
         buffer = []
         chunk_idx = 0
 
-        def save_chunk(buf, out_dir, c_idx):
-            if not buf:
-                return
-            records = [
-                {
-                    "input_ids": item["input_ids"].tolist(),
-                    "loss_mask": item["loss_mask"].tolist(),
-                    "hidden_state": item["hidden_state"].float().numpy().tolist(),
-                    "target_hidden_states": item["target_hidden_states"]
-                    .float()
-                    .numpy()
-                    .tolist(),
-                }
-                for item in buf
-            ]
-            ds = Dataset.from_dict({k: [r[k] for r in records] for k in records[0]})
-            ds.save_to_disk(f"{out_dir}/chunk_{c_idx}")
-
         while True:
-            item = data_queue.get()
+            item = await data_queue.get()
             if item is None:
                 break
             buffer.append(item)
 
             if len(buffer) >= chunk_size:
-                # save_chunk(buffer, outdir, chunk_idx)
+                # Run the synchronous, blocking IO in a separate thread
+                await asyncio.to_thread(save_chunk_sync, buffer, outdir, chunk_idx)
                 buffer.clear()
                 chunk_idx += 1
 
-        # save_chunk(buffer, outdir, chunk_idx)
+        # Save any remaining items in the buffer
+        if buffer:
+            await asyncio.to_thread(save_chunk_sync, buffer, outdir, chunk_idx)
         print("Consumer finished.")
 
-    producer_thread = threading.Thread(target=producer)
-    consumer_thread = threading.Thread(target=consumer)
+    async def async_main():
+        llm = sgl.Engine(
+            model_path=args.model_name,
+            skip_tokenizer_init=True,
+            enable_return_hidden_states=True,
+            tp_size=8,
+            context_length=65536,
+            disable_cuda_graph=True,
+            disable_radix_cache=True,
+        )
+        sampling_params = {
+            "temperature": 0,
+            "max_new_tokens": 0,
+        }
 
-    producer_thread.start()
-    consumer_thread.start()
+        outdir = f"{args.outdir}/{args.index}"
+        os.makedirs(outdir, exist_ok=True)
+        data_queue = asyncio.Queue(maxsize=200)
 
-    producer_thread.join()
+        # Run producer and consumer concurrently
+        producer_task = asyncio.create_task(
+            producer(data_queue, llm, sampling_params)
+        )
+        consumer_task = asyncio.create_task(consumer(data_queue, outdir))
 
-    # Shutdown the engine as soon as the producer is done to free up GPU memory
-    llm.shutdown()
+        await producer_task
+        await consumer_task
 
-    consumer_thread.join()
+        llm.shutdown()
+        print(f"✅ Done! 数据已写入 {outdir}")
 
-    print(f"✅ Done! 数据已写入 {outdir}")
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
+    # uvloop can provide better performance if installed
+    # try:
+    #     import uvloop
+    #     uvloop.install()
+    # except ImportError:
+    #     pass
     main()
