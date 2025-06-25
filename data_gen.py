@@ -28,6 +28,12 @@ def main():
         choices=["sharegpt", "ultrachat", "mixture_of_thoughts"],
         default="sharegpt",
     )
+    parser.add_argument(
+        "--num-consumers",
+        type=int,
+        default=4,
+        help="Number of consumer workers for saving data.",
+    )
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_index))
@@ -153,7 +159,7 @@ def main():
     producer_batch_size = 16
     chunk_size = 100
 
-    async def producer(data_queue, llm_engine, sampling_params):
+    async def producer(data_queue, llm_engine, sampling_params, num_consumers):
         batch_input_ids = []
         batch_rows = []
 
@@ -210,7 +216,8 @@ def main():
             batch_input_ids.clear()
             batch_rows.clear()
 
-        await data_queue.put(None)  # Signal end of production
+        for _ in range(num_consumers):
+            await data_queue.put(None)  # Signal end of production
         print("Producer finished.")
         llm_engine.shutdown()
         print("LLM shutdown")
@@ -236,7 +243,7 @@ def main():
         ds.save_to_disk(f"{out_dir}/chunk_{c_idx}")
         print(f"Finished saving chunk {c_idx}.")
 
-    async def consumer(data_queue, outdir):
+    async def consumer(worker_id, data_queue, outdir):
         buffer = []
         chunk_idx = 0
 
@@ -248,14 +255,16 @@ def main():
 
             if len(buffer) >= chunk_size:
                 # Run the synchronous, blocking IO in a separate thread
-                await asyncio.to_thread(save_chunk_sync, buffer, outdir, chunk_idx)
+                file_chunk_idx = f"{worker_id}_{chunk_idx}"
+                await asyncio.to_thread(save_chunk_sync, buffer, outdir, file_chunk_idx)
                 buffer.clear()
                 chunk_idx += 1
 
         # Save any remaining items in the buffer
         if buffer:
-            await asyncio.to_thread(save_chunk_sync, buffer, outdir, chunk_idx)
-        print("Consumer finished.")
+            file_chunk_idx = f"{worker_id}_{chunk_idx}"
+            await asyncio.to_thread(save_chunk_sync, buffer, outdir, file_chunk_idx)
+        print(f"Consumer {worker_id} finished.")
 
     async def async_main():
         llm = sgl.Engine(
@@ -275,17 +284,21 @@ def main():
         outdir = f"{args.outdir}/{args.index}"
         os.makedirs(outdir, exist_ok=True)
         data_queue = asyncio.Queue(maxsize=200)
+        num_consumers = args.num_consumers
 
         # Run producer and consumer concurrently
         producer_task = asyncio.create_task(
-            producer(data_queue, llm, sampling_params)
+            producer(data_queue, llm, sampling_params, num_consumers)
         )
-        consumer_task = asyncio.create_task(consumer(data_queue, outdir))
+        consumer_tasks = [
+            asyncio.create_task(consumer(i, data_queue, outdir))
+            for i in range(num_consumers)
+        ]
 
         await producer_task
-        await consumer_task
+        await asyncio.gather(*consumer_tasks)
 
-        print(f"✅ Done! 数据已写入 {outdir}")
+        print(f"✅ Done! Data has been written to {outdir}")
 
     asyncio.run(async_main())
 
