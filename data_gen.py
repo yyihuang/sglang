@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 def main():
     parser = argparse.ArgumentParser(description="sglang data gen")
     parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--end", type=int, default=20)
+    parser.add_argument("--end", type=int, default=100)
     parser.add_argument("--index", type=int, default=1)
     parser.add_argument("--gpu_index", type=int, nargs="+", default=list(range(8)))
     parser.add_argument("--outdir", type=str, default="/root/.cache/hidden_states_dump")
@@ -157,7 +157,7 @@ def main():
 
     # Batching is crucial for performance. This will make the producer much faster.
     producer_batch_size = 16
-    chunk_size = 100
+    chunk_size = 10
 
     async def producer(data_queue, llm_engine, sampling_params, num_consumers):
         batch_input_ids = []
