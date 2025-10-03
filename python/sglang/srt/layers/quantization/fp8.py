@@ -83,6 +83,11 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 
+try:
+    from tmp_trace.fused_moe_dump import log_fused_moe_inputs
+except ImportError:
+    log_fused_moe_inputs = None
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -1141,8 +1146,46 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else topk_config.correction_bias.to(x.dtype)
         )
 
+        # print("ep rank:", layer.moe_ep_rank)
+        # print("router_logits shape:", router_logits.shape)
+        # print(
+        #     "correction_bias shape:",
+        #     None if correction_bias is None else correction_bias.shape,
+        # )
+        # print("a_q (hidden_states) shape:", a_q.shape)
+        # print("a_sf_t (hidden_states_scale) shape:", a_sf_t.shape)
+        # print("gemm1_weights shape:", layer.w13_weight.shape)
+        # print("gemm1_weights_scale shape:", layer.w13_weight_scale_inv.shape)
+        # print("gemm2_weights shape:", layer.w2_weight.shape)
+        # print("gemm2_weights_scale shape:", layer.w2_weight_scale_inv.shape)
+        # print("num_experts:", layer.num_experts)
+        # print("intermediate_size:", layer.w2_weight.shape[2])
+        local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
+        effective_routed_scaling_factor = (
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0
+        )
+        routing_logits_fp32 = router_logits.to(torch.float32)
+
+        # print("local_expert_offset:", local_expert_offset)
+        # print("local_num_experts:", layer.num_local_experts)
+
+        if log_fused_moe_inputs is not None:
+            try:
+                log_fused_moe_inputs(
+                    routing_logits=routing_logits_fp32,
+                    hidden_states=a_q,
+                    hidden_states_scale=a_sf_t,
+                    routing_bias=correction_bias,
+                    local_expert_offset=local_expert_offset,
+                    routed_scaling_factor=effective_routed_scaling_factor,
+                )
+            except Exception as err:
+                print_warning_once(
+                    f"Failed to log fused MoE inputs for seq {routing_logits_fp32.shape[0]}: {err}"
+                )
+
         return trtllm_fp8_block_scale_moe(
-            routing_logits=router_logits.to(torch.float32),
+            routing_logits=routing_logits_fp32,
             routing_bias=correction_bias,
             hidden_states=a_q,
             hidden_states_scale=a_sf_t,
@@ -1155,11 +1198,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             n_group=topk_config.num_expert_group,
             topk_group=topk_config.topk_group,
             intermediate_size=layer.w2_weight.shape[2],
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            local_expert_offset=local_expert_offset,
             local_num_experts=layer.num_local_experts,
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
+            routed_scaling_factor=effective_routed_scaling_factor,
             tile_tokens_dim=get_tile_tokens_dim(
                 x.shape[0], topk_config.top_k, layer.num_experts
             ),
