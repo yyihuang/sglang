@@ -16,7 +16,7 @@ Usage:
 
 Arguments:
 --model: Model type to use (llama, deepseek, or qwen). This determines the TP configuration and model path.
---batch-size: Batch size (1, 2, 4, 8, 16, 32, 64, or 128).
+--batch-size: Batch size (1, 2, 4, 8, 16, 32, 64, or 128). (1,16,64)
 --ragged: Enable ragged batching (adds --disable-radix-cache to server args).
 """
 
@@ -122,8 +122,6 @@ def run_benchmark(
     base_url: str,
     prompts: list,
     batch_size: int,
-    top_p: float = None,
-    top_k: int = None,
     label: str = "",
 ) -> list:
     """Run benchmark with given prompts and return results."""
@@ -142,6 +140,7 @@ def run_benchmark(
             random_range_ratio=None,
             output_file=None,
             output_details=False,
+            warmup_requests=1,
         )
     )
 
@@ -155,10 +154,9 @@ def run_benchmark(
         ]
 
         extra_request_body = {}
-        if top_p is not None:
-            extra_request_body["top_p"] = top_p
-        if top_k is not None:
-            extra_request_body["top_k"] = top_k
+        extra_request_body["timestamp"] = time.time()
+
+
 
         log(f"Running batch {i + 1}/{num_batches} with {len(input_requests)} prompts")
         results = asyncio.run(
@@ -254,8 +252,8 @@ Examples:
         log("Using auto TP size")
 
     # Add attention backend if supported
-    if model_config["use_flashinfer"]:
-        server_args.extend(["--attention-backend", "flashinfer"])
+    # if model_config["use_flashinfer"]:
+    #     server_args.extend(["--attention-backend", "flashinfer"])
 
     # Add fused_moe arguments for deepseek
     if model_config["moe_backend"] is not None:
@@ -280,17 +278,15 @@ Examples:
 
     try:
         for batch_size in batch_sizes:
-            top_p = None
-            top_k = None
 
             log(
-                f"Running benchmark with batch size {batch_size}, top_p {top_p}, top_k {top_k}"
+                f"Running benchmark with batch size {batch_size}"
             )
             results = run_benchmark(
-                base_url, prompts[:batch_size], batch_size, top_p=top_p, top_k=top_k
+                base_url, prompts[:batch_size], batch_size
             )
             log(
-                f"Completed benchmark for batch size {batch_size}, top_p {top_p}, top_k {top_k}"
+                f"Completed benchmark for batch size {batch_size}"
             )
 
     except Exception as e:
