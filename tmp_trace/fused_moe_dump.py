@@ -23,7 +23,7 @@ def log_fused_moe_inputs(
     hidden_states_scale: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     local_expert_offset: int,
-    routed_scaling_factor: Optional[float] = None,
+    routed_scaling_factor: float,
 ) -> Tuple[str, dict]:
     seq_len = routing_logits.shape[0]
     definition_name = "fused_moe_n" + str(seq_len)

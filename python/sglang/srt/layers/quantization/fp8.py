@@ -1019,7 +1019,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -1180,12 +1179,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     routed_scaling_factor=effective_routed_scaling_factor,
                 )
             except Exception as err:
-                print_warning_once(
-                    f"Failed to log fused MoE inputs for seq {routing_logits_fp32.shape[0]}: {err}"
+                logger.exception(
+                    "Failed to log fused MoE inputs for seq %s", routing_logits_fp32.shape[0]
                 )
 
         return trtllm_fp8_block_scale_moe(
-            routing_logits=routing_logits_fp32,
+            routing_logits=router_logits.to(torch.float32),
             routing_bias=correction_bias,
             hidden_states=a_q,
             hidden_states_scale=a_sf_t,
@@ -1198,9 +1197,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             n_group=topk_config.num_expert_group,
             topk_group=topk_config.topk_group,
             intermediate_size=layer.w2_weight.shape[2],
-            local_expert_offset=local_expert_offset,
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=layer.num_local_experts,
-            routed_scaling_factor=effective_routed_scaling_factor,
+            routed_scaling_factor=(
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            ),
             tile_tokens_dim=get_tile_tokens_dim(
                 x.shape[0], topk_config.top_k, layer.num_experts
             ),
