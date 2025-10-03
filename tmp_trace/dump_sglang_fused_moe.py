@@ -20,23 +20,24 @@ Arguments:
 --ragged: Enable ragged batching (adds --disable-radix-cache to server args).
 """
 
-import os
-import json
-import time
-import asyncio
 import argparse
+import asyncio
+import json
 import math
+import os
 import sys
+import time
 from dataclasses import dataclass
-from typing import Optional, List
-from datasets import load_dataset
 from types import SimpleNamespace
+from typing import List, Optional
+
+from datasets import load_dataset
 
 from sglang.bench_serving import benchmark, set_global_args
 from sglang.test.test_utils import (
-    popen_launch_server,
-    kill_process_tree,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    kill_process_tree,
+    popen_launch_server,
 )
 
 

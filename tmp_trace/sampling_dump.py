@@ -1,12 +1,15 @@
+import json
 import os
 import uuid
-import json
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
+
 import torch
 
-WORKLOAD_LOG_DIR = # TO_ADD_YOUR_PATH
+WORKLOAD_LOG_DIR = "tmp_trace/dump_results_sampling"
 os.makedirs(WORKLOAD_LOG_DIR, exist_ok=True)
 from safetensors.torch import save_file
+
+
 def dump_safetensors_tensor_group(tensors: dict, prefix: str):
     file_id = uuid.uuid4().hex
     file_path = os.path.join(WORKLOAD_LOG_DIR, f"{prefix}_{file_id}.safetensors")
@@ -14,7 +17,11 @@ def dump_safetensors_tensor_group(tensors: dict, prefix: str):
     return file_path, {k: k for k in tensors}
 
 
-def log_sampling(logits: torch.Tensor, top_ks: Optional[List[int]] = None, top_ps: Optional[List[float]] = None) -> Tuple[str, dict]:
+def log_sampling(
+    logits: torch.Tensor,
+    top_ks: Optional[List[int]] = None,
+    top_ps: Optional[List[float]] = None,
+) -> Tuple[str, dict]:
     definition_name = "sampling_from_probs_v" + str(logits.shape[1])
     bs = logits.shape[0]
 
@@ -26,7 +33,7 @@ def log_sampling(logits: torch.Tensor, top_ks: Optional[List[int]] = None, top_p
             "tensor_key": None,
         }
     }
-    
+
     if top_ps is not None:
         p_val = top_ps[0]
         tensor_dict["top_p"] = torch.full((bs,), float(p_val), dtype=torch.float32)
@@ -47,7 +54,9 @@ def log_sampling(logits: torch.Tensor, top_ks: Optional[List[int]] = None, top_p
         definition_name = "top_k_" + definition_name
 
     log_file = f"{definition_name}.jsonl"
-    kv_tensor_file, tensor_keys = dump_safetensors_tensor_group(tensor_dict, prefix=definition_name)
+    kv_tensor_file, tensor_keys = dump_safetensors_tensor_group(
+        tensor_dict, prefix=definition_name
+    )
 
     # Fill in paths and tensorKeys
     for k in tensor_dict.keys():
@@ -64,7 +73,7 @@ def log_sampling(logits: torch.Tensor, top_ks: Optional[List[int]] = None, top_p
             },
             "inputs": inputs_json,
         },
-        "evaluation": None
+        "evaluation": None,
     }
 
     os.makedirs(WORKLOAD_LOG_DIR, exist_ok=True)
@@ -74,6 +83,5 @@ def log_sampling(logits: torch.Tensor, top_ks: Optional[List[int]] = None, top_p
 
     return path, log_entry
 
+
 # later in Sampler class, add log_sampling(logits=logits, top_ks=sampling_info.top_ks, top_ps=sampling_info.top_ps) in forward function
-
-

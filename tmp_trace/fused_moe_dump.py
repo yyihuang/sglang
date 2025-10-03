@@ -1,7 +1,7 @@
+import json
 import os
 import uuid
-import json
-from typing import Optional, Tuple, Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 from safetensors.torch import save_file
@@ -66,9 +66,9 @@ def log_fused_moe_inputs(
 
     inputs_json["routed_scaling_factor"] = {
         "type": "scalar",
-        "value": None
-        if routed_scaling_factor is None
-        else float(routed_scaling_factor),
+        "value": (
+            None if routed_scaling_factor is None else float(routed_scaling_factor)
+        ),
     }
 
     log_entry = {
