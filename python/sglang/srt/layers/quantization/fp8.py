@@ -88,6 +88,7 @@ try:
 except ImportError:
     log_fused_moe_inputs = None
 
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -1019,6 +1020,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -1144,21 +1146,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if topk_config.correction_bias is None
             else topk_config.correction_bias.to(x.dtype)
         )
-
-        # print("ep rank:", layer.moe_ep_rank)
-        # print("router_logits shape:", router_logits.shape)
-        # print(
-        #     "correction_bias shape:",
-        #     None if correction_bias is None else correction_bias.shape,
-        # )
-        # print("a_q (hidden_states) shape:", a_q.shape)
-        # print("a_sf_t (hidden_states_scale) shape:", a_sf_t.shape)
-        # print("gemm1_weights shape:", layer.w13_weight.shape)
-        # print("gemm1_weights_scale shape:", layer.w13_weight_scale_inv.shape)
-        # print("gemm2_weights shape:", layer.w2_weight.shape)
-        # print("gemm2_weights_scale shape:", layer.w2_weight_scale_inv.shape)
-        # print("num_experts:", layer.num_experts)
-        # print("intermediate_size:", layer.w2_weight.shape[2])
+        
         local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
         effective_routed_scaling_factor = (
             routed_scaling_factor if routed_scaling_factor is not None else 1.0
@@ -1172,9 +1160,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             try:
                 log_fused_moe_inputs(
                     routing_logits=routing_logits_fp32,
+                    routing_bias=correction_bias,
                     hidden_states=a_q,
                     hidden_states_scale=a_sf_t,
-                    routing_bias=correction_bias,
+                    gemm1_weights=layer.w13_weight,
+                    gemm1_weights_scale=layer.w13_weight_scale_inv,
+                    gemm2_weights=layer.w2_weight,
+                    gemm2_weights_scale=layer.w2_weight_scale_inv,
                     local_expert_offset=local_expert_offset,
                     routed_scaling_factor=effective_routed_scaling_factor,
                 )

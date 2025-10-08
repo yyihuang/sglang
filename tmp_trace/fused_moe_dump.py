@@ -6,7 +6,9 @@ from typing import Dict, Optional, Tuple
 import torch
 from safetensors.torch import save_file
 
-WORKLOAD_LOG_DIR = "/raid/user_data/YOUR_ID/fused_moe/"
+YOUR_ID = "yiyanz"
+
+WORKLOAD_LOG_DIR = f"/raid/user_data/{YOUR_ID}/fused_moe/"
 os.makedirs(WORKLOAD_LOG_DIR, exist_ok=True)
 
 def dump_safetensors_tensor_group(tensors: Dict[str, torch.Tensor], prefix: str):
@@ -14,7 +16,6 @@ def dump_safetensors_tensor_group(tensors: Dict[str, torch.Tensor], prefix: str)
     file_path = os.path.join(WORKLOAD_LOG_DIR, f"{prefix}_{file_id}.safetensors")
     save_file(tensors, file_path)
     return file_path, {k: k for k in tensors}
-
 
 def log_fused_moe_inputs(
     routing_logits: torch.Tensor,
