@@ -38,6 +38,12 @@ from sglang.srt.utils import (
     is_hip,
 )
 
+try:
+    from tmp_trace.fp8gemm_dump import log_fp8_gemm_inputs
+except ImportError:
+    log_fp8_gemm_inputs = None
+
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -561,6 +567,15 @@ def apply_fp8_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
+
+    log_fp8_gemm_inputs(
+        A=input_2d,
+        B=weight,
+        A_scale=input_scale,
+        B_scale=weight_scale
+    )
+
+    # print(f"input_2d shape: {input_2d.shape}, weight shape: {weight.shape}, weight_scale shape: {weight_scale.shape}, input_scale shape: {input_scale.shape if input_scale is not None else None}, input_scale_ub shape: {input_scale_ub.shape if input_scale_ub is not None else None}, bias shape: {bias.shape if bias is not None else None}, cutlass_fp8_supported: {cutlass_fp8_supported}, use_per_token_if_dynamic: {use_per_token_if_dynamic}, pad_output: {pad_output}, output_padding: {output_padding}, compressed_tensor_quant: {compressed_tensor_quant}")
 
     if compressed_tensor_quant:
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
