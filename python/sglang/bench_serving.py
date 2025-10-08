@@ -1742,7 +1742,7 @@ async def benchmark(
             lora_name=lora_name,
             image_data=request.image_data,
             extra_request_body=extra_request_body,
-            timestamp=request.timestamp,
+            # timestamp=request.timestamp,
         )
 
         tasks.append(
