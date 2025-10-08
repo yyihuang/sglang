@@ -154,9 +154,7 @@ def run_benchmark(
         ]
 
         extra_request_body = {}
-        extra_request_body["timestamp"] = time.time()
-
-
+        # extra_request_body["timestamp"] = time.time()
 
         log(f"Running batch {i + 1}/{num_batches} with {len(input_requests)} prompts")
         results = asyncio.run(
@@ -216,8 +214,8 @@ Examples:
 
     # Get model configuration
     model_config = get_model_config(args.model)
-    # batch_sizes = [1, 16, 64]
-    batch_sizes = [args.batch_size]
+    batch_sizes = [1, 16, 64]
+    # batch_sizes = [args.batch_size]
     num_batches = 1
     num_prompts = 64
     base_url = "http://127.0.0.1:20000"
