@@ -2000,6 +2000,8 @@ class ModelRunner:
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
+        
+
         if self.piecewise_cuda_graph_runner is not None:
             if self.piecewise_cuda_graph_runner.can_run(forward_batch):
                 return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)

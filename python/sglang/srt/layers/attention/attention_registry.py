@@ -20,6 +20,13 @@ def register_attention_backend(name):
     return decorator
 
 
+@register_attention_backend("mirage")
+def create_mirage_backend(runner):
+    from sglang.srt.layers.attention.mirage_backend import MirageAttentionBackend
+
+    return MirageAttentionBackend(runner)
+
+
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
     import torch
