@@ -958,6 +958,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             def_name,
         )
         safetensor_dump_path = safetensor_dump_path_prefix + f"_{workload_uuid}.safetensors"
+        # Set the fake_tensor_dump_path to a formatted fake path matching the given spec
+        # Template: "./blob/workloads/{def_name}/{def_name}_{workload_uuid}.safetensors"
+        fake_tensor_dump_path = f"./blob/workloads/gdn/{def_name}_{workload_uuid}.safetensors"
 
         try:
             import safetensors.torch
@@ -974,16 +977,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "uuid": workload_uuid,
                     "axes": variable_axes,
                     "inputs": {
-                        "q": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "q"},
-                        "k": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "k"},
-                        "v": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "v"},
-                        "state": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "state"},
-                        "A_log": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "A_log"},
-                        "a": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "a"},
-                        "dt_bias": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "dt_bias"},
-                        "b": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "b"},
-                        "scale": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "scale"},
-                        "cu_seqlens": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "cu_seqlens"},
+                        "q": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "q"},
+                        "k": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "k"},
+                        "v": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "v"},
+                        "state": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "state"},
+                        "A_log": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "A_log"},
+                        "a": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "a"},
+                        "dt_bias": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "dt_bias"},
+                        "b": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "b"},
+                        "scale": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "scale"},
+                        "cu_seqlens": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "cu_seqlens"},
                     },
                 },
                 "evaluation": None,
@@ -997,16 +1000,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "uuid": workload_uuid,
                     "axes": variable_axes,
                     "inputs": {
-                        "q": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "q"},
-                        "k": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "k"},
-                        "v": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "v"},
-                        "state": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "state"},
-                        "A_log": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "A_log"},
-                        "a": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "a"},
-                        "dt_bias": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "dt_bias"},
-                        "b": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "b"},
-                        "scale": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "scale"},
-                        "cu_seqlens": {"type": "safetensors", "path": safetensor_dump_path, "tensor_key": "cu_seqlens"},
+                        "q": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "q"},
+                        "k": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "k"},
+                        "v": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "v"},
+                        "state": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "state"},
+                        "A_log": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "A_log"},
+                        "a": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "a"},
+                        "dt_bias": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "dt_bias"},
+                        "b": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "b"},
+                        "scale": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "scale"},
+                        "cu_seqlens": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "cu_seqlens"},
                     },
                 },
                 "evaluation": None,
