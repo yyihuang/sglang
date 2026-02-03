@@ -216,6 +216,7 @@ def main() -> None:
 
     # Server flags: Qwen3-Next (match launch_server command: python3 -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 8 --attention-backend flashinfer)
     server_args = [
+        "--disable-cuda-graph",
         "--tp", "8",
         "--attention-backend", "flashinfer",
     ]
