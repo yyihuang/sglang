@@ -1072,6 +1072,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             a_log = layer.A_log.detach()
             dt_bias = layer.dt_bias.detach()
             
+            print(f"num_q_heads: {query.shape[1]}")
+            print(f"num_k_heads: {key.shape[1]}")
+            print(f"num_v_heads: {value.shape[1]}")
             self._maybe_dump_workload_and_write_jsonl(
                 "decode",
                 variable_axes={
@@ -1309,7 +1312,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 beta_for_kernel = beta.squeeze(0).to(torch.float32, copy=False)
                 # FlashInfer expects state in [N, H, V, K].
                 initial_state = ssm_states[cache_indices]
-                
+
+                print(f"num_q_heads: {q_for_kernel.shape[1]}")
+                print(f"num_k_heads: {k_for_kernel.shape[1]}")
+                print(f"num_v_heads: {v_for_kernel.shape[1]}")
                 self._maybe_dump_workload_and_write_jsonl(
                     "prefill",
                     variable_axes={
