@@ -894,7 +894,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._flashinfer_gdn_prefill_workload_jsonl = self._flashinfer_gdn_workload_dir + "/" + self._flashinfer_gdn_prefill_def_name + ".jsonl"
         self._flashinfer_gdn_decode_workload_jsonl = self._flashinfer_gdn_workload_dir + "/" + self._flashinfer_gdn_decode_def_name + ".jsonl"
         # self._flashinfer_gdn_mtp_workload_jsonl = self._flashinfer_gdn_workload_dir + "/" + self._flashinfer_gdn_mtp_def_name + ".jsonl"
-        self._flashinfer_gdn_workload_limit = int(os.getenv("SGLANG_FLASHINFER_GDN_WORKLOAD_LIMIT", "500"))
+        self._flashinfer_gdn_prefill_dump_limit = 100
+        self._flashinfer_gdn_decode_dump_limit = 20
+        self._flashinfer_gdn_prefill_dump_stride = 10
+        self._flashinfer_gdn_decode_dump_stride = 50
+        self._flashinfer_gdn_prefill_seen_count = 0
+        self._flashinfer_gdn_decode_seen_count = 0
         self._flashinfer_gdn_prefill_dump_count = 0
         self._flashinfer_gdn_decode_dump_count = 0
         prefill_backend, decode_backend = (
@@ -951,14 +956,32 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if model_parallel_is_initialized() and get_tensor_model_parallel_rank() != 0:
             return None
-        if self._flashinfer_gdn_workload_limit <= 0:
-            return None
         if kind == "prefill":
-            if self._flashinfer_gdn_prefill_dump_count >= self._flashinfer_gdn_workload_limit:
+            self._flashinfer_gdn_prefill_seen_count += 1
+            if (
+                self._flashinfer_gdn_prefill_dump_count
+                >= self._flashinfer_gdn_prefill_dump_limit
+            ):
+                return None
+            if (
+                self._flashinfer_gdn_prefill_seen_count
+                % self._flashinfer_gdn_prefill_dump_stride
+                != 0
+            ):
                 return None
             self._flashinfer_gdn_prefill_dump_count += 1
         elif kind == "decode":
-            if self._flashinfer_gdn_decode_dump_count >= self._flashinfer_gdn_workload_limit:
+            self._flashinfer_gdn_decode_seen_count += 1
+            if (
+                self._flashinfer_gdn_decode_dump_count
+                >= self._flashinfer_gdn_decode_dump_limit
+            ):
+                return None
+            if (
+                self._flashinfer_gdn_decode_seen_count
+                % self._flashinfer_gdn_decode_dump_stride
+                != 0
+            ):
                 return None
             self._flashinfer_gdn_decode_dump_count += 1
         else:
