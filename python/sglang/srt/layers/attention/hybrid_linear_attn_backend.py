@@ -884,16 +884,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._use_flashinfer_gdn_decode = False
         self._flashinfer_gdn_mtp = None
         self._use_flashinfer_gdn_mtp = False
+        self._lock = __import__("threading").Lock()
         self._flashinfer_gdn_prefill_def_name = _GDN_WORKLOAD_DEFS["prefill"].get("definition")
         self._flashinfer_gdn_decode_def_name = _GDN_WORKLOAD_DEFS["decode"].get("definition")
         # self._flashinfer_gdn_mtp_def_name = _GDN_WORKLOAD_DEFS["mtp"].get("definition")
-        self._flashinfer_gdn_workload_dir = os.getenv(
-            "SGLANG_FLASHINFER_GDN_WORKLOAD_DIR"
-        )
+        self._flashinfer_gdn_workload_dir = os.path.join(os.getcwd(), "tmp")
+        os.makedirs(self._flashinfer_gdn_workload_dir, exist_ok=True)
         self._flashinfer_gdn_prefill_workload_jsonl = self._flashinfer_gdn_workload_dir + "/" + self._flashinfer_gdn_prefill_def_name + ".jsonl"
         self._flashinfer_gdn_decode_workload_jsonl = self._flashinfer_gdn_workload_dir + "/" + self._flashinfer_gdn_decode_def_name + ".jsonl"
         # self._flashinfer_gdn_mtp_workload_jsonl = self._flashinfer_gdn_workload_dir + "/" + self._flashinfer_gdn_mtp_def_name + ".jsonl"
-        self._flashinfer_gdn_workload_limit = int(os.getenv("SGLANG_FLASHINFER_GDN_WORKLOAD_LIMIT", "10"))
+        self._flashinfer_gdn_workload_limit = int(os.getenv("SGLANG_FLASHINFER_GDN_WORKLOAD_LIMIT", "500"))
         self._flashinfer_gdn_prefill_dump_count = 0
         self._flashinfer_gdn_decode_dump_count = 0
         prefill_backend, decode_backend = (
@@ -937,6 +937,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
     def _maybe_dump_workload_and_write_jsonl(self, kind: str, variable_axes: dict, workload_tensors: dict):
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_rank,
+            model_parallel_is_initialized,
+        )
+
+        if model_parallel_is_initialized() and get_tensor_model_parallel_rank() != 0:
+            return None
         if self._flashinfer_gdn_workload_limit <= 0:
             return None
         if kind == "prefill":
@@ -1072,9 +1079,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             a_log = layer.A_log.detach()
             dt_bias = layer.dt_bias.detach()
             
-            print(f"num_q_heads: {query.shape[1]}")
-            print(f"num_k_heads: {key.shape[1]}")
-            print(f"num_v_heads: {value.shape[1]}")
+            # print(f"num_q_heads: {query.shape[1]}")
+            # print(f"num_k_heads: {key.shape[1]}")
+            # print(f"num_v_heads: {value.shape[1]}")
             self._maybe_dump_workload_and_write_jsonl(
                 "decode",
                 variable_axes={
@@ -1313,9 +1320,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # FlashInfer expects state in [N, H, V, K].
                 initial_state = ssm_states[cache_indices]
 
-                print(f"num_q_heads: {q_for_kernel.shape[1]}")
-                print(f"num_k_heads: {k_for_kernel.shape[1]}")
-                print(f"num_v_heads: {v_for_kernel.shape[1]}")
+                # print(f"num_q_heads: {q_for_kernel.shape[1]}")
+                # print(f"num_k_heads: {k_for_kernel.shape[1]}")
+                # print(f"num_v_heads: {v_for_kernel.shape[1]}")
                 self._maybe_dump_workload_and_write_jsonl(
                     "prefill",
                     variable_axes={

@@ -196,7 +196,7 @@ def main() -> None:
     env = os.environ.copy()
     trace_root = os.getcwd()
     env["SGLANG_FLASHINFER_GDN_WORKLOAD_DIR"] = os.path.join(trace_root, "gdn")
-    env.setdefault("SGLANG_FLASHINFER_GDN_WORKLOAD_LIMIT", "10")
+    env.setdefault("SGLANG_FLASHINFER_GDN_WORKLOAD_LIMIT", "100")
     parser = argparse.ArgumentParser(
         description="Benchmark ShareGPT with Qwen3-Next on SGLang",
     )
