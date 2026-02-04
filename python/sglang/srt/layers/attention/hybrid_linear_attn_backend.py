@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import uuid
 from typing import Optional, Tuple, Union
@@ -70,7 +71,7 @@ _GDN_WORKLOAD_DEFS = {
             "a",
             "dt_bias",
             "b",
-            # "scale", default, not collected
+            "scale",
         ],
     },
     "prefill": {
@@ -93,7 +94,7 @@ _GDN_WORKLOAD_DEFS = {
             "dt_bias",
             "b",
             "cu_seqlens",
-            # "scale", default, not collected
+            "scale",
         ],
     },
 }
@@ -936,7 +937,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     f"falling back to Triton FLA. Reason: {exc}"
                 )
 
-    def _maybe_dump_workload_and_write_jsonl(self, kind: str, variable_axes: dict, workload_tensors: dict):
+    def _maybe_dump_workload_and_write_jsonl(
+        self,
+        kind: str,
+        variable_axes: dict,
+        workload_tensors: dict,
+        scale_value: Optional[float] = None,
+    ):
         from sglang.srt.distributed import (
             get_tensor_model_parallel_rank,
             model_parallel_is_initialized,
@@ -976,6 +983,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             print(f"[HybridLinearAttnBackend] Failed to save tensors: {e}")
             return None
 
+        if scale_value is None:
+            raise ValueError("scale_value must be provided for GDN workload dumps.")
+
         if kind == "prefill":
             workload_json = {
                 "definition": def_name,
@@ -992,7 +1002,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         "a": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "a"},
                         "dt_bias": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "dt_bias"},
                         "b": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "b"},
-                        "scale": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "scale"},
+                        "scale": {"type": "scalar", "value": float(scale_value)},
                         "cu_seqlens": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "cu_seqlens"},
                     },
                 },
@@ -1015,7 +1025,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         "a": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "a"},
                         "dt_bias": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "dt_bias"},
                         "b": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "b"},
-                        "scale": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "scale"},
+                        "scale": {"type": "scalar", "value": float(scale_value)},
                         "cu_seqlens": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "cu_seqlens"},
                     },
                 },
@@ -1082,6 +1092,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # print(f"num_q_heads: {query.shape[1]}")
             # print(f"num_k_heads: {key.shape[1]}")
             # print(f"num_v_heads: {value.shape[1]}")
+            scale_value = 1.0 / math.sqrt(layer.head_q_dim)
             self._maybe_dump_workload_and_write_jsonl(
                 "decode",
                 variable_axes={
@@ -1096,7 +1107,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "a": a_for_kernel,
                     "dt_bias": dt_bias,
                     "b": b_for_kernel,
-                }
+                },
+                scale_value=scale_value,
             )
 
             output, output_state = self._flashinfer_gdn_decode(
@@ -1323,6 +1335,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # print(f"num_q_heads: {q_for_kernel.shape[1]}")
                 # print(f"num_k_heads: {k_for_kernel.shape[1]}")
                 # print(f"num_v_heads: {v_for_kernel.shape[1]}")
+                scale_value = 1.0 / math.sqrt(layer.head_q_dim)
                 self._maybe_dump_workload_and_write_jsonl(
                     "prefill",
                     variable_axes={
@@ -1341,6 +1354,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         "b": b.view(actual_seq_len, -1),
                         "cu_seqlens": query_start_loc.to(torch.int64),
                     },
+                    scale_value=scale_value,
                 )
 
                 output, output_state = self._flashinfer_gdn_prefill(
