@@ -54,7 +54,7 @@ if not is_cpu():
 
 _GDN_WORKLOAD_DEFS = {
     "decode": {
-        "definition": "gdn_decode_qk16_v32_d128_k_last",
+        "definition": "gdn_decode_qk4_v8_d128_k_last",
         "axes": {
             "batch_size": {
                 "type": "var",
@@ -74,7 +74,7 @@ _GDN_WORKLOAD_DEFS = {
         ],
     },
     "prefill": {
-        "definition": "gdn_prefill_qk16_v32_d128_k_last",
+        "definition": "gdn_prefill_qk4_v8_d128_k_last",
         "axes": {
             "total_seq_len": {"type": "var"},
             "num_seqs": {"type": "var"},
