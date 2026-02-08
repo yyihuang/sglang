@@ -1017,10 +1017,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "uuid": workload_uuid,
                     "axes": variable_axes,
                     "inputs": {
-                        "q": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "q"},
-                        "k": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "k"},
-                        "v": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "v"},
-                        "state": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "state"},
+                        "q": {"type": "random"},
+                        "k": {"type": "random"},
+                        "v": {"type": "random"},
+                        "state": {"type": "random"},
                         "A_log": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "A_log"},
                         "a": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "a"},
                         "dt_bias": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "dt_bias"},
@@ -1040,10 +1040,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "uuid": workload_uuid,
                     "axes": variable_axes,
                     "inputs": {
-                        "q": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "q"},
-                        "k": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "k"},
-                        "v": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "v"},
-                        "state": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "state"},
+                        "q": {"type": "random"},
+                        "k": {"type": "random"},
+                        "v": {"type": "random"},
+                        "state": {"type": "random"},
                         "A_log": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "A_log"},
                         "a": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "a"},
                         "dt_bias": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "dt_bias"},
@@ -1122,10 +1122,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "batch_size": bs,
                 },
                 workload_tensors={
-                    "q": query,
-                    "k": key,
-                    "v": value,
-                    "state": state_for_kernel,
+                    # "q": query,
+                    # "k": key,
+                    # "v": value,
+                    # "state": state_for_kernel,
                     "A_log": a_log,
                     "a": a_for_kernel,
                     "dt_bias": dt_bias,
@@ -1301,6 +1301,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # FlashInfer uses DLPack; parameters must not require grad.
                 a_log = layer.A_log.detach()
                 dt_bias = layer.dt_bias.detach()
+
+                # print(f"num_q_heads: {q_for_kernel.shape[2]}")
+                # print(f"num_k_heads: {k_for_kernel.shape[2]}")
+                # print(f"num_v_heads: {v_for_kernel.shape[2]}")
+
                 output, _ = self._flashinfer_gdn_mtp(
                     q=q_for_kernel,
                     k=k_for_kernel,
@@ -1367,10 +1372,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         "len_cu_seqlens": query_start_loc.shape[0],
                     },
                     workload_tensors={
-                        "q": q_for_kernel,
-                        "k": k_for_kernel,
-                        "v": v_for_kernel,
-                        "state": initial_state,
+                        # "q": q_for_kernel,
+                        # "k": k_for_kernel,
+                        # "v": v_for_kernel,
+                        # "state": initial_state,
                         "A_log": layer.A_log.detach(),
                         "a": a.view(actual_seq_len, -1),
                         "dt_bias": layer.dt_bias.detach(),
