@@ -2,6 +2,11 @@ import logging
 import os
 from typing import Optional, Union
 
+import json
+import math
+import os
+import uuid
+
 import torch
 import triton
 import triton.language as tl
@@ -15,6 +20,8 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
 
+from sglang.srt.utils.common import dump_to_file, is_flashinfer_available, rank0_log
+
 logger = logging.getLogger(__name__)
 
 # Lazy import for FlashInfer GDN kernels (prefill, decode and verify/MTP)
@@ -22,6 +29,73 @@ _flashinfer_gdn_available = None
 _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
+
+_GDN_WORKLOAD_DEFS = {
+    "decode": {
+        "definition": "gdn_decode_qk4_v8_d128_k_last",
+        "axes": {
+            "batch_size": {
+                "type": "var",
+                "description": "Number of sequences being decoded concurrently.",
+            }
+        },
+        "inputs": [
+            "q",
+            "k",
+            "v",
+            "state",
+            "A_log",
+            "a",
+            "dt_bias",
+            "b",
+            "scale",
+        ],
+    },
+    "prefill": {
+        "definition": "gdn_prefill_qk4_v8_d128_k_last",
+        "axes": {
+            "total_seq_len": {"type": "var"},
+            "num_seqs": {"type": "var"},
+            "len_cu_seqlens": {
+                "type": "var",
+                "description": "Length of cu_seqlens array (num_seqs + 1).",
+            },
+        },
+        "inputs": [
+            "q",
+            "k",
+            "v",
+            "state",
+            "A_log",
+            "a",
+            "dt_bias",
+            "b",
+            "cu_seqlens",
+            "scale",
+        ],
+    },
+    "mtp": {
+        "definition": "gdn_mtp_qk4_v8_d128_k_last",
+        "axes": {
+            "batch_size": {"type": "var"},
+            "seq_len": {"type": "var"},
+            "pool_size": {"type": "var"},
+        },
+        "inputs": [
+            "q",
+            "k",
+            "v",
+            "initial_state",
+            "initial_state_indices",
+            "A_log",
+            "a",
+            "dt_bias",
+            "b",
+            "scale",
+            "intermediate_states_buffer",
+        ],
+    },
+}
 
 
 def _get_flashinfer_gdn_kernels():
@@ -987,6 +1061,208 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             GDNAttnBackend._k_last_decode_warning_shown = True
 
+        self._lock = __import__("threading").Lock()
+        self._flashinfer_gdn_prefill_def_name = _GDN_WORKLOAD_DEFS["prefill"].get("definition")
+        self._flashinfer_gdn_decode_def_name = _GDN_WORKLOAD_DEFS["decode"].get("definition")
+        self._flashinfer_gdn_mtp_def_name = _GDN_WORKLOAD_DEFS["mtp"].get("definition")
+        self._flashinfer_gdn_workload_dir = os.path.join(os.getcwd(), "tmp")
+        os.makedirs(self._flashinfer_gdn_workload_dir, exist_ok=True)
+        self._flashinfer_gdn_prefill_workload_jsonl = self._flashinfer_gdn_workload_dir + "/" + self._flashinfer_gdn_prefill_def_name + ".jsonl"
+        self._flashinfer_gdn_decode_workload_jsonl = self._flashinfer_gdn_workload_dir + "/" + self._flashinfer_gdn_decode_def_name + ".jsonl"
+        self._flashinfer_gdn_mtp_workload_jsonl = self._flashinfer_gdn_workload_dir + "/" + self._flashinfer_gdn_mtp_def_name + ".jsonl"
+        self._flashinfer_gdn_prefill_dump_limit = 100
+        self._flashinfer_gdn_decode_dump_limit = 100
+        self._flashinfer_gdn_mtp_dump_limit = 100
+        self._flashinfer_gdn_prefill_dump_stride = 10
+        self._flashinfer_gdn_decode_dump_stride = 50
+        self._flashinfer_gdn_mtp_dump_stride = 50
+        self._flashinfer_gdn_prefill_seen_count = 0
+        self._flashinfer_gdn_decode_seen_count = 0
+        self._flashinfer_gdn_mtp_seen_count = 0
+        self._flashinfer_gdn_prefill_dump_count = 0
+        self._flashinfer_gdn_decode_dump_count = 0
+        self._flashinfer_gdn_mtp_dump_count = 0
+
+    def _maybe_dump_workload_and_write_jsonl(
+        self,
+        kind: str,
+        variable_axes: dict,
+        workload_tensors: dict,
+        scale_value: Optional[float] = None,
+    ):
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_rank,
+            model_parallel_is_initialized,
+        )
+
+        if model_parallel_is_initialized() and get_tensor_model_parallel_rank() != 0:
+            return None
+        if kind == "prefill":
+            self._flashinfer_gdn_prefill_seen_count += 1
+            if (
+                self._flashinfer_gdn_prefill_dump_count
+                >= self._flashinfer_gdn_prefill_dump_limit
+            ):
+                return None
+            if (
+                self._flashinfer_gdn_prefill_seen_count
+                % self._flashinfer_gdn_prefill_dump_stride
+                != 0
+            ):
+                return None
+            self._flashinfer_gdn_prefill_dump_count += 1
+        elif kind == "decode":
+            self._flashinfer_gdn_decode_seen_count += 1
+            if (
+                self._flashinfer_gdn_decode_dump_count
+                >= self._flashinfer_gdn_decode_dump_limit
+            ):
+                return None
+            if (
+                self._flashinfer_gdn_decode_seen_count
+                % self._flashinfer_gdn_decode_dump_stride
+                != 0
+            ):
+                return None
+            self._flashinfer_gdn_decode_dump_count += 1
+        elif kind == "mtp":
+            self._flashinfer_gdn_mtp_seen_count += 1
+            if (
+                self._flashinfer_gdn_mtp_dump_count
+                >= self._flashinfer_gdn_mtp_dump_limit
+            ):
+                return None
+            if (
+                self._flashinfer_gdn_mtp_seen_count
+                % self._flashinfer_gdn_mtp_dump_stride
+                != 0
+            ):
+                return None
+            self._flashinfer_gdn_mtp_dump_count += 1
+        else:
+            raise ValueError(f"Unknown GDN workload kind: {kind}")
+
+        workload_uuid = str(uuid.uuid4())
+        if kind == "decode":
+            def_name = self._flashinfer_gdn_decode_def_name
+        elif kind == "prefill":
+            def_name = self._flashinfer_gdn_prefill_def_name
+        else:
+            def_name = self._flashinfer_gdn_mtp_def_name
+
+        safetensor_dump_path_prefix = os.path.join(
+            self._flashinfer_gdn_workload_dir, 
+            def_name,
+        )
+        safetensor_dump_path = safetensor_dump_path_prefix + f"_{workload_uuid}.safetensors"
+        # Set the fake_tensor_dump_path to a formatted fake path matching the given spec
+        # Template: "./blob/workloads/{def_name}/{def_name}_{workload_uuid}.safetensors"
+        fake_tensor_dump_path = f"./blob/workloads/gdn/{def_name}_{workload_uuid}.safetensors"
+
+        try:
+            import safetensors.torch
+            safetensors.torch.save_file(workload_tensors, safetensor_dump_path)
+        except Exception as e:
+            print(f"[HybridLinearAttnBackend] Failed to save tensors: {e}")
+            return None
+
+        if scale_value is None:
+            raise ValueError("scale_value must be provided for GDN workload dumps.")
+
+        if kind == "prefill":
+            workload_json = {
+                "definition": def_name,
+                "solution": None,
+                "workload": {
+                    "uuid": workload_uuid,
+                    "axes": variable_axes,
+                    "inputs": {
+                        "q": {"type": "random"},
+                        "k": {"type": "random"},
+                        "v": {"type": "random"},
+                        "state": {"type": "random"},
+                        "A_log": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "A_log"},
+                        "a": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "a"},
+                        "dt_bias": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "dt_bias"},
+                        "b": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "b"},
+                        "scale": {"type": "scalar", "value": float(scale_value)},
+                        "cu_seqlens": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "cu_seqlens"},
+                    },
+                },
+                "evaluation": None,
+            }
+            jsonl_path = self._flashinfer_gdn_prefill_workload_jsonl
+        elif kind == "decode":
+            workload_json = {
+                "definition": def_name,
+                "solution": None,
+                "workload": {
+                    "uuid": workload_uuid,
+                    "axes": variable_axes,
+                    "inputs": {
+                        "q": {"type": "random"},
+                        "k": {"type": "random"},
+                        "v": {"type": "random"},
+                        "state": {"type": "random"},
+                        "A_log": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "A_log"},
+                        "a": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "a"},
+                        "dt_bias": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "dt_bias"},
+                        "b": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "b"},
+                        "scale": {"type": "scalar", "value": float(scale_value)},
+                        "cu_seqlens": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "cu_seqlens"},
+                    },
+                },
+                "evaluation": None,
+            }
+            jsonl_path = self._flashinfer_gdn_decode_workload_jsonl
+        else:
+            workload_inputs = {
+                "q": {"type": "random"},
+                "k": {"type": "random"},
+                "v": {"type": "random"},
+                "initial_state": {"type": "random"},
+                "initial_state_indices": {
+                    "type": "safetensors",
+                    "path": fake_tensor_dump_path,
+                    "tensor_key": "initial_state_indices",
+                },
+                "A_log": {
+                    "type": "safetensors",
+                    "path": fake_tensor_dump_path,
+                    "tensor_key": "A_log",
+                },
+                "a": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "a"},
+                "dt_bias": {
+                    "type": "safetensors",
+                    "path": fake_tensor_dump_path,
+                    "tensor_key": "dt_bias",
+                },
+                "b": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "b"},
+                "scale": {"type": "scalar", "value": float(scale_value)},
+            }
+            if "intermediate_states_buffer" in workload_tensors:
+                workload_inputs["intermediate_states_buffer"] = {
+                    "type": "safetensors",
+                    "path": fake_tensor_dump_path,
+                    "tensor_key": "intermediate_states_buffer",
+                }
+            workload_json = {
+                "definition": def_name,
+                "solution": None,
+                "workload": {
+                    "uuid": workload_uuid,
+                    "axes": variable_axes,
+                    "inputs": workload_inputs,
+                },
+                "evaluation": None,
+            }
+            jsonl_path = self._flashinfer_gdn_mtp_workload_jsonl
+
+
+        with self._lock:
+            with open(jsonl_path, "a") as f:
+                f.write(json.dumps(workload_json) + "\n")
+
     def _warmup_mtp_kernel(self):
         """Warmup FlashInfer MTP kernel to avoid JIT compilation overhead during serving.
 
@@ -1218,6 +1494,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
             b_fi = b.view(batch_size, 1, num_value_heads)
 
             # Call FlashInfer GDN decode kernel with pool indexing (zero-copy)
+            scale_value = 1.0 / math.sqrt(head_k_dim)
+            self._maybe_dump_workload_and_write_jsonl(
+                "decode",
+                variable_axes={
+                    "batch_size": batch_size,
+                },
+                workload_tensors={
+                    # "q": query,
+                    # "k": key,
+                    # "v": value,
+                    # "state": state_for_kernel,
+                    "A_log": A_log,
+                    "a": a,
+                    "dt_bias": dt_bias,
+                    "b": b,
+                },
+                scale_value=scale_value,
+            )
             output_fi, _ = self._flashinfer_gated_delta_rule_decode(
                 q=query_fi,
                 k=key_fi,
@@ -1407,6 +1701,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # FlashInfer MTP kernel expects state in K-last layout [pool_size, HV, V, K]
                 # which matches our ssm_states layout
                 # Note: detach A_log and dt_bias to avoid gradient tracking issues with dlpack
+
+                scale_value = 1.0 / math.sqrt(head_k_dim)
+                workload_tensors = {
+                    # "q": q_for_kernel,
+                    # "k": k_for_kernel,
+                    # "v": v_for_kernel,
+                    # "initial_state": initial_state,
+                    "initial_state_indices": cache_indices[:batch_size].to(
+                        torch.int32
+                    ),
+                    "A_log": A_log.detach(),
+                    "a": a_mtp,
+                    "dt_bias": dt_bias.detach(),
+                    "b": b_mtp,
+                }
+                self._maybe_dump_workload_and_write_jsonl(
+                    "mtp",
+                    variable_axes={
+                        "batch_size": batch_size,
+                        "seq_len": draft_token_num,
+                        "pool_size": ssm_states.shape[0],
+                    },
+                    workload_tensors=workload_tensors,
+                    scale_value=scale_value,
+                )
                 core_attn_out, _ = self._flashinfer_gated_delta_rule_mtp(
                     q=query_mtp,
                     k=key_mtp,
@@ -1484,6 +1803,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
                 # Prepare initial_state (FlashInfer requires float32, K-last layout [B, HV, V, K])
                 initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
+
+                scale_value = 1.0 / math.sqrt(head_k_dim)
+                self._maybe_dump_workload_and_write_jsonl(
+                    "prefill",
+                    variable_axes={
+                        "total_seq_len": q_fi.shape[0],
+                        "num_seqs": initial_state_fi.shape[0],
+                        "len_cu_seqlens": query_start_loc.shape[0],
+                    },
+                    workload_tensors={
+                        # "q": q_for_kernel,
+                        # "k": k_for_kernel,
+                        # "v": v_for_kernel,
+                        # "state": initial_state,
+                        "A_log": A_log.detach(),
+                        "a": a.view(actual_seq_len, -1),
+                        "dt_bias": dt_bias.detach(),
+                        "b": b.view(actual_seq_len, -1),
+                        "cu_seqlens": query_start_loc.to(torch.int64),
+                    },
+                    scale_value=scale_value,
+                )
 
                 # Call FlashInfer prefill kernel
                 # Note: q and k are already L2-normalized above, so use_qk_l2norm_in_kernel=False
