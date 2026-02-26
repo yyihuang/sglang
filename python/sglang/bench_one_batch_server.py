@@ -33,6 +33,7 @@ from sglang.bench_serving import (
     get_tokenizer,
     sample_mmmu_requests,
     sample_random_requests,
+    sample_sharegpt_requests,
 )
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
@@ -62,6 +63,7 @@ class BenchArgs:
     profile_output_dir: Optional[str] = None
     dataset_path: str = ""
     dataset_name: str = "random"
+    sharegpt_context_len: Optional[int] = None
     parallel_batch: bool = False
     result_filename: str = "result.jsonl"
     pydantic_result_filename: Optional[str] = None
@@ -121,8 +123,14 @@ class BenchArgs:
             "--dataset-name",
             type=str,
             default=BenchArgs.dataset_name,
-            choices=["mmmu", "random"],
+            choices=["mmmu", "random", "sharegpt"],
             help="Name of the dataset to benchmark on.",
+        )
+        parser.add_argument(
+            "--sharegpt-context-len",
+            type=int,
+            default=None,
+            help="Max context length for ShareGPT (prompt+output). Default: input_len + output_len.",
         )
         parser.add_argument("--parallel-batch", action="store_true")
         parser.add_argument(
@@ -290,6 +298,7 @@ def run_one_case(
     profile_output_dir: Optional[str] = BenchArgs.profile_output_dir,
     dataset_name: str = BenchArgs.dataset_name,
     dataset_path: str = BenchArgs.dataset_path,
+    sharegpt_context_len: Optional[int] = None,
     parallel_batch: bool = False,
     cache_hit_rate: float = BenchArgs.cache_hit_rate,
 ):
@@ -314,6 +323,15 @@ def run_one_case(
             dataset_path=dataset_path,
             random_sample=True,
             return_text=False,
+        )
+    elif dataset_name == "sharegpt":
+        context_len = sharegpt_context_len if sharegpt_context_len is not None else input_len + output_len
+        input_requests = sample_sharegpt_requests(
+            dataset_path=dataset_path or "",
+            num_requests=batch_size,
+            tokenizer=tokenizer,
+            fixed_output_len=output_len,
+            context_len=context_len,
         )
 
     # Load sampling parameters
@@ -351,17 +369,28 @@ def run_one_case(
             input_ids += [tokenizer.encode(input_req.prompt)]
         payload["image_data"] = [req.image_data for req in input_requests]
 
+    elif dataset_name == "sharegpt":
+        # ShareGPT returns text prompts; tokenize them
+        input_ids = [tokenizer.encode(req.prompt) for req in input_requests]
     else:
         input_ids = [req.prompt for req in input_requests]
 
     payload["input_ids"] = input_ids
+
+    # For ShareGPT, use actual token counts (variable-length prompts)
+    if dataset_name == "sharegpt":
+        actual_input_tokens = sum(req.prompt_len for req in input_requests)
+        effective_input_len = actual_input_tokens // batch_size
+    else:
+        actual_input_tokens = batch_size * input_len
+        effective_input_len = input_len
 
     # Warm up cache if cache_hit_rate > 0.0
     if cache_hit_rate > 0.0:
         _warmup_cache(
             url=url,
             input_ids=input_ids,
-            input_len=input_len,
+            input_len=effective_input_len,
             cache_hit_rate=cache_hit_rate,
             dataset_name=dataset_name,
             image_data=payload.get("image_data"),
@@ -407,9 +436,9 @@ def run_one_case(
 
     # Compute metrics
     latency = time.perf_counter() - tic
-    input_throughput = batch_size * input_len / last_ttft
+    input_throughput = actual_input_tokens / last_ttft
     output_throughput = batch_size * output_len / (latency - last_ttft)
-    overall_throughput = batch_size * (input_len + output_len) / latency
+    overall_throughput = (actual_input_tokens + batch_size * output_len) / latency
 
     server_info = requests.get(url + "/get_server_info").json()
     internal_state = server_info.get("internal_states", [{}])
@@ -418,7 +447,7 @@ def run_one_case(
 
     # Print results
     print(f"batch size: {batch_size}")
-    print(f"input_len: {input_len}")
+    print(f"input_len: {effective_input_len}" + (" (avg, sharegpt)" if dataset_name == "sharegpt" else ""))
     print(f"output_len: {output_len}")
     print(f"latency: {latency:.2f} s")
     print(f"input throughput: {input_throughput:.2f} tok/s")
@@ -433,7 +462,7 @@ def run_one_case(
     result = BenchOneCaseResult(
         run_name=run_name,
         batch_size=batch_size,
-        input_len=input_len,
+        input_len=effective_input_len,
         output_len=output_len,
         latency=latency,
         input_throughput=input_throughput,
@@ -595,6 +624,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 tokenizer=tokenizer,
                 dataset_name=bench_args.dataset_name,
                 dataset_path=bench_args.dataset_path,
+                sharegpt_context_len=bench_args.sharegpt_context_len,
                 parallel_batch=bench_args.parallel_batch,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -627,6 +657,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     tokenizer=tokenizer,
                     dataset_name=bench_args.dataset_name,
                     dataset_path=bench_args.dataset_path,
+                    sharegpt_context_len=bench_args.sharegpt_context_len,
                     parallel_batch=bench_args.parallel_batch,
                     cache_hit_rate=bench_args.cache_hit_rate,
                 )
@@ -662,6 +693,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                             tokenizer=tokenizer,
                             dataset_name=bench_args.dataset_name,
                             dataset_path=bench_args.dataset_path,
+                            sharegpt_context_len=bench_args.sharegpt_context_len,
                             parallel_batch=bench_args.parallel_batch,
                             cache_hit_rate=bench_args.cache_hit_rate,
                             profile=bench_args.profile,

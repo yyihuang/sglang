@@ -32,7 +32,7 @@ _flashinfer_gated_delta_rule_decode = None
 
 _GDN_WORKLOAD_DEFS = {
     "decode": {
-        "definition": "gdn_decode_qk4_v8_d128_k_last",
+        "definition": "gdn_decode_qk8_v16_d128_k_last",
         "axes": {
             "batch_size": {
                 "type": "var",
@@ -52,7 +52,7 @@ _GDN_WORKLOAD_DEFS = {
         ],
     },
     "prefill": {
-        "definition": "gdn_prefill_qk4_v8_d128_k_last",
+        "definition": "gdn_prefill_qk8_v16_d128_k_last",
         "axes": {
             "total_seq_len": {"type": "var"},
             "num_seqs": {"type": "var"},
@@ -75,7 +75,7 @@ _GDN_WORKLOAD_DEFS = {
         ],
     },
     "mtp": {
-        "definition": "gdn_mtp_qk4_v8_d128_k_last",
+        "definition": "gdn_mtp_qk8_v16_d128_k_last",
         "axes": {
             "batch_size": {"type": "var"},
             "seq_len": {"type": "var"},
