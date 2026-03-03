@@ -206,7 +206,7 @@ def main() -> None:
     parser.add_argument("--warmup-requests", type=int, default=3)
     args = parser.parse_args()
 
-    model_path = "/raid/catalyst/models/DeepSeek-V3.2"
+    model_path = "deepseek-ai/DeepSeek-V3.2"
     base_url = f"http://{args.host}:{args.port}"
 
     # Prompts
@@ -216,8 +216,8 @@ def main() -> None:
     # Server flags: DeepSeek-V3.2 decode TRTLLM only (prefill left default / non-trtllm)
     server_args = [
         "--disable-cuda-graph",
-        "--tp", "8",
-        "--dp", "8",
+        "--tp", "4",
+        "--dp", "4",
         "--enable-dp-attention",
         "--trust-remote-code",
         "--skip-server-warmup",
