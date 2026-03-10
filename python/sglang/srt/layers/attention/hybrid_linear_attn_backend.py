@@ -52,7 +52,7 @@ _GDN_WORKLOAD_DEFS = {
         ],
     },
     "prefill": {
-        "definition": "gdn_prefill_qk8_v16_d128_k_last",
+        "definition": "gdn_prefill_qk4_v8_d128_k_last",
         "axes": {
             "total_seq_len": {"type": "var"},
             "num_seqs": {"type": "var"},
@@ -1073,7 +1073,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._flashinfer_gdn_prefill_dump_limit = 100
         self._flashinfer_gdn_decode_dump_limit = 100
         self._flashinfer_gdn_mtp_dump_limit = 100
-        self._flashinfer_gdn_prefill_dump_stride = 10
+        self._flashinfer_gdn_prefill_dump_stride = 30
         self._flashinfer_gdn_decode_dump_stride = 50
         self._flashinfer_gdn_mtp_dump_stride = 50
         self._flashinfer_gdn_prefill_seen_count = 0
@@ -1178,7 +1178,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "axes": variable_axes,
                     "inputs": {
                         "q": {"type": "random"},
-                        "k": {"type": "random"},
+                        "k": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "k"},
                         "v": {"type": "random"},
                         "state": {"type": "random"},
                         "A_log": {"type": "safetensors", "path": fake_tensor_dump_path, "tensor_key": "A_log"},
@@ -1495,37 +1495,79 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             # Call FlashInfer GDN decode kernel with pool indexing (zero-copy)
             scale_value = 1.0 / math.sqrt(head_k_dim)
-            self._maybe_dump_workload_and_write_jsonl(
-                "decode",
-                variable_axes={
-                    "batch_size": batch_size,
-                },
-                workload_tensors={
-                    # "q": query,
-                    # "k": key,
-                    # "v": value,
-                    # "state": state_for_kernel,
-                    "A_log": A_log,
-                    "a": a,
-                    "dt_bias": dt_bias,
-                    "b": b,
-                },
-                scale_value=scale_value,
-            )
-            output_fi, _ = self._flashinfer_gated_delta_rule_decode(
-                q=query_fi,
-                k=key_fi,
-                v=value_fi,
-                state=ssm_states,
-                A_log=A_log.detach(),
-                a=a_fi,
-                dt_bias=dt_bias.detach(),
-                b=b_fi,
-                scale=None,
-                output=None,
-                use_qk_l2norm=True,
-                state_indices=cache_indices.to(torch.int32),
-            )
+            # self._maybe_dump_workload_and_write_jsonl(
+            #     "decode",
+            #     variable_axes={
+            #         "batch_size": batch_size,
+            #     },
+            #     workload_tensors={
+            #         # "q": query,
+            #         # "k": key,
+            #         # "v": value,
+            #         # "state": state_for_kernel,
+            #         "A_log": A_log,
+            #         "a": a,
+            #         "dt_bias": dt_bias,
+            #         "b": b,
+            #     },
+            #     scale_value=scale_value,
+            # )
+            output_fi = None
+            if not hasattr(self, "_flashinfer_decode_supports_indices"):
+                self._flashinfer_decode_supports_indices = None
+            if self._flashinfer_decode_supports_indices is not False:
+                try:
+                    output_fi, _ = self._flashinfer_gated_delta_rule_decode(
+                        q=query_fi,
+                        k=key_fi,
+                        v=value_fi,
+                        state=ssm_states,
+                        A_log=A_log.detach(),
+                        a=a_fi,
+                        dt_bias=dt_bias.detach(),
+                        b=b_fi,
+                        scale=None,
+                        output=None,
+                        use_qk_l2norm=True,
+                        initial_state_indices=cache_indices.to(torch.int32),
+                    )
+                    self._flashinfer_decode_supports_indices = True
+                except TypeError as e:
+                    if "initial_state_indices" not in str(e):
+                        raise
+                    self._flashinfer_decode_supports_indices = False
+                    logger.warning(
+                        "FlashInfer GDN decode kernel does not support "
+                        "initial_state_indices; falling back to gather/index_copy."
+                    )
+            if output_fi is None:
+                # Fallback path for older FlashInfer kernels without pooled state indices.
+                state_indices = cache_indices.to(torch.int64)
+                valid = state_indices >= 0
+                if torch.any(valid):
+                    gather_idx = state_indices.clone()
+                    gather_idx[~valid] = 0
+                    state_for_kernel = ssm_states.index_select(0, gather_idx)
+                    if torch.any(~valid):
+                        state_for_kernel[~valid] = 0
+                    output_fi, _ = self._flashinfer_gated_delta_rule_decode(
+                        q=query_fi,
+                        k=key_fi,
+                        v=value_fi,
+                        state=state_for_kernel,
+                        A_log=A_log.detach(),
+                        a=a_fi,
+                        dt_bias=dt_bias.detach(),
+                        b=b_fi,
+                        scale=None,
+                        output=None,
+                        use_qk_l2norm=True,
+                    )
+                    ssm_states.index_copy_(0, state_indices[valid], state_for_kernel[valid])
+                    if torch.any(~valid):
+                        output_fi[~valid] = 0
+                else:
+                    output_fi = torch.zeros_like(value_fi)
 
             # Reshape output: [B, 1, HV, V] -> [1, B, HV, V]
             core_attn_out = output_fi.view(1, batch_size, num_value_heads, head_v_dim)
@@ -1716,16 +1758,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "dt_bias": dt_bias.detach(),
                     "b": b_mtp,
                 }
-                self._maybe_dump_workload_and_write_jsonl(
-                    "mtp",
-                    variable_axes={
-                        "batch_size": batch_size,
-                        "seq_len": draft_token_num,
-                        "pool_size": ssm_states.shape[0],
-                    },
-                    workload_tensors=workload_tensors,
-                    scale_value=scale_value,
-                )
+                # self._maybe_dump_workload_and_write_jsonl(
+                #     "mtp",
+                #     variable_axes={
+                #         "batch_size": batch_size,
+                #         "seq_len": draft_token_num,
+                #         "pool_size": ssm_states.shape[0],
+                #     },
+                #     workload_tensors=workload_tensors,
+                #     scale_value=scale_value,
+                # )
                 core_attn_out, _ = self._flashinfer_gated_delta_rule_mtp(
                     q=query_mtp,
                     k=key_mtp,
@@ -1814,7 +1856,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     },
                     workload_tensors={
                         # "q": q_for_kernel,
-                        # "k": k_for_kernel,
+                        "k": k_fi.detach(),
                         # "v": v_for_kernel,
                         # "state": initial_state,
                         "A_log": A_log.detach(),
