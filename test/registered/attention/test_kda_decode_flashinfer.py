@@ -235,9 +235,13 @@ def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
     d["q"] = q.unflatten(-1, (12, K)).unsqueeze(0)
     d["k"] = k.unflatten(-1, (12, K)).unsqueeze(0)
     d["v"] = v.unflatten(-1, (12, V)).unsqueeze(0)
-    assert not d["q"].is_contiguous()
-    assert not d["k"].is_contiguous()
-    assert not d["v"].is_contiguous()
+    # For B=1 PyTorch legitimately reports these gapped split views as
+    # contiguous because the only strided outer dimension is a singleton.
+    # Larger batches exercise the real non-contiguous qkv-split layout.
+    if batch_size > 1:
+        assert not d["q"].is_contiguous()
+        assert not d["k"].is_contiguous()
+        assert not d["v"].is_contiguous()
     pool_size = d["ssm"].shape[0]
     d["cache_indices"] = torch.randperm(pool_size, device="cuda", dtype=torch.int64)[
         :batch_size
