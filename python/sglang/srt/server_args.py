@@ -369,6 +369,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
     "cutedsl",
     "flashinfer",
+    "cake",
     "flashkda",
     "nvidia_kda",
     "ptx_kda",
@@ -6063,13 +6064,13 @@ class ServerArgs:
             )
 
         if (
-            decode == "flashinfer"
+            decode in ("flashinfer", "cake")
             and self.mamba_ssm_dtype != "bfloat16"
             and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
         ):
             raise ValueError(
-                "--linear-attn-decode-backend flashinfer on SM100+ requires "
+                f"--linear-attn-decode-backend {decode} on SM100+ requires "
                 "--mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
             )
@@ -7957,9 +7958,10 @@ class ServerArgs:
         # The Mamba/KDA state is stored in envelope-strided views; only
         # stride-audited kernels may read it (Stage 4 audit, per slot):
         # - decode: triton; flashinfer (recurrent_kda compiles the state slot
-        #   stride as a free int64 — natively strided); cutedsl (KDA fused
-        #   sigmoid-gating update made stride-safe) on KDA-hybrid models only —
-        #   cutedsl_gdn still compiles h0 against a contiguous dummy.
+        #   stride as a free int64 — natively strided); cake (the SGLang
+        #   adapter gathers/scatters compact per-request rows); cutedsl (KDA
+        #   fused sigmoid-gating update made stride-safe) on KDA-hybrid models
+        #   only — cutedsl_gdn still compiles h0 against a contiguous dummy.
         # - prefill: triton; flashkda (wrapper gathers/scatters a contiguous
         #   per-slot copy, external kernel never sees the pool); cutedsl
         #   (kernel_h compiles h0/ht with dynamic int64 strides), same
@@ -7967,7 +7969,7 @@ class ServerArgs:
         # - mamba (mamba2/short-conv state): triton only.
         # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
         # are MLA-hybrid) from GDN models (GQA-hybrid) for the cutedsl caveat.
-        decode_allowed = {"triton", "flashinfer"}
+        decode_allowed = {"triton", "flashinfer", "cake"}
         prefill_allowed = {"triton", "flashkda"}
         if self.use_mla_backend():
             decode_allowed.add("cutedsl")

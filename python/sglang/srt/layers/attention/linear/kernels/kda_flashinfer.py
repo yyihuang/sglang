@@ -9,6 +9,12 @@ Contract with the Triton KDA reference:
   - beta ``b`` is a logit, so this wrapper passes ``sigmoid(b)``;
   - q/k are L2-normalized in-kernel;
   - state layout is ``[N, HV, V, K]`` for committed and speculative state.
+
+The optional ``cake`` mode adapts SGLang's raw-gate/indexed-state decode call
+to FlashInfer's strict exported CAKE T=1 contract. The exported kernel accepts
+precomputed BF16 gate/beta tensors and dense identity-mapped state rows, so the
+adapter computes activations in FP32, gathers active state rows, launches CAKE,
+and scatters the updated rows back into SGLang's state pool.
 """
 
 import logging
@@ -64,13 +70,18 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
     KDA chunk kernel; the dispatcher keeps prefill on Triton / CuTe DSL.
     """
 
-    def __init__(self):
+    def __init__(self, backend: str = "cute-dsl"):
+        if backend not in ("cute-dsl", "cake"):
+            raise ValueError(
+                f"FlashInfer KDA backend must be 'cute-dsl' or 'cake', got {backend!r}"
+            )
         available, self._recurrent_kda = _get_flashinfer_kda_kernel()
         if not available or self._recurrent_kda is None:
             raise RuntimeError(
                 "FlashInfer KDA kernel (recurrent_kda) is not available. "
                 "Requires SM100 (Blackwell) and a FlashInfer build with KDA support."
             )
+        self._backend = backend
         # Cache the per-layer constant gate-param prep (A_log/dt_bias reshape+cast),
         # keyed by tensor identity. Layer params are persistent weights so id() is
         # stable; this removes the per-call reshape/float/contiguous work.
@@ -82,7 +93,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         # recurrent_kda contract (per-layer views are pool-stable, so id() is
         # a stable key — same lifetime argument as _gate_cache).
         self._state_contract_ok: set = set()
-        logger.info("Using FlashInfer KDA kernel")
+        logger.info("Using FlashInfer KDA kernel backend=%s", backend)
 
     def _check_state_stride_contract(self, ssm_states: torch.Tensor) -> None:
         """One-time (per pool view) check that ``ssm_states`` matches the
@@ -146,6 +157,105 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         # logit is enough (avoids an explicit fp32 upcast + downcast = 2 extra kernels).
         return torch.sigmoid(b).to(torch.bfloat16)
 
+    @staticmethod
+    def _cake_precompute_gate(
+        a: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: Optional[torch.Tensor],
+        lower_bound: Optional[float],
+        batch_size: int,
+        num_v_heads: int,
+        head_k_dim: int,
+    ) -> torch.Tensor:
+        """Match SGLang's fused Triton gate transform before BF16 handoff.
+
+        Triton consumes raw BF16 ``a`` but evaluates the transform in FP32.
+        CAKE T=1 consumes an already transformed BF16 log-gate, so keep every
+        operation in FP32 until the final unavoidable contract conversion.
+        """
+        gate_input = a.reshape(batch_size, num_v_heads, head_k_dim).float()
+        if dt_bias is not None:
+            gate_input = (
+                gate_input + dt_bias.reshape(1, num_v_heads, head_k_dim).float()
+            )
+        decay = A_log.reshape(1, num_v_heads, 1).float().exp()
+        if lower_bound is None:
+            gate = -decay * torch.nn.functional.softplus(gate_input)
+        else:
+            gate = float(lower_bound) * torch.sigmoid(decay * gate_input)
+        return gate.to(torch.bfloat16).reshape(batch_size, 1, num_v_heads, head_k_dim)
+
+    def _decode_cake(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: Optional[torch.Tensor],
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        lower_bound: Optional[float],
+    ) -> torch.Tensor:
+        batch_size = cache_indices.shape[0]
+        num_heads, head_k_dim = q.shape[2:]
+        num_v_heads, head_v_dim = v.shape[2:]
+
+        query_fi = (
+            q.reshape(batch_size, 1, num_heads, head_k_dim)
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+        key_fi = (
+            k.reshape(batch_size, 1, num_heads, head_k_dim)
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+        value_fi = (
+            v.reshape(batch_size, 1, num_v_heads, head_v_dim)
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+        gate_fi = self._cake_precompute_gate(
+            a,
+            A_log,
+            dt_bias,
+            lower_bound,
+            batch_size,
+            num_v_heads,
+            head_k_dim,
+        )
+        beta_fi = (
+            torch.sigmoid(b.float())
+            .to(torch.bfloat16)
+            .reshape(batch_size, 1, num_v_heads)
+        )
+
+        # Slot 0 is SGLang's reserved CUDA-graph padding row. Preserve existing
+        # zeros and map any legacy negative marker there as well. Multiple pad
+        # rows may race on slot 0 during index_copy_, but that row is never
+        # allocated to a request and its value is intentionally disposable.
+        state_indices = cache_indices.clamp(min=0).to(torch.int64)
+        state_batch = ssm_states.index_select(0, state_indices).contiguous()
+
+        output_fi, _ = self._recurrent_kda(
+            q=query_fi,
+            k=key_fi,
+            v=value_fi,
+            g=gate_fi,
+            beta=beta_fi,
+            scale=None,
+            initial_state=state_batch,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=False,
+            backend="cake",
+        )
+        ssm_states.index_copy_(0, state_indices, state_batch)
+        return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
+
     # ---- decode ----
 
     def decode(
@@ -174,6 +284,20 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         # unified memory / page-major it is an envelope-strided view, which the
         # cu_seqlens path supports — verify the compiled contract once per pool.
         self._check_state_stride_contract(ssm_states)
+
+        if self._backend == "cake":
+            return self._decode_cake(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                lower_bound=lower_bound,
+            )
 
         # Pack each request as a length-1 sequence ([1, B, ...] + cu_seqlens) so
         # recurrent_kda indexes the committed pool IN-KERNEL via ssm_state_indices.

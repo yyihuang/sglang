@@ -4,6 +4,7 @@ Runs the Low Latency DSPARK recipe and the Balanced DCP/HiCache recipe on
 eight B300 GPUs. Each server must preserve basic model quality on GSM8K.
 """
 
+import os
 import unittest
 
 from sglang.srt.utils import kill_process_tree
@@ -25,6 +26,13 @@ MODEL_PATH = (
 DSPARK_DRAFT_MODEL = "RadixArk/Kimi-K3-DSpark"
 SERVER_LAUNCH_TIMEOUT = 3600
 GPU_IDLE_TIMEOUT = 120
+DECODE_BACKEND = os.getenv("SGLANG_K3_E2E_DECODE_BACKEND")
+
+
+def _decode_backend_args():
+    if DECODE_BACKEND is None:
+        return []
+    return ["--linear-attn-decode-backend", DECODE_BACKEND]
 
 
 def _stop_server(process):
@@ -67,7 +75,8 @@ class TestKimiK3B300LowLatency(GSM8KMixin, CustomTestCase):
                 "--speculative-dspark-block-size",
                 "7",
                 "--enable-linear-replayssm-spec",
-            ],
+            ]
+            + _decode_backend_args(),
         )
 
     @classmethod
@@ -105,7 +114,8 @@ class TestKimiK3B300Balanced(GSM8KMixin, CustomTestCase):
                 "--mamba-full-memory-ratio",
                 "7.21",
                 "--enable-hierarchical-cache",
-            ],
+            ]
+            + _decode_backend_args(),
         )
 
     @classmethod
