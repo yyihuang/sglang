@@ -672,6 +672,12 @@ def _trace_alphamoe_nvfp4_shape(
 ) -> None:
     if os.environ.get("SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES", "0") != "1":
         return
+    # Validation may arm tracing only after server initialization, CUDA graph
+    # capture, and warmup have finished.  This keeps startup-only padded graph
+    # shapes out of evidence that is explicitly labeled as request-observed.
+    arm_file = os.environ.get("SGLANG_FLASHINFER_ALPHAMOE_TRACE_ARM_FILE")
+    if arm_file and not os.path.isfile(arm_file):
+        return
     num_experts, gate_up_rows, _ = quant_info.w13_weight.shape
     key = (
         int(hidden_states.shape[0]),
