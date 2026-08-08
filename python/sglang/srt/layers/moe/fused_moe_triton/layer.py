@@ -380,29 +380,12 @@ class FusedMoE(torch.nn.Module):
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
         if get_moe_runner_backend().is_flashinfer_alphamoe():
-            if not isinstance(self.quant_method, Fp8MoEMethod):
-                raise ValueError(
-                    "flashinfer_alphamoe supports only native fine-grained FP8 "
-                    "MoE weights. NVFP4/ModelOpt global scales cannot be "
-                    "represented by the AlphaMoE W8A8 API."
-                )
-            if (
-                not self.quant_method.block_quant
-                or tuple(self.quant_method.weight_block_size) != (128, 128)
-                or not self.quant_method.quant_config.is_checkpoint_fp8_serialized
-                or self.quant_method.use_mxfp8
-                or self.quant_method.is_fp4_expert
-            ):
-                raise ValueError(
-                    "flashinfer_alphamoe requires a serialized W8A8 checkpoint "
-                    "with FP32 128x128 block scales; MXFP8 and NVFP4/ModelOpt "
-                    "formats are unsupported."
-                )
             from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+                validate_alphamoe_nvfp4_runner_contract,
                 validate_alphamoe_runner_contract,
             )
 
-            validate_alphamoe_runner_contract(
+            contract_kwargs = dict(
                 tp_size=self.moe_tp_size,
                 ep_size=self.moe_ep_size,
                 a2a_is_none=get_moe_a2a_backend().is_none(),
@@ -419,6 +402,36 @@ class FusedMoE(torch.nn.Module):
                 top_k=top_k,
                 num_experts=num_experts,
             )
+            if isinstance(self.quant_method, Fp8MoEMethod):
+                if (
+                    not self.quant_method.block_quant
+                    or tuple(self.quant_method.weight_block_size) != (128, 128)
+                    or not self.quant_method.quant_config.is_checkpoint_fp8_serialized
+                    or self.quant_method.use_mxfp8
+                    or self.quant_method.is_fp4_expert
+                ):
+                    raise ValueError(
+                        "flashinfer_alphamoe W8A8 requires a serialized FP8 "
+                        "checkpoint with FP32 128x128 block scales"
+                    )
+                validate_alphamoe_runner_contract(**contract_kwargs)
+            elif isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod):
+                if (
+                    not self.quant_method.quant_config.is_checkpoint_nvfp4_serialized
+                    or self.quant_method.quant_config.group_size != 16
+                    or self.quant_method.quant_config.use_per_token_activation
+                ):
+                    raise ValueError(
+                        "flashinfer_alphamoe NVFP4 requires a serialized static "
+                        "ModelOpt FP4 checkpoint with group_size=16; per-token "
+                        "activation scaling is not supported by PR #4340"
+                    )
+                validate_alphamoe_nvfp4_runner_contract(**contract_kwargs)
+            else:
+                raise ValueError(
+                    "flashinfer_alphamoe supports only validated W8A8 FP8 or "
+                    "serialized ModelOpt NVFP4 MoE weights"
+                )
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
             and get_moe_runner_backend().is_flashinfer_trtllm()

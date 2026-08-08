@@ -6601,12 +6601,10 @@ class ServerArgs:
             effective_quantization = (
                 view.quantization or self.get_model_config().quantization
             )
-            if effective_quantization != "fp8":
+            if effective_quantization not in ("fp8", "modelopt_fp4"):
                 raise ValueError(
-                    "flashinfer_alphamoe supports only native W8A8 fine-grained "
-                    "FP8 checkpoints (--quantization fp8) with FP32 128x128 "
-                    "block scales. NVFP4/ModelOpt global scales are not "
-                    "representable by this kernel API. Got effective "
+                    "flashinfer_alphamoe supports native W8A8 fine-grained FP8 "
+                    "or serialized ModelOpt NVFP4 checkpoints. Got effective "
                     f"quantization={effective_quantization!r}."
                 )
             if self.tp_size != 4:

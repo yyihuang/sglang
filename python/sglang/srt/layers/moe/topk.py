@@ -442,6 +442,14 @@ class TopK(BaseFusedOp):
         # flashinfer_mxfp4 backend only: True -> STANDARD (Mxfp4FlashinferTrtllmMoEMethod
         # consumes), False -> BYPASSED (flashinfer's own mxfp4 kernel). No-op otherwise.
         self.is_fp4_experts = is_fp4_experts
+        # AlphaMoE W8A8 owns routing and therefore consumes raw logits.  The
+        # NVFP4 kernel only consumes an already aligned route plan, so ModelOpt
+        # FP4 must keep SGLang's model-specific TopK (grouped sigmoid,
+        # correction bias, renormalization, and routed scaling included).
+        self.alphamoe_uses_standard_topk = (
+            quant_config is not None
+            and quant_config.get_name() in ("modelopt_fp4", "nvfp4_online")
+        )
         self.topk_config = TopKConfig(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
@@ -525,13 +533,14 @@ class TopK(BaseFusedOp):
                 else TopKOutputFormat.BYPASSED
             )
         # ===== END TO BE REFACTORED ====
-        elif (
-            get_moe_runner_backend().is_flashinfer_alphamoe()
-            or get_moe_runner_backend().is_flashinfer_trtllm()
-            or (
-                get_moe_runner_backend().is_flashinfer_mxfp4()
-                and not self.is_fp4_experts
+        elif get_moe_runner_backend().is_flashinfer_alphamoe():
+            output_format = (
+                TopKOutputFormat.STANDARD
+                if self.alphamoe_uses_standard_topk
+                else TopKOutputFormat.BYPASSED
             )
+        elif get_moe_runner_backend().is_flashinfer_trtllm() or (
+            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:

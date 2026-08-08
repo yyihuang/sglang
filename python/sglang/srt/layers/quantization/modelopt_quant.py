@@ -2031,6 +2031,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
+        self.enable_flashinfer_alphamoe_moe = (
+            get_moe_runner_backend().is_flashinfer_alphamoe()
+        )
         self._cache_permute_indices = {}
 
     @property
@@ -2153,7 +2156,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
         # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or self.enable_flashinfer_alphamoe_moe:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2173,7 +2176,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or self.enable_flashinfer_alphamoe_moe:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
@@ -2293,7 +2296,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return
 
         # Calculate input scales based on strategy
-        if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
+        if (
+            self.enable_flashinfer_cutlass_moe
+            or self.enable_flashinfer_trtllm_moe
+            or self.enable_flashinfer_alphamoe_moe
+        ):
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         elif self.enable_flashinfer_cutedsl_moe:
@@ -2354,6 +2361,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
+        if self.enable_flashinfer_alphamoe_moe:
+            # AlphaMoE applies the gate scale before SiLU, while the up scale
+            # also requantizes the intermediate into GEMM2's input domain.
+            copy_or_rebind_param(
+                layer,
+                "g1_scale_c",
+                (layer.w2_input_scale_quant * layer.g1_alphas_up)
+                .to(torch.float32)
+                .contiguous(),
+            )
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             gemm1_clamp_limit = (
@@ -2402,7 +2419,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ("w2", layer.w2_weight_scale),
         ]:
             # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+                or self.enable_flashinfer_alphamoe_moe
+            ):
                 expected_blocks = {
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
@@ -2423,7 +2443,38 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
 
         # Weight processing based on strategy
-        if (
+        if self.enable_flashinfer_alphamoe_moe:
+            # PR #4340 consumes checkpoint-canonical packed weights and linear
+            # per-16 E4M3 scales.  Do not run either TRT-LLM's row shuffle or
+            # CUTLASS's scale swizzle here.
+            copy_or_rebind_param(layer, "w13_weight", layer.w13_weight.contiguous())
+            copy_or_rebind_param(layer, "w2_weight", layer.w2_weight.contiguous())
+            copy_or_rebind_param(
+                layer, "w13_weight_scale", layer.w13_weight_scale.contiguous()
+            )
+            copy_or_rebind_param(
+                layer, "w2_weight_scale", layer.w2_weight_scale.contiguous()
+            )
+            layer.w13_blockscale_swizzled = layer.w13_weight_scale
+            layer.w2_blockscale_swizzled = layer.w2_weight_scale
+
+            from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+                validate_alphamoe_nvfp4_weights,
+                warmup_alphamoe_nvfp4_jit_module,
+            )
+
+            validate_alphamoe_nvfp4_weights(
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                output1_scale_gate_scalar=layer.g1_alphas,
+                output1_scale_scalar=layer.g1_scale_c,
+                output2_scale_scalar=layer.g2_alphas,
+                top_k=self.moe_runner_config.top_k,
+            )
+            warmup_alphamoe_nvfp4_jit_module()
+        elif (
             self.enable_flashinfer_trtllm_moe
             and reorder_rows_for_gated_act_gemm is not None
             and shuffle_matrix_sf_a is not None
@@ -2585,6 +2636,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
+        if moe_runner_backend.is_flashinfer_alphamoe():
+            import sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe  # noqa: F401
+
         if moe_runner_backend.is_cutlass():
             raise NotImplementedError(
                 "moe_runner_backend=cutlass is not supported for NVFP4 MoE. "
@@ -2644,6 +2698,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_marlin():
             quant_info = self.get_marlin_quant_info(layer)
+            return self.runner.run(dispatch_output, quant_info)
+
+        if self.enable_flashinfer_alphamoe_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+                FlashInferAlphaMoeNvFp4QuantInfo,
+            )
+
+            quant_info = FlashInferAlphaMoeNvFp4QuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.w13_weight_scale,
+                w2_weight_scale=layer.w2_weight_scale,
+                output1_scale_gate_scalar=layer.g1_alphas,
+                output1_scale_scalar=layer.g1_scale_c,
+                output2_scale_scalar=layer.g2_alphas,
+                input_scale_quant=layer.w13_input_scale_quant,
+            )
             return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path
