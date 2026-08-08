@@ -6612,7 +6612,12 @@ class ServerArgs:
             if view.enable_torch_compile:
                 raise ValueError(
                     "flashinfer_alphamoe does not support --enable-torch-compile; "
-                    "the fused router requires the raw-logit TopK bypass"
+                    "its model-specific execution contracts are not compile-validated"
+                )
+            if view.enable_symm_mem:
+                raise ValueError(
+                    "flashinfer_alphamoe does not support --enable-symm-mem; "
+                    "its output buffer is not allocated from symmetric memory"
                 )
             if not is_sm100_supported():
                 raise ValueError(

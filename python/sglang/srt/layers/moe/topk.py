@@ -447,8 +447,7 @@ class TopK(BaseFusedOp):
         # FP4 must keep SGLang's model-specific TopK (grouped sigmoid,
         # correction bias, renormalization, and routed scaling included).
         self.alphamoe_uses_standard_topk = (
-            quant_config is not None
-            and quant_config.get_name() in ("modelopt_fp4", "nvfp4_online")
+            quant_config is not None and quant_config.get_name() == "modelopt_fp4"
         )
         self.topk_config = TopKConfig(
             top_k=top_k,

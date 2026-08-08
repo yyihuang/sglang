@@ -2459,8 +2459,8 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     if runner == "flashinfer_alphamoe":
         logger.warning(
             "FlashInfer AlphaMoE is enabled. --disable-shared-experts-fusion "
-            "is automatically set because the fused router supports at most "
-            "512 experts."
+            "is automatically set because the backend executes routed experts "
+            "separately from shared experts."
         )
         return {"disable_shared_experts_fusion": True}
     return {}
