@@ -507,8 +507,13 @@ class TopK(MultiPlatformOp):
                 else TopKOutputFormat.BYPASSED
             )
         # ===== END TO BE REFACTORED ====
-        elif get_moe_runner_backend().is_flashinfer_trtllm() or (
-            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
+        elif (
+            get_moe_runner_backend().is_flashinfer_alphamoe()
+            or get_moe_runner_backend().is_flashinfer_trtllm()
+            or (
+                get_moe_runner_backend().is_flashinfer_mxfp4()
+                and not self.is_fp4_experts
+            )
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:
