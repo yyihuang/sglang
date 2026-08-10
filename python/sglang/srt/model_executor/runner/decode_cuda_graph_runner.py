@@ -51,6 +51,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+from sglang.srt.mem_cache.allocator.mamba import (
+    MAMBA_STATE_INDEX_REPLAY_PROVENANCE,
+)
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
@@ -183,6 +186,11 @@ def build_replay_fb_view(
             if buffers.mamba_track_indices is None
             else buffers.mamba_track_indices[:bs]
         ),
+        # Host request identities prove that the active request gather is not a
+        # top-k/duplicate expansion.  Mamba metadata binds this proof to its
+        # exact stable post-v2p index buffer; padding rows are not represented.
+        rids=getattr(forward_batch, "rids", None),
+        mamba_state_index_replay_provenance=MAMBA_STATE_INDEX_REPLAY_PROVENANCE,
         spec_info=forward_batch.spec_info,
     )
 
@@ -995,6 +1003,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
+            forward_batch.mamba_state_index_replay_provenance = (
+                MAMBA_STATE_INDEX_REPLAY_PROVENANCE
+            )
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
