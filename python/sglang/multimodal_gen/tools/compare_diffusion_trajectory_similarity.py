@@ -274,6 +274,9 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
         kwargs["transformer_weights_path"] = transformer_path
     if component_paths:
         kwargs["component_paths"] = component_paths
+    attention_backend = getattr(args, f"{variant}_attention_backend")
+    if attention_backend is not None:
+        kwargs["attention_backend"] = attention_backend
     return kwargs
 
 
@@ -453,6 +456,14 @@ def main() -> None:
     parser.add_argument("--reference-transformer-path")
     parser.add_argument("--candidate-transformer-path")
     parser.add_argument(
+        "--reference-attention-backend",
+        help="Optional attention backend for the reference run.",
+    )
+    parser.add_argument(
+        "--candidate-attention-backend",
+        help="Optional attention backend for the candidate run.",
+    )
+    parser.add_argument(
         "--reference-fp4-gemm-backend",
         help=(
             "Optional NVFP4 GEMM backend override for the reference run, e.g. "
@@ -566,6 +577,10 @@ def main() -> None:
             "candidate": cand_server_kwargs,
         },
         "backend_overrides": {
+            "reference_attention_backend": args.reference_attention_backend
+            or "default",
+            "candidate_attention_backend": args.candidate_attention_backend
+            or "default",
             "reference_fp4_gemm_backend": reference_run["fp4_gemm_backend"],
             "candidate_fp4_gemm_backend": candidate_run["fp4_gemm_backend"],
         },
