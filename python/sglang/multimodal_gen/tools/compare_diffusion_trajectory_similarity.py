@@ -27,6 +27,7 @@ import contextlib
 import json
 import math
 import os
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -406,17 +407,17 @@ def run_variant(
                 )
 
             measured_results = []
+            generation_times = []
             for _ in range(measure_runs):
+                start_time = time.perf_counter()
                 measured_results.append(
                     _normalize_single_result(
                         generator.generate(sampling_params_kwargs=sampling_kwargs)
                     )
                 )
+                generation_times.append(time.perf_counter() - start_time)
 
     final_result = measured_results[-1]
-    generation_times = [
-        _extract_generation_time_s(result) for result in measured_results
-    ]
     peak_memories = [float(result.peak_memory_mb) for result in measured_results]
     total_duration_ms = [
         duration
