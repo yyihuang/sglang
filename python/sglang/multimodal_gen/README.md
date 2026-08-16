@@ -98,6 +98,12 @@ KV sequence lengths differ. Packed-varlen, masks, GQA/MQA, and ring attention
 are not supported. Ulysses-only sequence parallelism is supported when each
 rank retains a valid local head count.
 
+This integration is experimental and is not a production quality claim. The
+Cake path directly quantizes Q/K/V and does not implement the Q-centering and
+QK-logit correction used by FlashInfer's SM120 NVFP4 backend. Qualify complete
+diffusion trajectories and generated frames against the dense backend before
+enabling it for a model; isolated attention-kernel agreement is insufficient.
+
 ### Component residency
 
 Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each
