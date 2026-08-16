@@ -358,6 +358,27 @@ def _extract_total_duration_ms(result: Any) -> float | None:
     return float(total_duration_ms)
 
 
+def _extract_generation_time_s(result: Any) -> float:
+    """Return a populated end-to-end generation duration.
+
+    ``DiffGenerator`` currently snapshots ``timer.duration`` before the timer
+    context exits, so ``GenerationResult.generation_time`` can still be zero
+    even though the scheduler metrics contain the completed request duration.
+    Prefer a positive public field and otherwise use the scheduler's
+    ``total_duration_ms`` measurement.
+    """
+    generation_time = float(result.generation_time)
+    if generation_time > 0:
+        return generation_time
+    total_duration_ms = _extract_total_duration_ms(result)
+    if total_duration_ms is None or total_duration_ms <= 0:
+        raise ValueError(
+            "Generation result contains neither a positive generation_time "
+            "nor a positive metrics['total_duration_ms']."
+        )
+    return total_duration_ms / 1000.0
+
+
 def run_variant(
     *,
     server_kwargs: dict[str, Any],
@@ -393,7 +414,9 @@ def run_variant(
                 )
 
     final_result = measured_results[-1]
-    generation_times = [float(result.generation_time) for result in measured_results]
+    generation_times = [
+        _extract_generation_time_s(result) for result in measured_results
+    ]
     peak_memories = [float(result.peak_memory_mb) for result in measured_results]
     total_duration_ms = [
         duration
