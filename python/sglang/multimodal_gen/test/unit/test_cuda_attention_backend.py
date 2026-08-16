@@ -10,9 +10,13 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 )
 from sglang.multimodal_gen.runtime.platforms.cuda import (
     CudaPlatformBase,
+    _CakeNVFP4AttentionBackendResolver,
     _SageAttentionBackendResolver,
 )
-from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import (
+    AttentionBackendEnum,
+    DeviceCapability,
+)
 
 SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -122,6 +126,30 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)
+
+    def test_cake_nvfp4_resolver_accepts_sm100_and_sm103(self):
+        flashinfer = types.ModuleType("flashinfer")
+        flashinfer.nvfp4_attention = object()
+        expected = "sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4.CakeNVFP4AttentionBackend"
+        with patch.dict(sys.modules, {"flashinfer": flashinfer}):
+            for capability in (DeviceCapability(10, 0), DeviceCapability(10, 3)):
+                with self.subTest(capability=capability), patch.object(
+                    FakeCudaPlatform,
+                    "get_device_capability",
+                    return_value=capability,
+                ):
+                    self.assertEqual(
+                        _CakeNVFP4AttentionBackendResolver.resolve(FakeCudaPlatform),
+                        expected,
+                    )
+
+    def test_cake_nvfp4_resolver_rejects_other_architectures(self):
+        with patch.object(
+            FakeCudaPlatform,
+            "get_device_capability",
+            return_value=DeviceCapability(12, 0),
+        ), self.assertRaisesRegex(ValueError, "10.0 or 10.3"):
+            _CakeNVFP4AttentionBackendResolver.resolve(FakeCudaPlatform)
 
     def test_hopper_sage_attention_without_sm90_fix_falls_back(self):
         FakeCudaPlatform.is_hopper_device = True

@@ -55,6 +55,16 @@ class _FakeAITERBackend:
         return ("packed varlen attention",) if requirements.packed_varlen else ()
 
 
+class _FakeCakeNVFP4Backend:
+    @classmethod
+    def get_enum(cls) -> AttentionBackendEnum:
+        return AttentionBackendEnum.CAKE_NVFP4
+
+    @classmethod
+    def unsupported_requirements(cls, _requirements) -> tuple[str, ...]:
+        return ()
+
+
 class _FakePlatform:
     device_name = "test"
     selected_backend = None
@@ -64,6 +74,8 @@ class _FakePlatform:
         cls.selected_backend = selected_backend
         if selected_backend == AttentionBackendEnum.AITER:
             return "fake.AITERBackend"
+        if selected_backend == AttentionBackendEnum.CAKE_NVFP4:
+            return "fake.CakeNVFP4Backend"
         if selected_backend in (None, AttentionBackendEnum.FA):
             return "fake.FABackend"
         return "fake.SDPABackend"
@@ -71,6 +83,7 @@ class _FakePlatform:
 
 _FAKE_BACKENDS = {
     "fake.AITERBackend": _FakeAITERBackend,
+    "fake.CakeNVFP4Backend": _FakeCakeNVFP4Backend,
     "fake.FABackend": _FakeFABackend,
     "fake.SDPABackend": _FakeSDPABackend,
 }
@@ -182,6 +195,27 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 is_cross_attention=False,
                 supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
             )
+
+    def test_cake_nvfp4_falls_back_for_cross_attention(self):
+        backend = self._resolve(
+            AttentionBackendEnum.CAKE_NVFP4,
+            explicit=True,
+            is_cross_attention=True,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        )
+
+        self.assertIs(backend, _FakeFABackend)
+        self.assertIsNone(_FakePlatform.selected_backend)
+
+    def test_cake_nvfp4_remains_strict_for_self_attention(self):
+        backend = self._resolve(
+            AttentionBackendEnum.CAKE_NVFP4,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.CAKE_NVFP4},
+        )
+
+        self.assertIs(backend, _FakeCakeNVFP4Backend)
 
 
 if __name__ == "__main__":

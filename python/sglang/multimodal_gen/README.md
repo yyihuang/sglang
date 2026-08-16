@@ -77,6 +77,27 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
+### Cake NVFP4 attention for Wan
+
+On B200/GB200 (`sm_100`) and B300/GB300 (`sm_103`), a FlashInfer build that
+exports `flashinfer.nvfp4_attention` can run the dense self-attention layers of
+Wan's ModelOpt NVFP4 checkpoint through the Cake backend:
+
+```bash
+sglang generate \
+  --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
+  --attention-backend cake_nvfp4 \
+  --prompt "A curious raccoon walks through a sunlit forest" \
+  --save-output
+```
+
+This backend is intentionally fail-closed: it accepts BF16, noncausal dense
+self-attention with equal Q/K/V shapes and head dimension 128. Wan
+cross-attention continues to use the normal dense backend because its query and
+KV sequence lengths differ. Packed-varlen, masks, GQA/MQA, and ring attention
+are not supported. Ulysses-only sequence parallelism is supported when each
+rank retains a valid local head count.
+
 ### Component residency
 
 Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each

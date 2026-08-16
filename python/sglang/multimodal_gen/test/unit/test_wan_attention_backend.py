@@ -3,13 +3,35 @@ from unittest.mock import patch
 
 from torch import nn
 
-from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanSelfAttention
+from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
+    WanSelfAttention,
+    WanTransformer3DModel,
+    _wan_cross_attention_backends,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 _WAN = "sglang.multimodal_gen.runtime.models.dits.wanvideo"
 
 
 class TestWanAttentionBackendRole(unittest.TestCase):
+    def test_cake_nvfp4_is_admitted_for_wan_self_attention_only(self):
+        self.assertIn(
+            AttentionBackendEnum.CAKE_NVFP4,
+            WanTransformer3DModel._supported_attention_backends,
+        )
+        cross = _wan_cross_attention_backends(
+            {
+                AttentionBackendEnum.CAKE_NVFP4,
+                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            }
+        )
+        self.assertEqual(
+            cross,
+            {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        )
+
     def test_cross_attention_role_is_forwarded_to_usp(self):
         with (
             patch(f"{_WAN}.ColumnParallelLinear", return_value=nn.Identity()),

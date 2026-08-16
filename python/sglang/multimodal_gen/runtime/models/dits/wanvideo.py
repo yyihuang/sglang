@@ -74,6 +74,17 @@ from sglang.srt.utils import add_prefix
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
+
+def _wan_cross_attention_backends(
+    backends: set[AttentionBackendEnum],
+) -> set[AttentionBackendEnum]:
+    """Keep cross-attention on backends that support unequal Q/KV lengths."""
+    return {
+        backend
+        for backend in backends
+        if not backend.is_sparse and backend != AttentionBackendEnum.CAKE_NVFP4
+    }
+
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
@@ -497,9 +508,9 @@ class WanTransformerBlock(nn.Module):
         )
 
         # 2. Cross-attention
-        cross_attn_backends = {
-            b for b in supported_attention_backends if not b.is_sparse
-        }
+        cross_attn_backends = _wan_cross_attention_backends(
+            supported_attention_backends
+        )
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -767,9 +778,9 @@ class WanTransformerBlock_VSA(nn.Module):
         )
 
         # 2. Cross-attention
-        cross_attn_backends = {
-            b for b in supported_attention_backends if not b.is_sparse
-        }
+        cross_attn_backends = _wan_cross_attention_backends(
+            supported_attention_backends
+        )
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -928,6 +939,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
+    _supported_attention_backends = CachableDiT._supported_attention_backends | {
+        AttentionBackendEnum.CAKE_NVFP4
+    }
 
     def __init__(
         self,

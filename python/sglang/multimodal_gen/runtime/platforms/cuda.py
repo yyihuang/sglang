@@ -114,6 +114,29 @@ class _DynamicCudnnSDPAAttentionBackendResolver(_DirectCudaAttentionBackendResol
     backend_cls_str = _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR
 
 
+class _CakeNVFP4AttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.CAKE_NVFP4
+    required_capabilities = {(10, 0), (10, 3)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        if capability is None or tuple(capability) not in cls.required_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "Cake NVFP4 attention requires compute capability 10.0 or 10.3; "
+                f"this device reports {found}."
+            )
+        try:
+            from flashinfer import nvfp4_attention  # noqa: F401
+        except ImportError as error:
+            raise ImportError(
+                "Cake NVFP4 attention requires a FlashInfer build that exports "
+                "flashinfer.nvfp4_attention."
+            ) from error
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4.CakeNVFP4AttentionBackend"
+
+
 class _SparseLinearAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SLA_ATTN
     backend_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
@@ -364,6 +387,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _TorchSDPAAttentionBackendResolver,
         _TorchCudnnSDPAAttentionBackendResolver,
         _DynamicCudnnSDPAAttentionBackendResolver,
+        _CakeNVFP4AttentionBackendResolver,
         _SparseLinearAttentionBackendResolver,
         _SageSparseLinearAttentionBackendResolver,
         _SlidingTileAttentionBackendResolver,

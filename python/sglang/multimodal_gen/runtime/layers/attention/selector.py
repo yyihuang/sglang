@@ -195,7 +195,10 @@ def get_attn_backend(
     allowed_fallback_reason = None
     if selected_backend is None:
         allowed_fallback_reason = "platform default fallback"
-    elif is_cross_attention and selected_backend.is_sparse:
+    elif is_cross_attention and (
+        selected_backend.is_sparse
+        or selected_backend == AttentionBackendEnum.CAKE_NVFP4
+    ):
         allowed_fallback_reason = "dense cross-attention fallback"
     elif not selection_is_explicit:
         allowed_fallback_reason = "platform default fallback"
