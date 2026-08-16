@@ -105,7 +105,12 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             ) from error
 
         query_hnd = query.transpose(1, 2).contiguous()
-        key_hnd = key.transpose(1, 2).contiguous()
+        # Translating every key by the same per-head vector adds a constant to
+        # each row of QK^T, so softmax attention is unchanged. Centering K
+        # before FP4 quantization removes the common-mode component without
+        # requiring a correction term in the attention kernel.
+        key_centered = key - key.mean(dim=1, keepdim=True)
+        key_hnd = key_centered.transpose(1, 2).contiguous()
         value_hnd = value.transpose(1, 2).contiguous()
         output_hnd = nvfp4_attention(
             query_hnd,
