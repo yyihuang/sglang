@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4 import (
     CakeNVFP4AttentionBackend,
@@ -43,10 +47,68 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         }
         for overrides, message in cases:
             kwargs = defaults | overrides
-            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(
-                ValueError, message
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(ValueError, message),
             ):
                 CakeNVFP4AttentionImpl(**kwargs)
+
+    def test_forward_uses_nhd_and_reuses_caller_owned_buffers(self):
+        impl = CakeNVFP4AttentionImpl(
+            num_heads=40,
+            num_kv_heads=40,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            causal=False,
+        )
+        query = Mock()
+        query.shape = (1, 4800, 40, 128)
+        query.ndim = 4
+        query.device = SimpleNamespace(type="cuda", index=0)
+        query.dtype = torch.bfloat16
+        query.is_contiguous.return_value = True
+        key = Mock()
+        key.shape = query.shape
+        key.ndim = query.ndim
+        key.device = query.device
+        key.dtype = query.dtype
+        key.is_contiguous.return_value = True
+        value = Mock()
+        value.shape = query.shape
+        value.ndim = query.ndim
+        value.device = query.device
+        value.dtype = query.dtype
+        value.is_contiguous.return_value = True
+
+        workspace = object()
+        output = object()
+        allocate = Mock(return_value=workspace)
+        run = Mock(side_effect=lambda *_args, **kwargs: kwargs["out"])
+        fake_flashinfer = SimpleNamespace(
+            allocate_cake_nvfp4_attention_workspace=allocate,
+            nvfp4_attention=run,
+        )
+        with (
+            patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "cake_nvfp4.torch.empty_like",
+                return_value=output,
+            ) as empty_like,
+        ):
+            first = impl.forward(query, key, value, None)
+            second = impl.forward(query, key, value, None)
+
+        self.assertIs(first, output)
+        self.assertIs(second, output)
+        allocate.assert_called_once_with(query, qkv_layout="NHD")
+        empty_like.assert_called_once_with(query, dtype=torch.bfloat16)
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["backend"], "cake")
+            self.assertEqual(call.kwargs["qkv_layout"], "NHD")
+            self.assertIs(call.kwargs["workspace"], workspace)
+            self.assertIs(call.kwargs["out"], output)
 
 
 if __name__ == "__main__":
