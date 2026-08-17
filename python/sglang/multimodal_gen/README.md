@@ -106,11 +106,13 @@ enabling it for a model; isolated attention-kernel agreement is insufficient.
 
 The current B200 qualification uses the exact ModelOpt checkpoint above at
 640x384, 17 frames, 12 steps, seed 0, one warmup, and two measured requests.
-FA averages 2.8304 seconds and Cake averages 3.1103 seconds (0.910x, 9.89%
-slower). Denoising-trajectory cosine falls from 0.999923 at step 0 to 0.087235
-at step 11, and all-frame cosine is 0.722415. The integration is therefore
-retained for correctness and performance follow-up, but is not serving
-qualified and should not be selected by default.
+With native BSHD quantization, reusable workspace, and caller-owned output, FA
+averages 2.619980 seconds and Cake averages 2.674145 seconds (0.9797x, 2.07%
+slower). This removes most of the earlier integration overhead, but does not
+fix model quality: denoising-trajectory cosine falls from 0.999933 at step 0 to
+0.272738 at step 11, and all-frame cosine is 0.688079. The integration is
+therefore retained for correctness and performance follow-up, but is not
+serving qualified and should not be selected by default.
 
 ### Component residency
 
