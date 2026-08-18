@@ -202,7 +202,9 @@ class CakeDsv4DecodeWorkspace:
             bmm1_scale=softmax_scale,
             bmm2_scale=1.0,
             sinks=sinks,
-            kv_layout="NHD",
+            # Gathered scratch is a flat 3-D [row, head, dim] pool.  FlashInfer
+            # represents that form as HND; NHD is reserved for paged 4-D input.
+            kv_layout="HND",
             enable_pdl=False,
             backend="cake",
         )
