@@ -254,6 +254,9 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
     component_paths = parse_component_overrides(
         getattr(args, f"{variant}_component_path") or []
     )
+    component_attention_backends = parse_component_overrides(
+        getattr(args, f"{variant}_component_attention_backend", None) or []
+    )
     transformer_path = getattr(args, f"{variant}_transformer_path")
 
     kwargs: dict[str, Any] = {
@@ -275,6 +278,8 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
         kwargs["transformer_weights_path"] = transformer_path
     if component_paths:
         kwargs["component_paths"] = component_paths
+    if component_attention_backends:
+        kwargs["component_attention_backends"] = component_attention_backends
     attention_backend = getattr(args, f"{variant}_attention_backend")
     if attention_backend is not None:
         kwargs["attention_backend"] = attention_backend
@@ -486,6 +491,24 @@ def main() -> None:
     parser.add_argument(
         "--candidate-attention-backend",
         help="Optional attention backend for the candidate run.",
+    )
+    parser.add_argument(
+        "--reference-component-attention-backend",
+        action="append",
+        default=[],
+        help=(
+            "Repeatable reference component attention override in the form "
+            "component=backend."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-component-attention-backend",
+        action="append",
+        default=[],
+        help=(
+            "Repeatable candidate component attention override in the form "
+            "component=backend."
+        ),
     )
     parser.add_argument(
         "--reference-fp4-gemm-backend",

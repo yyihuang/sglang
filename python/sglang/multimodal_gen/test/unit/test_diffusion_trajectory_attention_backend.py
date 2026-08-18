@@ -31,6 +31,8 @@ def _args(**overrides):
         "candidate_component_path": [],
         "reference_attention_backend": None,
         "candidate_attention_backend": None,
+        "reference_component_attention_backend": [],
+        "candidate_component_attention_backend": [],
     }
     return argparse.Namespace(**(defaults | overrides))
 
@@ -53,6 +55,24 @@ def test_build_server_kwargs_omits_unspecified_attention_backend():
 
     assert "attention_backend" not in build_server_kwargs(args, variant="reference")
     assert "attention_backend" not in build_server_kwargs(args, variant="candidate")
+
+
+def test_build_server_kwargs_forwards_component_attention_backends():
+    args = _args(
+        candidate_attention_backend="fa",
+        candidate_component_attention_backend=[
+            "transformer=cake_nvfp4",
+            "transformer_2=fa",
+        ],
+    )
+
+    candidate = build_server_kwargs(args, variant="candidate")
+
+    assert candidate["attention_backend"] == "fa"
+    assert candidate["component_attention_backends"] == {
+        "transformer": "cake_nvfp4",
+        "transformer_2": "fa",
+    }
 
 
 def test_extract_generation_time_prefers_populated_public_field():
