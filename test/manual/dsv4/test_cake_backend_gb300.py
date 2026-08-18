@@ -84,8 +84,74 @@ def _packed_cache(rows: int, page_size: int, *, seed: int) -> torch.Tensor:
     return cache
 
 
+def _dense_reference(
+    *,
+    q: torch.Tensor,
+    swa: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_active_lens: torch.Tensor,
+    compressed: torch.Tensor | None,
+    compressed_indices: torch.Tensor | None,
+    compressed_active_lens: torch.Tensor | None,
+    softmax_scale: float,
+    sinks: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate the exact dense-BF16 semantics consumed by CAKE."""
+
+    batch, _, heads, _ = q.shape
+    swa_width = swa_indices.shape[-1]
+    swa_rows = swa.reshape(batch, swa_width, HEAD_DIM).float()
+    compressed_width = 0 if compressed_indices is None else compressed_indices.shape[-1]
+    compressed_rows = (
+        None
+        if compressed is None
+        else compressed.reshape(batch, compressed_width, HEAD_DIM).float()
+    )
+    output = torch.zeros((batch, heads, HEAD_DIM), dtype=torch.float32, device=q.device)
+    for row in range(batch):
+        gathered = swa_rows[row]
+        valid = swa_indices[row].reshape(-1) >= 0
+        active_len = int(swa_active_lens[row])
+        if compressed_rows is not None:
+            assert compressed_indices is not None
+            assert compressed_active_lens is not None
+            gathered = torch.cat((gathered, compressed_rows[row]), dim=0)
+            valid = torch.cat(
+                (valid, compressed_indices[row].reshape(-1) >= 0), dim=0
+            )
+            # CAKE reserves the first 128 physical positions for SWA.
+            active_len = 128 + int(compressed_active_lens[row])
+        valid &= torch.arange(valid.numel(), device=q.device) < active_len
+        scores = q[row, 0].float() @ gathered[valid].transpose(0, 1)
+        scores *= softmax_scale
+        sink = sinks.reshape(-1, 1)
+        row_max = torch.maximum(scores.amax(-1, keepdim=True), sink)
+        numerator = torch.exp(scores - row_max)
+        probabilities = numerator / (
+            numerator.sum(-1, keepdim=True) + torch.exp(sink - row_max)
+        )
+        output[row] = probabilities @ gathered[valid]
+    return output.to(torch.bfloat16).unsqueeze(1)
+
+
+def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict:
+    actual_f = actual.float()
+    expected_f = expected.float()
+    close = torch.isclose(actual_f, expected_f, atol=1e-2, rtol=1e-2)
+    return {
+        "strict_close": bool(close.all()),
+        "outside_tolerance": int((~close).sum()),
+        "elements": close.numel(),
+        "max_abs_err": float((actual_f - expected_f).abs().max()),
+    }
+
+
 def _run_case(
-    case: Case, *, benchmark: bool, adapter: CakeDsv4DecodeWorkspace
+    case: Case,
+    *,
+    benchmark: bool,
+    diagnostic: bool,
+    adapter: CakeDsv4DecodeWorkspace,
 ) -> dict:
     torch.manual_seed(1000 + case.batch + case.compressed_width)
     # TP4 owns 32 of the model's 128 heads, but the production DSV4 path pads
@@ -188,27 +254,40 @@ def _run_case(
     expected = baseline()
     actual = candidate()
     torch.cuda.synchronize()
-    torch.testing.assert_close(
-        actual[:, :, :LOCAL_HEADS],
-        expected[:, :, :LOCAL_HEADS],
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    actual_local = actual[:, :, :LOCAL_HEADS]
+    expected_local = expected[:, :, :LOCAL_HEADS]
+    packed_stats = _error_stats(actual_local, expected_local)
+    if not diagnostic:
+        torch.testing.assert_close(actual_local, expected_local, atol=1e-2, rtol=1e-2)
     result = {
         "case": case.name,
-        "correct": True,
+        "correct": packed_stats["strict_close"],
         "kernel_heads": KERNEL_HEADS,
         "model_local_heads": LOCAL_HEADS,
-        "max_abs_err": float(
-            (
-                actual[:, :, :LOCAL_HEADS].float()
-                - expected[:, :, :LOCAL_HEADS].float()
-            )
-            .abs()
-            .max()
-        ),
+        "max_abs_err": packed_stats["max_abs_err"],
+        "cake_vs_packed": packed_stats,
         "cake_route_count": adapter.launch_count,
     }
+    if diagnostic:
+        swa_dense = adapter._swa[: case.batch * swa_width]
+        compressed_dense = None
+        if compressed_indices is not None:
+            compressed_dense = adapter._compressed[
+                : case.batch * compressed_indices.shape[-1]
+            ]
+        dense = _dense_reference(
+            q=q,
+            swa=swa_dense,
+            swa_indices=swa_indices,
+            swa_active_lens=swa_lens,
+            compressed=compressed_dense,
+            compressed_indices=compressed_indices,
+            compressed_active_lens=compressed_lens,
+            softmax_scale=scale,
+            sinks=sinks,
+        )[:, :, :LOCAL_HEADS]
+        result["cake_vs_dense_reference"] = _error_stats(actual_local, dense)
+        result["packed_vs_dense_reference"] = _error_stats(expected_local, dense)
     if benchmark:
         from loom.bench import bench_gpu_time
 
@@ -240,6 +319,8 @@ def _run_case(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument("--case", action="append", dest="cases")
     args = parser.parse_args()
     if torch.cuda.get_device_capability() != (10, 3):
         raise RuntimeError(
@@ -250,8 +331,21 @@ def main() -> None:
     # and batch sizes change so the probe covers scratch growth and c4/c128/SWA
     # alternation, not only isolated launches with fresh allocations.
     adapter = CakeDsv4DecodeWorkspace(torch.device("cuda"))
+    selected = CASES
+    if args.cases:
+        requested = set(args.cases)
+        selected = tuple(case for case in CASES if case.name in requested)
+        missing = requested - {case.name for case in selected}
+        if missing:
+            raise ValueError(f"unknown cases: {sorted(missing)}")
     rows = [
-        _run_case(case, benchmark=args.benchmark, adapter=adapter) for case in CASES
+        _run_case(
+            case,
+            benchmark=args.benchmark,
+            diagnostic=args.diagnostic,
+            adapter=adapter,
+        )
+        for case in selected
     ]
     print("SGLANG_DSV4_CAKE_GPU_ROWS=" + json.dumps(rows, sort_keys=True), flush=True)
 
