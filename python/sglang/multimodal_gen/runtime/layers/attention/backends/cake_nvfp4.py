@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+import math
 import threading
 import weakref
 from dataclasses import dataclass
@@ -20,16 +22,42 @@ class _CakeNVFP4CorrectionWorkspace(NamedTuple):
     qk_correction: torch.Tensor
 
 
+class _CakeNVFP4WanWorkspace(NamedTuple):
+    q_rstd: torch.Tensor
+    k_rstd: torch.Tensor
+    q_mean_fp4: torch.Tensor
+    q_mean_scale: torch.Tensor
+    dummy_correction: torch.Tensor
+
+
 @dataclass
 class _CakeNVFP4SharedScratch:
     packed: object
     correction: _CakeNVFP4CorrectionWorkspace
+    wan: _CakeNVFP4WanWorkspace | None = None
 
 
 _SHARED_SCRATCH_LOCK = threading.Lock()
 _SHARED_SCRATCH: weakref.WeakValueDictionary[tuple, _CakeNVFP4SharedScratch] = (
     weakref.WeakValueDictionary()
 )
+
+
+@functools.cache
+def _get_wan_fp4_attention_module(device_index: int):
+    from loom.examples.weave.fp4_flash_attention import (
+        fp4_flash_attention_qk_fp4_corrected,
+    )
+    from loom.runtime import build_kernel_module
+
+    with torch.cuda.device(device_index):
+        return build_kernel_module(
+            fp4_flash_attention_qk_fp4_corrected,
+            validate=False,
+            options=["--use_fast_math"],
+            IS_CAUSAL=0,
+            HAS_QK_CORRECTION=0,
+        )
 
 
 class CakeNVFP4AttentionBackend(AttentionBackend):
@@ -105,6 +133,26 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             ),
         )
 
+    @staticmethod
+    def _allocate_wan_workspace(
+        query: torch.Tensor,
+        packed,
+    ) -> _CakeNVFP4WanWorkspace:
+        batch, seq_len, _, _ = query.shape
+        return _CakeNVFP4WanWorkspace(
+            q_rstd=torch.empty(
+                (batch * seq_len,), device=query.device, dtype=torch.float32
+            ),
+            k_rstd=torch.empty(
+                (batch * seq_len,), device=query.device, dtype=torch.float32
+            ),
+            q_mean_fp4=torch.empty_like(packed.q_fp4),
+            q_mean_scale=torch.empty_like(packed.q_scale),
+            dummy_correction=torch.zeros(
+                (1,), device=query.device, dtype=torch.float32
+            ),
+        )
+
     def _get_workspace_and_output(self, query: torch.Tensor):
         try:
             from flashinfer import allocate_cake_nvfp4_attention_workspace
@@ -143,6 +191,14 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             self._output,
             self._shared_scratch.correction,
         )
+
+    def _get_wan_workspace(self, query: torch.Tensor, packed):
+        with _SHARED_SCRATCH_LOCK:
+            if self._shared_scratch.wan is None:
+                self._shared_scratch.wan = self._allocate_wan_workspace(
+                    query, packed
+                )
+        return self._shared_scratch.wan
 
     @staticmethod
     def _prepare_qk_correction(
@@ -260,3 +316,136 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             qk_correction=qk_correction,
             out=output,
         )
+
+    def forward_wan_projections(
+        self,
+        query_projection: torch.Tensor,
+        key_projection: torch.Tensor,
+        value_projection: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        *,
+        eps: float,
+    ) -> torch.Tensor:
+        """Run the qualified Wan projection-to-attention fused path."""
+
+        expected_projection_shape = (1, query_projection.shape[1], 5120)
+        if (
+            query_projection.ndim != 3
+            or tuple(query_projection.shape) != expected_projection_shape
+            or key_projection.shape != query_projection.shape
+            or value_projection.shape != query_projection.shape
+        ):
+            raise ValueError(
+                "Cake fused Wan serving requires Q/K/V projections with shape "
+                f"[1, seq_len, 5120], got {tuple(query_projection.shape)}, "
+                f"{tuple(key_projection.shape)}, and {tuple(value_projection.shape)}"
+            )
+        if self.num_heads != 40 or self.head_size != 128:
+            raise ValueError(
+                "Cake fused Wan serving requires H40/D128, got "
+                f"H{self.num_heads}/D{self.head_size}"
+            )
+        for name, tensor in (
+            ("query_projection", query_projection),
+            ("key_projection", key_projection),
+            ("value_projection", value_projection),
+        ):
+            if (
+                tensor.device.type != "cuda"
+                or tensor.dtype != torch.bfloat16
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous BF16 CUDA storage"
+                )
+        seq_len = int(query_projection.shape[1])
+        for name, weight in (("q_weight", q_weight), ("k_weight", k_weight)):
+            if (
+                tuple(weight.shape) != (5120,)
+                or weight.device != query_projection.device
+                or weight.dtype != torch.bfloat16
+                or not weight.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous BF16 [5120] on the projection device"
+                )
+        if (
+            tuple(cos_sin_cache.shape) != (seq_len, 128)
+            or cos_sin_cache.device != query_projection.device
+            or cos_sin_cache.dtype != torch.float32
+            or not cos_sin_cache.is_contiguous()
+        ):
+            raise ValueError(
+                "cos_sin_cache must be contiguous FP32 [seq_len, 128] on the "
+                "projection device"
+            )
+
+        query = query_projection.view(1, seq_len, 40, 128)
+        packed, output, _ = self._get_workspace_and_output(query)
+        wan = self._get_wan_workspace(query, packed)
+
+        from loom.examples.weave.fp4_attention_wan_fused import (
+            make_wan_qk_norm_rope_pack_launch,
+            make_wan_qk_rstd_launch,
+        )
+
+        make_wan_qk_rstd_launch(
+            query_projection,
+            key_projection,
+            outputs=(wan.q_rstd, wan.k_rstd),
+            eps=eps,
+        )()
+        make_wan_qk_norm_rope_pack_launch(
+            query_projection,
+            key_projection,
+            value_projection,
+            q_weight,
+            k_weight,
+            wan.q_rstd,
+            wan.k_rstd,
+            cos_sin_cache,
+            outputs=(
+                packed.q_fp4,
+                packed.k_fp4,
+                packed.q_scale,
+                packed.k_scale,
+                wan.q_mean_fp4,
+                wan.q_mean_scale,
+                packed.v_fp4_t,
+                packed.v_scale_lo,
+                packed.v_scale_hi,
+            ),
+        )()
+
+        padded_seq_len = int(packed.q_fp4.shape[2])
+        total_bh = self.num_heads
+        total_tiles = total_bh * ((seq_len + 511) // 512)
+        num_sms = torch.cuda.get_device_properties(
+            query_projection.device
+        ).multi_processor_count
+        persistent_clusters = min(num_sms // 2, total_tiles)
+        module = _get_wan_fp4_attention_module(query_projection.device.index or 0)
+        module.launch(
+            grid=(2 * persistent_clusters, 1, 1),
+            Q=packed.q_fp4.reshape(total_bh * padded_seq_len, 64),
+            QMean=wan.q_mean_fp4.reshape(total_bh * padded_seq_len, 64),
+            K=packed.k_fp4.reshape(total_bh * padded_seq_len, 64),
+            Vt=packed.v_fp4_t.reshape(total_bh * 128, padded_seq_len // 2),
+            SFQ=packed.q_scale,
+            SFQMean=wan.q_mean_scale,
+            SFK=packed.k_scale,
+            SFVtLo=packed.v_scale_lo,
+            SFVtHi=packed.v_scale_hi,
+            QKCorrection=wan.dummy_correction,
+            O=output.permute(0, 2, 1, 3),
+            seqlen_q=seq_len,
+            seqlen_kv=seq_len,
+            q_stride=padded_seq_len,
+            kv_stride=padded_seq_len,
+            softmax_scale_log2=self.softmax_scale / math.log(2.0),
+            heads=self.num_heads,
+            total_bh=total_bh,
+        )
+        return output

@@ -41,6 +41,32 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         self.assertEqual(workspace.q_mean.shape, (4, 4, 128))
         self.assertEqual(workspace.qk_correction.shape, (1, 4, 4, 512))
 
+    def test_wan_workspace_contains_only_reusable_serving_operands(self):
+        query = torch.empty((1, 257, 40, 128), dtype=torch.bfloat16)
+        packed = SimpleNamespace(
+            q_fp4=torch.empty((1, 40, 512, 64), dtype=torch.uint8),
+            q_scale=torch.empty((40 * 4 * 32, 32), dtype=torch.uint8),
+        )
+
+        workspace = CakeNVFP4AttentionImpl._allocate_wan_workspace(query, packed)
+
+        self.assertEqual(
+            workspace._fields,
+            (
+                "q_rstd",
+                "k_rstd",
+                "q_mean_fp4",
+                "q_mean_scale",
+                "dummy_correction",
+            ),
+        )
+        self.assertEqual(workspace.q_rstd.shape, (257,))
+        self.assertEqual(workspace.k_rstd.shape, (257,))
+        self.assertEqual(workspace.q_mean_fp4.shape, packed.q_fp4.shape)
+        self.assertEqual(workspace.q_mean_scale.shape, packed.q_scale.shape)
+        self.assertEqual(workspace.dummy_correction.shape, (1,))
+        self.assertEqual(workspace.dummy_correction.dtype, torch.float32)
+
     def test_constructor_rejects_unsupported_contracts(self):
         cases = (
             ({"head_size": 64}, "head_size=128"),

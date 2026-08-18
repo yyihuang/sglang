@@ -613,24 +613,13 @@ class WanTransformerBlock(nn.Module):
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
-
-        if self.norm_q is not None:
-            if self.tp_rmsnorm:
-                query = tensor_parallel_rms_norm(query, self.norm_q)
-            else:
-                query = self.norm_q(query)
-        if self.norm_k is not None:
-            if self.tp_rmsnorm:
-                key = tensor_parallel_rms_norm(key, self.norm_k)
-            else:
-                key = self.norm_k(key)
-        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-
-        # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
+
+        if self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4:
+            if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
+                raise NotImplementedError(
+                    "Cake fused Wan serving requires unsharded across-head RMSNorm"
+                )
             # The concatenated cache only depends on freqs_cis, which is fixed
             # for the whole forward; the transformer builds it once per call.
             cos_sin_cache = rope_cos_sin_cache
@@ -642,33 +631,75 @@ class WanTransformerBlock(nn.Module):
                     ],
                     dim=-1,
                 )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
+            attn_output = self.attn1.forward_wan_projections(
+                query.squeeze(1),
+                key.squeeze(1),
+                value.squeeze(1),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos_sin_cache,
+                eps=self.norm_q.variance_epsilon,
             )
-        elif USE_AITER:
-            query_shape = query.shape
-            key_shape = key.shape
-            num_tokens = query.shape[:-2].numel()
-            q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
-            k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
-            cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
-            sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
-            rope_cached_2c_fwd_inplace(
-                q_sbhd,
-                k_sbhd,
-                cos_sbhd,
-                sin_sbhd,
-                1,  # GPTJ rotate style
-                True,  # reuse_freqs_front_part
-                False,  # nope_first
-            )
-            query = q_sbhd.view(query_shape)
-            key = k_sbhd.view(key_shape)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attn_output = self.attn1(query, key, value)
+            if self.norm_q is not None:
+                if self.tp_rmsnorm:
+                    query = tensor_parallel_rms_norm(query, self.norm_q)
+                else:
+                    query = self.norm_q(query)
+            if self.norm_k is not None:
+                if self.tp_rmsnorm:
+                    key = tensor_parallel_rms_norm(key, self.norm_k)
+                else:
+                    key = self.norm_k(key)
+            query = query.squeeze(1).unflatten(
+                2, (self.local_num_heads, self.dim_head)
+            )
+            key = key.squeeze(1).unflatten(
+                2, (self.local_num_heads, self.dim_head)
+            )
+            value = value.squeeze(1).unflatten(
+                2, (self.local_num_heads, self.dim_head)
+            )
+
+            # Apply rotary embeddings
+            if _is_cuda and query.shape == key.shape:
+                cos_sin_cache = rope_cos_sin_cache
+                if cos_sin_cache is None:
+                    cos_sin_cache = torch.cat(
+                        [
+                            cos.to(dtype=torch.float32).contiguous(),
+                            sin.to(dtype=torch.float32).contiguous(),
+                        ],
+                        dim=-1,
+                    )
+                query, key = apply_flashinfer_rope_qk_inplace(
+                    query, key, cos_sin_cache, is_neox=False
+                )
+            elif USE_AITER:
+                query_shape = query.shape
+                key_shape = key.shape
+                num_tokens = query.shape[:-2].numel()
+                q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
+                k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
+                cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
+                sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
+                rope_cached_2c_fwd_inplace(
+                    q_sbhd,
+                    k_sbhd,
+                    cos_sbhd,
+                    sin_sbhd,
+                    1,  # GPTJ rotate style
+                    True,  # reuse_freqs_front_part
+                    False,  # nope_first
+                )
+                query = q_sbhd.view(query_shape)
+                key = k_sbhd.view(key_shape)
+            else:
+                query, key = _apply_rotary_emb(
+                    query, cos, sin, is_neox_style=False
+                ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            attn_output = self.attn1(query, key, value)
+
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
