@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -77,6 +78,7 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+_WAN_NVFP4_PREATTN_CAPTURED = False
 
 
 def _wan_cross_attention_backends(
@@ -613,6 +615,31 @@ class WanTransformerBlock(nn.Module):
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
+
+        capture_path = os.environ.get("SGLANG_CAKE_NVFP4_CAPTURE_PREATTN")
+        global _WAN_NVFP4_PREATTN_CAPTURED
+        if capture_path and not _WAN_NVFP4_PREATTN_CAPTURED:
+            _WAN_NVFP4_PREATTN_CAPTURED = True
+            cos, sin = freqs_cis
+            torch.save(
+                {
+                    "query_projection": query.detach().cpu(),
+                    "key_projection": key.detach().cpu(),
+                    "value_projection": value.detach().cpu(),
+                    "q_norm_weight": self.norm_q.weight.detach().cpu(),
+                    "k_norm_weight": self.norm_k.weight.detach().cpu(),
+                    "norm_epsilon": self.norm_q.variance_epsilon,
+                    "qk_norm": self.qk_norm,
+                    "rope_cos": cos.detach().cpu(),
+                    "rope_sin": sin.detach().cpu(),
+                    "rope_cos_sin_cache": (
+                        rope_cos_sin_cache.detach().cpu()
+                        if rope_cos_sin_cache is not None
+                        else None
+                    ),
+                },
+                capture_path,
+            )
 
         if self.norm_q is not None:
             if self.tp_rmsnorm:
