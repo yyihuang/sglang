@@ -1059,12 +1059,6 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.cake_nvfp4_min_timestep = _validate_cake_nvfp4_min_timestep(
             attention_backend_config.get("cake_nvfp4_min_timestep")
         )
-        if self.cake_nvfp4_min_timestep is not None:
-            logger.info_once(
-                "Wan Cake NVFP4 self-attention is enabled at timestep >= "
-                f"{self.cake_nvfp4_min_timestep:g} and falls back to FA below "
-                "the threshold"
-            )
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -1109,6 +1103,21 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 for i in range(config.num_layers)
             ]
         )
+        uses_cake_nvfp4 = any(
+            getattr(getattr(block, "attn1", None), "backend", None)
+            == AttentionBackendEnum.CAKE_NVFP4
+            for block in self.blocks
+        )
+        if not uses_cake_nvfp4:
+            # Component-scoped FA models share the server config with the Cake
+            # component. Avoid a needless timestep device synchronization.
+            self.cake_nvfp4_min_timestep = None
+        elif self.cake_nvfp4_min_timestep is not None:
+            logger.info_once(
+                "Wan Cake NVFP4 self-attention is enabled at timestep >= "
+                f"{self.cake_nvfp4_min_timestep:g} and falls back to FA below "
+                "the threshold"
+            )
 
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
