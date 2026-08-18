@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
-from types import SimpleNamespace
+from collections import namedtuple
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -80,21 +81,44 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         value.dtype = query.dtype
         value.is_contiguous.return_value = True
 
-        workspace = object()
+        packed_type = namedtuple(
+            "Packed",
+            (
+                "q_fp4",
+                "k_fp4",
+                "v_fp4_t",
+                "q_scale",
+                "k_scale",
+                "v_scale_lo",
+                "v_scale_hi",
+            ),
+        )
+        packed = packed_type(*(object() for _ in packed_type._fields))
+        allocated_workspace = SimpleNamespace(packed=packed)
         output = object()
         correction_workspace = object()
-        centered_query = Mock()
-        centered_key = Mock()
         qk_correction = object()
-        allocate = Mock(return_value=workspace)
+        allocate = Mock(return_value=allocated_workspace)
         run = Mock(side_effect=lambda *_args, **kwargs: kwargs["out"])
-        fake_flashinfer = SimpleNamespace(
-            allocate_cake_nvfp4_attention_workspace=allocate,
-            nvfp4_attention=run,
-        )
+        quantize_v = Mock()
+        quantize_module = SimpleNamespace(quantize_v=quantize_v)
+        get_module = Mock(return_value=quantize_module)
+        target_for_device = Mock(return_value="sm100a")
+        fake_flashinfer = ModuleType("flashinfer")
+        fake_flashinfer.allocate_cake_nvfp4_attention_workspace = allocate
+        fake_flashinfer.cake_nvfp4_attention_fwd = run
+        fake_cake_module = ModuleType("flashinfer.cake_nvfp4_attention")
+        fake_cake_module._get_module = get_module
+        fake_cake_module._target_for_device = target_for_device
         with (
             patch.dict(_SHARED_SCRATCH, {}, clear=True),
-            patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
+            patch.dict(
+                "sys.modules",
+                {
+                    "flashinfer": fake_flashinfer,
+                    "flashinfer.cake_nvfp4_attention": fake_cake_module,
+                },
+            ),
             patch(
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
                 "cake_nvfp4.torch.cuda.current_stream",
@@ -108,7 +132,7 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
             patch.object(
                 impl,
                 "_prepare_qk_correction",
-                return_value=(centered_query, centered_key, qk_correction),
+                return_value=qk_correction,
             ) as prepare_correction,
             patch(
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
@@ -124,15 +148,25 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         allocate.assert_called_once_with(query, qkv_layout="NHD")
         allocate_correction.assert_called_once_with(query)
         self.assertEqual(prepare_correction.call_count, 2)
-        prepare_correction.assert_called_with(query, key, correction_workspace)
+        prepare_correction.assert_called_with(
+            query, key, packed, correction_workspace
+        )
         empty_like.assert_called_once_with(query, dtype=torch.bfloat16)
+        self.assertEqual(quantize_v.call_count, 2)
+        quantize_v.assert_called_with(
+            value,
+            packed.v_fp4_t,
+            packed.v_scale_lo,
+            packed.v_scale_hi,
+            0,
+        )
+        self.assertEqual(get_module.call_count, 2)
+        target_for_device.assert_called_with(value.device)
         self.assertEqual(run.call_count, 2)
         for call in run.call_args_list:
-            self.assertEqual(call.kwargs["backend"], "cake")
+            self.assertEqual(call.args[:7], tuple(packed))
+            self.assertEqual(call.args[7], 4800)
             self.assertEqual(call.kwargs["qkv_layout"], "NHD")
-            self.assertIs(call.kwargs["workspace"], workspace)
-            self.assertIs(call.args[0], centered_query)
-            self.assertIs(call.args[1], centered_key)
             self.assertIs(call.kwargs["qk_correction"], qk_correction)
             self.assertIs(call.kwargs["out"], output)
 
@@ -156,8 +190,9 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         query.device = SimpleNamespace(type="cuda", index=0)
         query.dtype = torch.bfloat16
         packed = object()
+        allocated_workspace = SimpleNamespace(packed=packed)
         correction = object()
-        allocate = Mock(return_value=packed)
+        allocate = Mock(return_value=allocated_workspace)
         fake_flashinfer = SimpleNamespace(
             allocate_cake_nvfp4_attention_workspace=allocate,
         )

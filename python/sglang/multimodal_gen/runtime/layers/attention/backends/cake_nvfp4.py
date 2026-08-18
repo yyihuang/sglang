@@ -16,10 +16,8 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class _CakeNVFP4CorrectionWorkspace(NamedTuple):
-    q_padded: torch.Tensor
     q_mean: torch.Tensor
     k_mean: torch.Tensor
-    k_centered: torch.Tensor
     qk_correction: torch.Tensor
 
 
@@ -100,10 +98,8 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
         q_blocks = padded_seq_len // 128
         common = {"device": query.device, "dtype": query.dtype}
         return _CakeNVFP4CorrectionWorkspace(
-            q_padded=torch.empty((batch, padded_seq_len, heads, head_dim), **common),
-            q_mean=torch.empty((batch, q_blocks, heads, head_dim), **common),
-            k_mean=torch.empty((batch, 1, heads, head_dim), **common),
-            k_centered=torch.empty_like(query),
+            q_mean=torch.empty((batch * heads, q_blocks, head_dim), **common),
+            k_mean=torch.empty((batch * heads, head_dim), **common),
             qk_correction=torch.empty(
                 (batch, heads, q_blocks, padded_seq_len),
                 device=query.device,
@@ -131,10 +127,13 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             with _SHARED_SCRATCH_LOCK:
                 shared_scratch = _SHARED_SCRATCH.get(key)
                 if shared_scratch is None:
-                    shared_scratch = _CakeNVFP4SharedScratch(
-                        packed=allocate_cake_nvfp4_attention_workspace(
+                    allocated_workspace = (
+                        allocate_cake_nvfp4_attention_workspace(
                             query, qkv_layout="NHD"
-                        ),
+                        )
+                    )
+                    shared_scratch = _CakeNVFP4SharedScratch(
+                        packed=allocated_workspace.packed,
                         correction=self._allocate_correction_workspace(query),
                     )
                     _SHARED_SCRATCH[key] = shared_scratch
@@ -151,33 +150,41 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
     def _prepare_qk_correction(
         query: torch.Tensor,
         key: torch.Tensor,
+        packed,
         workspace: _CakeNVFP4CorrectionWorkspace,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch, seq_len, heads, head_dim = query.shape
-        padded_seq_len = workspace.q_padded.shape[1]
+    ) -> torch.Tensor:
+        batch, seq_len, heads, _ = query.shape
+        padded_seq_len = packed.q_fp4.shape[2]
         q_blocks = padded_seq_len // 128
 
-        workspace.q_padded.zero_()
-        workspace.q_padded[:, :seq_len].copy_(query)
-        q_grouped = workspace.q_padded.view(batch, q_blocks, 128, heads, head_dim)
-        torch.mean(q_grouped, dim=2, out=workspace.q_mean)
-        torch.sub(q_grouped, workspace.q_mean.unsqueeze(2), out=q_grouped)
+        from loom.examples.weave.fp4_attention_quantize import (
+            make_centered_qk_launch,
+        )
 
-        torch.mean(key, dim=1, keepdim=True, out=workspace.k_mean)
-        torch.sub(key, workspace.k_mean, out=workspace.k_centered)
+        make_centered_qk_launch(
+            query,
+            key,
+            outputs=(
+                packed.q_fp4,
+                packed.k_fp4,
+                packed.q_scale,
+                packed.k_scale,
+                workspace.q_mean,
+                workspace.k_mean,
+            ),
+            qkv_layout="NHD",
+        )()
         workspace.qk_correction.zero_()
         torch.bmm(
-            workspace.q_mean.permute(0, 2, 1, 3).squeeze(0),
-            workspace.k_centered.permute(0, 2, 3, 1).squeeze(0),
+            workspace.q_mean,
+            key.permute(0, 2, 3, 1).squeeze(0),
             out_dtype=torch.float32,
             out=workspace.qk_correction.squeeze(0)[..., :seq_len],
         )
 
-        centered_query = workspace.q_padded[:, :seq_len]
-        correction = workspace.qk_correction.view(
+        return workspace.qk_correction.view(
             batch * heads, q_blocks, padded_seq_len
         )
-        return centered_query, workspace.k_centered, correction
 
     def forward(
         self,
@@ -223,26 +230,35 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             raise ValueError("Cake NVFP4 attention requires contiguous NHD Q/K/V")
 
         try:
-            from flashinfer import nvfp4_attention
+            from flashinfer import cake_nvfp4_attention_fwd
+            from flashinfer.cake_nvfp4_attention import (
+                _get_module,
+                _target_for_device,
+            )
         except ImportError as error:
             raise ImportError(
                 "Cake NVFP4 attention requires a FlashInfer build that exports "
-                "flashinfer.nvfp4_attention."
+                "the Cake packed attention API."
             ) from error
 
-        workspace, output, correction_workspace = self._get_workspace_and_output(query)
-        centered_query, centered_key, qk_correction = self._prepare_qk_correction(
-            query, key, correction_workspace
+        packed, output, correction_workspace = self._get_workspace_and_output(query)
+        qk_correction = self._prepare_qk_correction(
+            query, key, packed, correction_workspace
         )
-        return nvfp4_attention(
-            centered_query,
-            centered_key,
+        quantize_module = _get_module(_target_for_device(value.device), False)
+        quantize_module.quantize_v(
             value,
+            packed.v_fp4_t,
+            packed.v_scale_lo,
+            packed.v_scale_hi,
+            0,
+        )
+        return cake_nvfp4_attention_fwd(
+            *packed,
+            seq_len,
             sm_scale=self.softmax_scale,
             causal=False,
-            backend="cake",
             qkv_layout="NHD",
-            workspace=workspace,
             qk_correction=qk_correction,
             out=output,
         )
