@@ -17,6 +17,7 @@ def _args(**overrides):
         "model_id": None,
         "backend": "sglang",
         "num_gpus": 1,
+        "master_port": None,
         "dit_cpu_offload": False,
         "dit_layerwise_offload": False,
         "text_encoder_cpu_offload": False,
@@ -50,6 +51,13 @@ def test_build_server_kwargs_forwards_attention_backend_per_variant():
 
     assert reference["attention_backend"] == "dynamic_cudnn_sdpa"
     assert candidate["attention_backend"] == "cake_nvfp4"
+
+
+def test_build_server_kwargs_forwards_master_port():
+    args = _args(master_port=31005)
+
+    assert build_server_kwargs(args, variant="reference")["master_port"] == 31005
+    assert build_server_kwargs(args, variant="candidate")["master_port"] == 31005
 
 
 def test_build_server_kwargs_omits_unspecified_attention_backend():

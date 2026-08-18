@@ -288,6 +288,8 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
         "enable_cfg_parallel": args.enable_cfg_parallel,
         "ulysses_degree": args.ulysses_degree,
     }
+    if args.master_port is not None:
+        kwargs["master_port"] = args.master_port
     if args.sp_degree is not None:
         kwargs["sp_degree"] = args.sp_degree
     if transformer_path is not None:
@@ -497,6 +499,11 @@ def main() -> None:
     parser.add_argument("--guidance-scale-2", type=float)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        help="Optional distributed master port used by both sequential variants.",
+    )
     parser.add_argument("--ulysses-degree", type=int, default=1)
     parser.add_argument("--sp-degree", type=int)
     parser.add_argument("--trajectory-step-index", type=int, default=-1)
