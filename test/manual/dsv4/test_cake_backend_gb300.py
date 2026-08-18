@@ -52,7 +52,10 @@ def _packed_cache(rows: int, page_size: int, *, seed: int) -> torch.Tensor:
         torch.randn((rows, HEAD_DIM), generator=generator, device="cuda") * 0.05
     ).to(torch.bfloat16)
     packed = quant_to_nope_fp8_rope_bf16_pack_triton(values)
-    num_pages = math.ceil(rows / page_size)
+    # Keep at least two pages so PyTorch preserves the padded outer stride in
+    # the 4-D FlashMLA view.  A degenerate one-page allocation is allowed to
+    # collapse that stride and does not match SGLang's real multi-page pool.
+    num_pages = max(2, math.ceil(rows / page_size))
     raw_page_bytes = page_size * 584
     padded_page_bytes = math.ceil(raw_page_bytes / 576) * 576
     cache = torch.zeros(
