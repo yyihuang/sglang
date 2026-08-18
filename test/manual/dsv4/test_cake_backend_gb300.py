@@ -46,8 +46,10 @@ CASES = (
     Case("tp4_b16_c4_topk512", 16, 512, 64),
     Case("tp4_b1_topk4x", 1, 1024, 64),
     Case("tp4_b8_topk4x", 8, 1024, 64),
-    Case("tp4_b1_topk128x", 1, 128, 2),
-    Case("tp4_b8_topk128x", 8, 128, 2),
+    # c128 has one compressed row per 128 source tokens.  A 128-row active
+    # prefix therefore represents a 16K-token sequence, not a 4K sequence.
+    Case("tp4_b1_topk128x", 1, 128, 2, max_seq_len=16384),
+    Case("tp4_b8_topk128x", 8, 128, 2, max_seq_len=16384),
     Case(
         "tp4_b1_c128_capacity8256_live1",
         1,
@@ -271,9 +273,14 @@ def _run_case(
     if diagnostic:
         swa_dense = adapter._swa[: case.batch * swa_width]
         compressed_dense = None
+        diagnostic_compressed_indices = compressed_indices
         if compressed_indices is not None:
+            gathered_width = adapter._indices.shape[-1] - swa_width
+            diagnostic_compressed_indices = compressed_indices[
+                :, :, :gathered_width
+            ]
             compressed_dense = adapter._compressed[
-                : case.batch * compressed_indices.shape[-1]
+                : case.batch * gathered_width
             ]
         dense = _dense_reference(
             q=q,
@@ -281,7 +288,7 @@ def _run_case(
             swa_indices=swa_indices,
             swa_active_lens=swa_lens,
             compressed=compressed_dense,
-            compressed_indices=compressed_indices,
+            compressed_indices=diagnostic_compressed_indices,
             compressed_active_lens=compressed_lens,
             softmax_scale=scale,
             sinks=sinks,
