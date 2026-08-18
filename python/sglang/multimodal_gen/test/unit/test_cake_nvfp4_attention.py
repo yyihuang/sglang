@@ -55,17 +55,16 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
             (
                 "q_rstd",
                 "k_rstd",
+                "k_rope",
                 "q_mean_fp4",
                 "q_mean_scale",
-                "dummy_correction",
             ),
         )
         self.assertEqual(workspace.q_rstd.shape, (257,))
         self.assertEqual(workspace.k_rstd.shape, (257,))
+        self.assertEqual(workspace.k_rope.shape, (1, 257, 5120))
         self.assertEqual(workspace.q_mean_fp4.shape, packed.q_fp4.shape)
         self.assertEqual(workspace.q_mean_scale.shape, packed.q_scale.shape)
-        self.assertEqual(workspace.dummy_correction.shape, (1,))
-        self.assertEqual(workspace.dummy_correction.dtype, torch.float32)
 
     def test_constructor_rejects_unsupported_contracts(self):
         cases = (
@@ -274,6 +273,29 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         query = torch.empty((2, 512, 40, 128), dtype=torch.bfloat16)
         with self.assertRaisesRegex(ValueError, "batch=1"):
             impl.forward(query, query, query, None)
+
+    def test_wan_projection_path_rejects_rank_before_reading_sequence(self):
+        impl = CakeNVFP4AttentionImpl(
+            num_heads=40,
+            num_kv_heads=40,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            causal=False,
+        )
+        projection = torch.empty((5120,), dtype=torch.bfloat16)
+        weight = torch.empty((5120,), dtype=torch.bfloat16)
+        cos_sin_cache = torch.empty((1, 128), dtype=torch.float32)
+
+        with self.assertRaisesRegex(ValueError, r"\[1, seq_len, 5120\]"):
+            impl.forward_wan_projections(
+                projection,
+                projection,
+                projection,
+                weight,
+                weight,
+                cos_sin_cache,
+                eps=1e-6,
+            )
 
 
 if __name__ == "__main__":

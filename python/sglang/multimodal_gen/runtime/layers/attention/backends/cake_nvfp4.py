@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import functools
-import math
 import threading
 import weakref
 from dataclasses import dataclass
@@ -25,9 +23,9 @@ class _CakeNVFP4CorrectionWorkspace(NamedTuple):
 class _CakeNVFP4WanWorkspace(NamedTuple):
     q_rstd: torch.Tensor
     k_rstd: torch.Tensor
+    k_rope: torch.Tensor
     q_mean_fp4: torch.Tensor
     q_mean_scale: torch.Tensor
-    dummy_correction: torch.Tensor
 
 
 @dataclass
@@ -41,23 +39,6 @@ _SHARED_SCRATCH_LOCK = threading.Lock()
 _SHARED_SCRATCH: weakref.WeakValueDictionary[tuple, _CakeNVFP4SharedScratch] = (
     weakref.WeakValueDictionary()
 )
-
-
-@functools.cache
-def _get_wan_fp4_attention_module(device_index: int):
-    from loom.examples.weave.fp4_flash_attention import (
-        fp4_flash_attention_qk_fp4_corrected,
-    )
-    from loom.runtime import build_kernel_module
-
-    with torch.cuda.device(device_index):
-        return build_kernel_module(
-            fp4_flash_attention_qk_fp4_corrected,
-            validate=False,
-            options=["--use_fast_math"],
-            IS_CAUSAL=0,
-            HAS_QK_CORRECTION=0,
-        )
 
 
 class CakeNVFP4AttentionBackend(AttentionBackend):
@@ -126,7 +107,7 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
         common = {"device": query.device, "dtype": query.dtype}
         return _CakeNVFP4CorrectionWorkspace(
             q_mean=torch.empty((batch * heads, q_blocks, head_dim), **common),
-            qk_correction=torch.empty(
+            qk_correction=torch.zeros(
                 (batch, heads, q_blocks, padded_seq_len),
                 device=query.device,
                 dtype=torch.float32,
@@ -146,11 +127,13 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             k_rstd=torch.empty(
                 (batch * seq_len,), device=query.device, dtype=torch.float32
             ),
+            k_rope=torch.empty(
+                (batch, seq_len, query.shape[2] * query.shape[3]),
+                device=query.device,
+                dtype=query.dtype,
+            ),
             q_mean_fp4=torch.empty_like(packed.q_fp4),
             q_mean_scale=torch.empty_like(packed.q_scale),
-            dummy_correction=torch.zeros(
-                (1,), device=query.device, dtype=torch.float32
-            ),
         )
 
     def _get_workspace_and_output(self, query: torch.Tensor):
@@ -227,7 +210,6 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             ),
             qkv_layout="NHD",
         )()
-        workspace.qk_correction.zero_()
         torch.bmm(
             workspace.q_mean,
             key.permute(0, 2, 3, 1).squeeze(0),
@@ -330,10 +312,15 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         """Run the qualified Wan projection-to-attention fused path."""
 
+        if query_projection.ndim != 3:
+            raise ValueError(
+                "Cake fused Wan serving requires Q/K/V projections with shape "
+                f"[1, seq_len, 5120], got {tuple(query_projection.shape)}, "
+                f"{tuple(key_projection.shape)}, and {tuple(value_projection.shape)}"
+            )
         expected_projection_shape = (1, query_projection.shape[1], 5120)
         if (
-            query_projection.ndim != 3
-            or tuple(query_projection.shape) != expected_projection_shape
+            tuple(query_projection.shape) != expected_projection_shape
             or key_projection.shape != query_projection.shape
             or value_projection.shape != query_projection.shape
         ):
@@ -383,7 +370,7 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             )
 
         query = query_projection.view(1, seq_len, 40, 128)
-        packed, output, _ = self._get_workspace_and_output(query)
+        packed, output, correction = self._get_workspace_and_output(query)
         wan = self._get_wan_workspace(query, packed)
 
         from loom.examples.weave.fp4_attention_wan_fused import (
@@ -411,6 +398,8 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
                 packed.k_fp4,
                 packed.q_scale,
                 packed.k_scale,
+                correction.q_mean,
+                wan.k_rope,
                 wan.q_mean_fp4,
                 wan.q_mean_scale,
                 packed.v_fp4_t,
@@ -419,33 +408,27 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             ),
         )()
 
-        padded_seq_len = int(packed.q_fp4.shape[2])
-        total_bh = self.num_heads
-        total_tiles = total_bh * ((seq_len + 511) // 512)
-        num_sms = torch.cuda.get_device_properties(
-            query_projection.device
-        ).multi_processor_count
-        persistent_clusters = min(num_sms // 2, total_tiles)
-        module = _get_wan_fp4_attention_module(query_projection.device.index or 0)
-        module.launch(
-            grid=(2 * persistent_clusters, 1, 1),
-            Q=packed.q_fp4.reshape(total_bh * padded_seq_len, 64),
-            QMean=wan.q_mean_fp4.reshape(total_bh * padded_seq_len, 64),
-            K=packed.k_fp4.reshape(total_bh * padded_seq_len, 64),
-            Vt=packed.v_fp4_t.reshape(total_bh * 128, padded_seq_len // 2),
-            SFQ=packed.q_scale,
-            SFQMean=wan.q_mean_scale,
-            SFK=packed.k_scale,
-            SFVtLo=packed.v_scale_lo,
-            SFVtHi=packed.v_scale_hi,
-            QKCorrection=wan.dummy_correction,
-            O=output.permute(0, 2, 1, 3),
-            seqlen_q=seq_len,
-            seqlen_kv=seq_len,
-            q_stride=padded_seq_len,
-            kv_stride=padded_seq_len,
-            softmax_scale_log2=self.softmax_scale / math.log(2.0),
-            heads=self.num_heads,
-            total_bh=total_bh,
+        torch.bmm(
+            correction.q_mean,
+            wan.k_rope.view(1, seq_len, 40, 128)
+            .permute(0, 2, 3, 1)
+            .squeeze(0),
+            out_dtype=torch.float32,
+            out=correction.qk_correction.squeeze(0)[..., :seq_len],
         )
-        return output
+
+        from flashinfer import cake_nvfp4_attention_fwd
+
+        return cake_nvfp4_attention_fwd(
+            *packed,
+            seq_len,
+            sm_scale=self.softmax_scale,
+            causal=False,
+            qkv_layout="NHD",
+            qk_correction=correction.qk_correction.view(
+                self.num_heads,
+                int(packed.q_fp4.shape[2]) // 128,
+                int(packed.q_fp4.shape[2]),
+            ),
+            out=output,
+        )
