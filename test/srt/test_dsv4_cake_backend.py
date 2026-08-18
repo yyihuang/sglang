@@ -5,13 +5,19 @@ from sglang.srt.layers.attention.dsv4 import cake_backend
 
 
 def test_rebased_indices_keep_swa_and_compressed_pools_separate():
-    indices = cake_backend._rebased_indices(2, 128, 4, device=torch.device("cpu"))
+    swa_source = torch.arange(256, dtype=torch.int32).view(2, 128)
+    swa_source[1, 127] = -1
+    compressed_source = torch.tensor(
+        [[0, 1, -1, -1], [2, 3, 4, -1]], dtype=torch.int32
+    )
+    indices = cake_backend._rebased_indices(swa_source, compressed_source)
 
     assert indices.shape == (2, 132)
     assert torch.equal(indices[0, :128], torch.arange(128, dtype=torch.int32))
-    assert torch.equal(indices[1, :128], torch.arange(128, 256, dtype=torch.int32))
-    assert torch.equal(indices[0, 128:], torch.arange(4, dtype=torch.int32))
-    assert torch.equal(indices[1, 128:], torch.arange(4, 8, dtype=torch.int32))
+    assert torch.equal(indices[1, :127], torch.arange(128, 255, dtype=torch.int32))
+    assert indices[1, 127].item() == -1
+    assert torch.equal(indices[0, 128:], torch.tensor([0, 1, -1, -1]))
+    assert torch.equal(indices[1, 128:], torch.tensor([4, 5, 6, -1]))
 
 
 def test_decode_adapter_forces_cake_without_fallback(monkeypatch):
@@ -49,6 +55,7 @@ def test_decode_adapter_forces_cake_without_fallback(monkeypatch):
         compressed_active_lens=torch.tensor([2, 1], dtype=torch.int32),
         compressed_page_size=2,
         seq_lens=torch.tensor([256, 255], dtype=torch.int32),
+        max_seq_len=256,
         softmax_scale=0.125,
         sinks=torch.zeros(8, dtype=torch.float32),
     )
@@ -60,5 +67,5 @@ def test_decode_adapter_forces_cake_without_fallback(monkeypatch):
     assert call.kwargs["backend"] == "cake"
     assert call.kwargs["enable_pdl"] is False
     assert call.kwargs["kv_layout"] == "HND"
-    assert call.kwargs["sparse_topk_lens"].tolist() == [130, 128]
-    assert call.kwargs["sparse_indices"].shape == (2, 132)
+    assert call.kwargs["sparse_topk_lens"].tolist() == [130, 129]
+    assert call.kwargs["sparse_indices"].shape == (2, 130)

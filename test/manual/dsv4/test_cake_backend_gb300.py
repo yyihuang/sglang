@@ -33,6 +33,9 @@ class Case:
     batch: int
     compressed_width: int
     compressed_page_size: int | None
+    swa_active: int = 128
+    compressed_active: int | None = None
+    max_seq_len: int = 4096
 
 
 CASES = (
@@ -45,6 +48,15 @@ CASES = (
     Case("tp4_b8_topk4x", 8, 1024, 64),
     Case("tp4_b1_topk128x", 1, 128, 2),
     Case("tp4_b8_topk128x", 8, 128, 2),
+    Case(
+        "tp4_b1_c128_capacity8256_live1",
+        1,
+        8256,
+        2,
+        swa_active=7,
+        compressed_active=1,
+        max_seq_len=7,
+    ),
 )
 
 
@@ -98,7 +110,10 @@ def _run_case(
     swa_indices = torch.arange(swa_rows, dtype=torch.int32, device="cuda").view(
         case.batch, 1, swa_width
     )
-    swa_lens = torch.full((case.batch,), swa_width, dtype=torch.int32, device="cuda")
+    swa_indices[:, :, case.swa_active :] = -1
+    swa_lens = torch.full(
+        (case.batch,), case.swa_active, dtype=torch.int32, device="cuda"
+    )
 
     if case.compressed_width:
         assert case.compressed_page_size is not None
@@ -111,11 +126,14 @@ def _run_case(
         compressed_indices = torch.arange(
             compressed_rows, dtype=torch.int32, device="cuda"
         ).view(case.batch, 1, case.compressed_width)
+        compressed_active = (
+            case.compressed_width
+            if case.compressed_active is None
+            else case.compressed_active
+        )
+        compressed_indices[:, :, compressed_active:] = -1
         compressed_lens = torch.full(
-            (case.batch,),
-            case.compressed_width,
-            dtype=torch.int32,
-            device="cuda",
+            (case.batch,), compressed_active, dtype=torch.int32, device="cuda"
         )
     else:
         compressed_cache = None
@@ -159,7 +177,10 @@ def _run_case(
             compressed_indices=compressed_indices,
             compressed_active_lens=compressed_lens,
             compressed_page_size=case.compressed_page_size,
-            seq_lens=torch.full((case.batch,), 4096, dtype=torch.int32, device="cuda"),
+            seq_lens=torch.full(
+                (case.batch,), case.max_seq_len, dtype=torch.int32, device="cuda"
+            ),
+            max_seq_len=case.max_seq_len,
             softmax_scale=scale,
             sinks=sinks,
         )

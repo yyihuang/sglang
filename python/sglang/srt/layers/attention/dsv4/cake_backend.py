@@ -39,22 +39,24 @@ def _flashinfer_dsv4():
 
 
 def _rebased_indices(
-    num_queries: int,
-    swa_width: int,
-    compressed_width: int,
-    *,
-    device: torch.device,
+    swa_indices: torch.Tensor,
+    compressed_indices: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Return legal row IDs for two per-query gathered scratch pools."""
+    """Rebase valid source rows while preserving padded ``-1`` sentinels."""
 
+    num_queries, swa_width = swa_indices.shape
+    device = swa_indices.device
     swa = torch.arange(num_queries * swa_width, dtype=torch.int32, device=device).view(
         num_queries, swa_width
     )
-    if compressed_width == 0:
+    swa = swa.masked_fill(swa_indices < 0, -1)
+    if compressed_indices is None:
         return swa
+    compressed_width = compressed_indices.shape[1]
     compressed = torch.arange(
         num_queries * compressed_width, dtype=torch.int32, device=device
     ).view(num_queries, compressed_width)
+    compressed = compressed.masked_fill(compressed_indices < 0, -1)
     return torch.cat((swa, compressed), dim=-1)
 
 
@@ -119,6 +121,7 @@ class CakeDsv4DecodeWorkspace:
         compressed_active_lens: torch.Tensor | None,
         compressed_page_size: int | None,
         seq_lens: torch.Tensor,
+        max_seq_len: int,
         softmax_scale: float,
         sinks: torch.Tensor,
     ) -> torch.Tensor:
@@ -159,6 +162,19 @@ class CakeDsv4DecodeWorkspace:
                     "and page size"
                 )
             compressed_indices = compressed_indices.reshape(num_queries, -1)
+            if compressed_page_size == 2:
+                # c128 metadata is sized for the model's maximum context.  Only
+                # the current batch's live c128 prefix may enter the CAKE launch;
+                # otherwise a short decode would spuriously launch thousands of
+                # empty split CTAs and exceed the reducer's supported split set.
+                live_c128_width = max(1, (max_seq_len + 127) // 128)
+                if live_c128_width > compressed_indices.shape[1]:
+                    raise ValueError(
+                        "live c128 extent exceeds metadata capacity: "
+                        f"extent={live_c128_width}, "
+                        f"capacity={compressed_indices.shape[1]}"
+                    )
+                compressed_indices = compressed_indices[:, :live_c128_width]
             compressed_width = compressed_indices.shape[1]
             safe_compressed_indices = (
                 compressed_indices.reshape(-1).clamp_min(0).contiguous()
@@ -170,21 +186,17 @@ class CakeDsv4DecodeWorkspace:
                 page_size=compressed_page_size,
                 out=compressed,
             )
-            active_lens = swa_active_lens.reshape(-1).to(
-                torch.int32
-            ) + compressed_active_lens.reshape(-1).to(torch.int32)
+            # CAKE's split 0 is always the 128-column SWA region; compressed
+            # rows begin at split 1.  Keep that physical split boundary even
+            # when the live SWA prefix is shorter than 128.  The preserved -1
+            # sentinels above mask the unused tail of split 0.
+            active_lens = 128 + compressed_active_lens.reshape(-1).to(torch.int32)
 
         expected_width = 128 + compressed_width
-        if self._indices is None or self._indices.shape != (
-            num_queries,
-            expected_width,
-        ):
-            self._indices = _rebased_indices(
-                num_queries,
-                128,
-                compressed_width,
-                device=self.device,
-            )
+        self._indices = _rebased_indices(
+            swa_indices,
+            compressed_indices,
+        )
         workspace = self._reduction_workspace(
             num_queries=num_queries,
             num_heads=num_heads,

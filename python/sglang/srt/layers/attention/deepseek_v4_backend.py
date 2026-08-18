@@ -1659,6 +1659,9 @@ class DeepseekV4AttnBackend(
                         else None
                     ),
                     seq_lens=forward_batch.seq_lens,
+                    max_seq_len=int(
+                        forward_batch.seq_lens_cpu[: q.shape[0]].max().item()
+                    ),
                     softmax_scale=self.softmax_scale,
                     sinks=attn_sink,
                 ).squeeze(1)
