@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import threading
+import weakref
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
@@ -20,6 +23,18 @@ class _CakeNVFP4CorrectionWorkspace(NamedTuple):
     k_centered: torch.Tensor
     k_centered_fp32_t: torch.Tensor
     qk_correction: torch.Tensor
+
+
+@dataclass
+class _CakeNVFP4SharedScratch:
+    packed: object
+    correction: _CakeNVFP4CorrectionWorkspace
+
+
+_SHARED_SCRATCH_LOCK = threading.Lock()
+_SHARED_SCRATCH: weakref.WeakValueDictionary[tuple, _CakeNVFP4SharedScratch] = (
+    weakref.WeakValueDictionary()
+)
 
 
 class CakeNVFP4AttentionBackend(AttentionBackend):
@@ -75,9 +90,8 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.softmax_scale = softmax_scale
         self._workspace_key = None
-        self._workspace = None
+        self._shared_scratch = None
         self._output = None
-        self._correction_workspace = None
 
     @staticmethod
     def _allocate_correction_workspace(
@@ -123,15 +137,27 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             query.device.type,
             query.device.index,
             query.dtype,
+            torch.cuda.current_stream(query.device).cuda_stream,
         )
         if key != self._workspace_key:
-            self._workspace = allocate_cake_nvfp4_attention_workspace(
-                query, qkv_layout="NHD"
-            )
+            with _SHARED_SCRATCH_LOCK:
+                shared_scratch = _SHARED_SCRATCH.get(key)
+                if shared_scratch is None:
+                    shared_scratch = _CakeNVFP4SharedScratch(
+                        packed=allocate_cake_nvfp4_attention_workspace(
+                            query, qkv_layout="NHD"
+                        ),
+                        correction=self._allocate_correction_workspace(query),
+                    )
+                    _SHARED_SCRATCH[key] = shared_scratch
+            self._shared_scratch = shared_scratch
             self._output = torch.empty_like(query, dtype=torch.bfloat16)
-            self._correction_workspace = self._allocate_correction_workspace(query)
             self._workspace_key = key
-        return self._workspace, self._output, self._correction_workspace
+        return (
+            self._shared_scratch.packed,
+            self._output,
+            self._shared_scratch.correction,
+        )
 
     @staticmethod
     def _prepare_qk_correction(

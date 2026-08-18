@@ -8,6 +8,7 @@ import torch
 from sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4 import (
     CakeNVFP4AttentionBackend,
     CakeNVFP4AttentionImpl,
+    _SHARED_SCRATCH,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
@@ -92,7 +93,13 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
             nvfp4_attention=run,
         )
         with (
+            patch.dict(_SHARED_SCRATCH, {}, clear=True),
             patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "cake_nvfp4.torch.cuda.current_stream",
+                return_value=SimpleNamespace(cuda_stream=17),
+            ),
             patch.object(
                 impl,
                 "_allocate_correction_workspace",
@@ -128,6 +135,64 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
             self.assertIs(call.args[1], centered_key)
             self.assertIs(call.kwargs["qk_correction"], qk_correction)
             self.assertIs(call.kwargs["out"], output)
+
+    def test_scratch_is_shared_across_layers_on_the_same_stream(self):
+        first = CakeNVFP4AttentionImpl(
+            num_heads=40,
+            num_kv_heads=40,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            causal=False,
+        )
+        second = CakeNVFP4AttentionImpl(
+            num_heads=40,
+            num_kv_heads=40,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            causal=False,
+        )
+        query = Mock()
+        query.shape = (1, 4800, 40, 128)
+        query.device = SimpleNamespace(type="cuda", index=0)
+        query.dtype = torch.bfloat16
+        packed = object()
+        correction = object()
+        allocate = Mock(return_value=packed)
+        fake_flashinfer = SimpleNamespace(
+            allocate_cake_nvfp4_attention_workspace=allocate,
+        )
+
+        with (
+            patch.dict(_SHARED_SCRATCH, {}, clear=True),
+            patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "cake_nvfp4.torch.cuda.current_stream",
+                return_value=SimpleNamespace(cuda_stream=23),
+            ),
+            patch.object(
+                CakeNVFP4AttentionImpl,
+                "_allocate_correction_workspace",
+                return_value=correction,
+            ) as allocate_correction,
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "cake_nvfp4.torch.empty_like",
+                side_effect=(object(), object()),
+            ),
+        ):
+            first_workspace, first_output, first_correction = (
+                first._get_workspace_and_output(query)
+            )
+            second_workspace, second_output, second_correction = (
+                second._get_workspace_and_output(query)
+            )
+
+        allocate.assert_called_once_with(query, qkv_layout="NHD")
+        allocate_correction.assert_called_once_with(query)
+        self.assertIs(first_workspace, second_workspace)
+        self.assertIs(first_correction, second_correction)
+        self.assertIsNot(first_output, second_output)
 
     def test_forward_rejects_unqualified_batch(self):
         impl = CakeNVFP4AttentionImpl(
