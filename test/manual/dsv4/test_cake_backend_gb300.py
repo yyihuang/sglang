@@ -24,7 +24,8 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.attention.dsv4.cake_backend import CakeDsv4DecodeWorkspace
 
 HEAD_DIM = 512
-HEADS = 32
+LOCAL_HEADS = 32
+KERNEL_HEADS = 64
 
 
 @dataclass(frozen=True)
@@ -68,10 +69,20 @@ def _packed_cache(rows: int, page_size: int, *, seed: int) -> torch.Tensor:
 
 def _run_case(case: Case, *, benchmark: bool) -> dict:
     torch.manual_seed(1000 + case.batch + case.compressed_width)
-    q = (torch.randn((case.batch, 1, HEADS, HEAD_DIM), device="cuda") * 0.05).to(
-        torch.bfloat16
+    # TP4 owns 32 of the model's 128 heads, but the production DSV4 path pads
+    # to FlashMLA's H64 specialization and discards the upper 32 outputs.
+    q = torch.zeros(
+        (case.batch, 1, KERNEL_HEADS, HEAD_DIM),
+        dtype=torch.bfloat16,
+        device="cuda",
     )
-    sinks = torch.randn(HEADS, dtype=torch.float32, device="cuda") * 0.05
+    q[:, :, :LOCAL_HEADS] = (
+        torch.randn((case.batch, 1, LOCAL_HEADS, HEAD_DIM), device="cuda") * 0.05
+    ).to(torch.bfloat16)
+    sinks = torch.zeros(KERNEL_HEADS, dtype=torch.float32, device="cuda")
+    sinks[:LOCAL_HEADS] = (
+        torch.randn(LOCAL_HEADS, dtype=torch.float32, device="cuda") * 0.05
+    )
     scale = HEAD_DIM**-0.5
 
     swa_width = 128
@@ -151,11 +162,25 @@ def _run_case(case: Case, *, benchmark: bool) -> dict:
     expected = baseline()
     actual = candidate()
     torch.cuda.synchronize()
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        actual[:, :, :LOCAL_HEADS],
+        expected[:, :, :LOCAL_HEADS],
+        atol=2e-2,
+        rtol=2e-2,
+    )
     result = {
         "case": case.name,
         "correct": True,
-        "max_abs_err": float((actual.float() - expected.float()).abs().max()),
+        "kernel_heads": KERNEL_HEADS,
+        "model_local_heads": LOCAL_HEADS,
+        "max_abs_err": float(
+            (
+                actual[:, :, :LOCAL_HEADS].float()
+                - expected[:, :, :LOCAL_HEADS].float()
+            )
+            .abs()
+            .max()
+        ),
         "cake_route_count": adapter.launch_count,
     }
     if benchmark:
