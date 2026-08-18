@@ -79,11 +79,20 @@ def _wan_cross_attention_backends(
     backends: set[AttentionBackendEnum],
 ) -> set[AttentionBackendEnum]:
     """Keep cross-attention on backends that support unequal Q/KV lengths."""
-    return {
+    dense_backends = {
         backend
         for backend in backends
         if not backend.is_sparse and backend != AttentionBackendEnum.CAKE_NVFP4
     }
+    # CAKE_NVFP4 is qualified only for dense self-attention.  Keep Wan's
+    # cross-attention on FA so selecting Cake changes exactly one role instead
+    # of silently switching cross-attention to the platform-default cuDNN path.
+    if (
+        AttentionBackendEnum.CAKE_NVFP4 in backends
+        and AttentionBackendEnum.FA in dense_backends
+    ):
+        return {AttentionBackendEnum.FA}
+    return dense_backends
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace

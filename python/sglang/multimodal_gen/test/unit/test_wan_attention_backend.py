@@ -29,6 +29,19 @@ class TestWanAttentionBackendRole(unittest.TestCase):
         )
         self.assertEqual(
             cross,
+            {AttentionBackendEnum.FA},
+        )
+
+    def test_non_cake_cross_attention_preserves_dense_candidates(self):
+        cross = _wan_cross_attention_backends(
+            {
+                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            }
+        )
+        self.assertEqual(
+            cross,
             {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
         )
 
