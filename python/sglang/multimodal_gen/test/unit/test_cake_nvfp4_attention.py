@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4 import (
     CakeNVFP4AttentionBackend,
     CakeNVFP4AttentionImpl,
@@ -82,6 +81,10 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
 
         workspace = object()
         output = object()
+        correction_workspace = object()
+        centered_query = Mock()
+        centered_key = Mock()
+        qk_correction = object()
         allocate = Mock(return_value=workspace)
         run = Mock(side_effect=lambda *_args, **kwargs: kwargs["out"])
         fake_flashinfer = SimpleNamespace(
@@ -90,6 +93,16 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         )
         with (
             patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
+            patch.object(
+                impl,
+                "_allocate_correction_workspace",
+                return_value=correction_workspace,
+            ) as allocate_correction,
+            patch.object(
+                impl,
+                "_prepare_qk_correction",
+                return_value=(centered_query, centered_key, qk_correction),
+            ) as prepare_correction,
             patch(
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
                 "cake_nvfp4.torch.empty_like",
@@ -102,13 +115,31 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         self.assertIs(first, output)
         self.assertIs(second, output)
         allocate.assert_called_once_with(query, qkv_layout="NHD")
+        allocate_correction.assert_called_once_with(query)
+        self.assertEqual(prepare_correction.call_count, 2)
+        prepare_correction.assert_called_with(query, key, correction_workspace)
         empty_like.assert_called_once_with(query, dtype=torch.bfloat16)
         self.assertEqual(run.call_count, 2)
         for call in run.call_args_list:
             self.assertEqual(call.kwargs["backend"], "cake")
             self.assertEqual(call.kwargs["qkv_layout"], "NHD")
             self.assertIs(call.kwargs["workspace"], workspace)
+            self.assertIs(call.args[0], centered_query)
+            self.assertIs(call.args[1], centered_key)
+            self.assertIs(call.kwargs["qk_correction"], qk_correction)
             self.assertIs(call.kwargs["out"], output)
+
+    def test_forward_rejects_unqualified_batch(self):
+        impl = CakeNVFP4AttentionImpl(
+            num_heads=40,
+            num_kv_heads=40,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            causal=False,
+        )
+        query = torch.empty((2, 512, 40, 128), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "batch=1"):
+            impl.forward(query, query, query, None)
 
 
 if __name__ == "__main__":
