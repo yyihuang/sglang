@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 class _CakeNVFP4CorrectionWorkspace(NamedTuple):
     q_mean: torch.Tensor
-    k_mean: torch.Tensor
     qk_correction: torch.Tensor
 
 
@@ -99,7 +98,6 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
         common = {"device": query.device, "dtype": query.dtype}
         return _CakeNVFP4CorrectionWorkspace(
             q_mean=torch.empty((batch * heads, q_blocks, head_dim), **common),
-            k_mean=torch.empty((batch * heads, head_dim), **common),
             qk_correction=torch.empty(
                 (batch, heads, q_blocks, padded_seq_len),
                 device=query.device,
@@ -158,10 +156,10 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
         q_blocks = padded_seq_len // 128
 
         from loom.examples.weave.fp4_attention_quantize import (
-            make_centered_qk_launch,
+            make_q_centered_qk_launch,
         )
 
-        make_centered_qk_launch(
+        make_q_centered_qk_launch(
             query,
             key,
             outputs=(
@@ -170,7 +168,6 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
                 packed.q_scale,
                 packed.k_scale,
                 workspace.q_mean,
-                workspace.k_mean,
             ),
             qkv_layout="NHD",
         )()

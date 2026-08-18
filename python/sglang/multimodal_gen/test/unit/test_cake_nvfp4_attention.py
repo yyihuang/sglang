@@ -33,6 +33,14 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         )
         self.assertEqual(impl.num_heads, 40)
 
+    def test_correction_workspace_centers_q_only(self):
+        query = torch.empty((1, 257, 4, 128), dtype=torch.bfloat16)
+        workspace = CakeNVFP4AttentionImpl._allocate_correction_workspace(query)
+
+        self.assertEqual(workspace._fields, ("q_mean", "qk_correction"))
+        self.assertEqual(workspace.q_mean.shape, (4, 4, 128))
+        self.assertEqual(workspace.qk_correction.shape, (1, 4, 4, 512))
+
     def test_constructor_rejects_unsupported_contracts(self):
         cases = (
             ({"head_size": 64}, "head_size=128"),
