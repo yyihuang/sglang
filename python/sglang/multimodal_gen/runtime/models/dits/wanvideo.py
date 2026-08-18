@@ -79,6 +79,27 @@ logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
 
+def _validate_cake_nvfp4_min_timestep(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("cake_nvfp4_min_timestep must be a finite number")
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1000.0:
+        raise ValueError("cake_nvfp4_min_timestep must be within [0, 1000]")
+    return value
+
+
+def _use_cake_nvfp4_for_timestep(
+    timestep: torch.Tensor, min_timestep: float | None
+) -> bool:
+    if min_timestep is None:
+        return True
+    if timestep.numel() == 0:
+        raise ValueError("Wan timestep tensor must not be empty")
+    return bool(torch.amin(timestep).item() >= min_timestep)
+
+
 def _wan_cross_attention_backends(
     backends: set[AttentionBackendEnum],
 ) -> set[AttentionBackendEnum]:
@@ -503,6 +524,18 @@ class WanTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 is_cross_attention=False,
             )
+        self.attn1_fallback = None
+        if self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4:
+            self.attn1_fallback = USPAttention(
+                num_heads=self.local_num_heads,
+                head_size=dim // num_heads,
+                causal=False,
+                supported_attention_backends=self_attn_backends,
+                selected_attention_backend=AttentionBackendEnum.FA,
+                prefix=add_prefix("attn1_fallback", prefix),
+                quant_config=quant_config,
+                is_cross_attention=False,
+            )
 
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -579,6 +612,7 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
+        use_cake_nvfp4: bool = True,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -615,7 +649,10 @@ class WanTransformerBlock(nn.Module):
         value, _ = self.to_v(norm_hidden_states)
         cos, sin = freqs_cis
 
-        if self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4:
+        if (
+            self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4
+            and use_cake_nvfp4
+        ):
             if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
                 raise NotImplementedError(
                     "Cake fused Wan serving requires unsharded across-head RMSNorm"
@@ -698,7 +735,13 @@ class WanTransformerBlock(nn.Module):
                 query, key = _apply_rotary_emb(
                     query, cos, sin, is_neox_style=False
                 ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-            attn_output = self.attn1(query, key, value)
+            attention = (
+                self.attn1_fallback
+                if self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4
+                else self.attn1
+            )
+            assert attention is not None
+            attn_output = attention(query, key, value)
 
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -1010,6 +1053,18 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.num_channels_latents = config.num_channels_latents
         self.patch_size = config.patch_size
         self.text_len = config.text_len
+        attention_backend_config = (
+            get_global_server_args().attention_backend_config or {}
+        )
+        self.cake_nvfp4_min_timestep = _validate_cake_nvfp4_min_timestep(
+            attention_backend_config.get("cake_nvfp4_min_timestep")
+        )
+        if self.cake_nvfp4_min_timestep is not None:
+            logger.info_once(
+                "Wan Cake NVFP4 self-attention is enabled at timestep >= "
+                f"{self.cake_nvfp4_min_timestep:g} and falls back to FA below "
+                "the threshold"
+            )
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -1143,6 +1198,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         orig_dtype = hidden_states.dtype
+        use_cake_nvfp4 = _use_cake_nvfp4_for_timestep(
+            timestep, self.cake_nvfp4_min_timestep
+        )
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
         if (
@@ -1299,12 +1357,15 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     dim=-1,
                 )
             for block in self.blocks:
+                block_kwargs = {"rope_cos_sin_cache": rope_cos_sin_cache}
+                if isinstance(block, WanTransformerBlock):
+                    block_kwargs["use_cake_nvfp4"] = use_cake_nvfp4
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states,
                     timestep_proj,
                     freqs_cis,
-                    rope_cos_sin_cache=rope_cos_sin_cache,
+                    **block_kwargs,
                 )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:

@@ -681,6 +681,7 @@ class USPAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        selected_attention_backend: AttentionBackendEnum | None = None,
         default_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
@@ -698,6 +699,9 @@ class USPAttention(nn.Module):
               full KV without any collective communication.
             default_attention_backend:
               fallback used only when no global or component override is active.
+            selected_attention_backend:
+              explicit backend for this attention instance. This takes priority
+              over global and component overrides.
             is_cross_attention:
               sparse backend preferences may select a compatible dense backend
               for cross-attention while remaining strict for self-attention.
@@ -716,6 +720,7 @@ class USPAttention(nn.Module):
             head_size,
             dtype,
             supported_attention_backends=supported_attention_backends,
+            selected_attention_backend=selected_attention_backend,
             default_attention_backend=default_attention_backend,
             is_cross_attention=is_cross_attention,
         )

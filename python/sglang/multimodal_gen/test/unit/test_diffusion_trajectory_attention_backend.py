@@ -31,6 +31,8 @@ def _args(**overrides):
         "candidate_component_path": [],
         "reference_attention_backend": None,
         "candidate_attention_backend": None,
+        "reference_attention_backend_config": None,
+        "candidate_attention_backend_config": None,
         "reference_component_attention_backend": [],
         "candidate_component_attention_backend": [],
     }
@@ -73,6 +75,28 @@ def test_build_server_kwargs_forwards_component_attention_backends():
         "transformer": "cake_nvfp4",
         "transformer_2": "fa",
     }
+
+
+def test_build_server_kwargs_forwards_attention_backend_config():
+    args = _args(
+        candidate_attention_backend="fa",
+        candidate_attention_backend_config=(
+            '{"cake_nvfp4_min_timestep": 975}'
+        ),
+    )
+
+    candidate = build_server_kwargs(args, variant="candidate")
+
+    assert candidate["attention_backend_config"] == {
+        "cake_nvfp4_min_timestep": 975
+    }
+
+
+def test_build_server_kwargs_rejects_non_object_attention_backend_config():
+    args = _args(candidate_attention_backend_config="[975]")
+
+    with pytest.raises(ValueError, match="must decode to a JSON object"):
+        build_server_kwargs(args, variant="candidate")
 
 
 def test_extract_generation_time_prefers_populated_public_field():

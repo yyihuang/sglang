@@ -55,6 +55,18 @@ def parse_component_overrides(entries: Sequence[str] | None) -> dict[str, str]:
     return overrides
 
 
+def parse_json_object(value: str | None, *, option_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid {option_name} JSON: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{option_name} must decode to a JSON object")
+    return parsed
+
+
 def _cosine_similarity(flat_a: torch.Tensor, flat_b: torch.Tensor) -> float:
     norm_a = torch.linalg.vector_norm(flat_a).item()
     norm_b = torch.linalg.vector_norm(flat_b).item()
@@ -257,6 +269,10 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
     component_attention_backends = parse_component_overrides(
         getattr(args, f"{variant}_component_attention_backend", None) or []
     )
+    attention_backend_config = parse_json_object(
+        getattr(args, f"{variant}_attention_backend_config", None),
+        option_name=f"--{variant}-attention-backend-config",
+    )
     transformer_path = getattr(args, f"{variant}_transformer_path")
 
     kwargs: dict[str, Any] = {
@@ -280,6 +296,8 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
         kwargs["component_paths"] = component_paths
     if component_attention_backends:
         kwargs["component_attention_backends"] = component_attention_backends
+    if attention_backend_config:
+        kwargs["attention_backend_config"] = attention_backend_config
     attention_backend = getattr(args, f"{variant}_attention_backend")
     if attention_backend is not None:
         kwargs["attention_backend"] = attention_backend
@@ -491,6 +509,14 @@ def main() -> None:
     parser.add_argument(
         "--candidate-attention-backend",
         help="Optional attention backend for the candidate run.",
+    )
+    parser.add_argument(
+        "--reference-attention-backend-config",
+        help="Optional JSON object configuring the reference attention backend.",
+    )
+    parser.add_argument(
+        "--candidate-attention-backend-config",
+        help="Optional JSON object configuring the candidate attention backend.",
     )
     parser.add_argument(
         "--reference-component-attention-backend",

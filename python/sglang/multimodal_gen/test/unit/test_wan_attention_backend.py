@@ -1,11 +1,15 @@
 import unittest
 from unittest.mock import patch
 
+import pytest
+import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanSelfAttention,
     WanTransformer3DModel,
+    _use_cake_nvfp4_for_timestep,
+    _validate_cake_nvfp4_min_timestep,
     _wan_cross_attention_backends,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -14,6 +18,27 @@ _WAN = "sglang.multimodal_gen.runtime.models.dits.wanvideo"
 
 
 class TestWanAttentionBackendRole(unittest.TestCase):
+    def test_cake_nvfp4_timestep_threshold(self):
+        self.assertTrue(
+            _use_cake_nvfp4_for_timestep(torch.tensor([999]), 975.0)
+        )
+        self.assertTrue(
+            _use_cake_nvfp4_for_timestep(torch.tensor([975]), 975.0)
+        )
+        self.assertFalse(
+            _use_cake_nvfp4_for_timestep(torch.tensor([972]), 975.0)
+        )
+        self.assertTrue(
+            _use_cake_nvfp4_for_timestep(torch.tensor([0]), None)
+        )
+
+    def test_cake_nvfp4_timestep_threshold_validation(self):
+        self.assertEqual(_validate_cake_nvfp4_min_timestep(975), 975.0)
+        self.assertIsNone(_validate_cake_nvfp4_min_timestep(None))
+        for invalid in (True, "975", -1, 1001, float("inf")):
+            with self.subTest(invalid=invalid), pytest.raises(ValueError):
+                _validate_cake_nvfp4_min_timestep(invalid)
+
     def test_cake_nvfp4_is_admitted_for_wan_self_attention_only(self):
         self.assertIn(
             AttentionBackendEnum.CAKE_NVFP4,
