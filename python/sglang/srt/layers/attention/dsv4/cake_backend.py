@@ -168,6 +168,7 @@ class CakeDsv4DecodeWorkspace:
                 # otherwise a short decode would spuriously launch thousands of
                 # empty split CTAs and exceed the reducer's supported split set.
                 live_c128_width = max(1, (max_seq_len + 127) // 128)
+                live_c128_width = (live_c128_width + 3) & ~3
                 if live_c128_width > compressed_indices.shape[1]:
                     raise ValueError(
                         "live c128 extent exceeds metadata capacity: "

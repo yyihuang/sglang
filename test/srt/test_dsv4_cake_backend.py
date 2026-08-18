@@ -68,4 +68,4 @@ def test_decode_adapter_forces_cake_without_fallback(monkeypatch):
     assert call.kwargs["enable_pdl"] is False
     assert call.kwargs["kv_layout"] == "HND"
     assert call.kwargs["sparse_topk_lens"].tolist() == [130, 129]
-    assert call.kwargs["sparse_indices"].shape == (2, 130)
+    assert call.kwargs["sparse_indices"].shape == (2, 132)
