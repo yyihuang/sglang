@@ -41,6 +41,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsv4.cake_backend import (
+    CakeDsv4DecodeWorkspace,
+    is_cake_dsv4_enabled,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -580,6 +584,18 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.cake_dsv4_workspace = None
+        if is_cake_dsv4_enabled():
+            if not model_runner.server_args.disable_cuda_graph:
+                raise ValueError(
+                    "SGLANG_HACK_FLASHMLA_BACKEND=cake currently requires "
+                    "--disable-cuda-graph"
+                )
+            self.cake_dsv4_workspace = CakeDsv4DecodeWorkspace(self.device)
+            logger.info(
+                "Enabled strict SGLang DSV4 CAKE decode adapter; prefill remains "
+                "on the existing sparse-prefill path"
+            )
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -1617,6 +1633,35 @@ class DeepseekV4AttnBackend(
                 extra_indices = extra_indices.unsqueeze(1)
 
             assert attn_sink is not None
+
+            if (
+                self.cake_dsv4_workspace is not None
+                and forward_batch.forward_mode.is_decode()
+            ):
+                return self.cake_dsv4_workspace.run(
+                    q=q,
+                    packed_swa_cache=token_to_kv_pool.get_swa_key_buffer_radix(
+                        layer_id
+                    ),
+                    swa_indices=swa_page_indices,
+                    swa_active_lens=swa_topk_lengths,
+                    swa_page_size=swa_window_size,
+                    packed_compressed_cache=(
+                        token_to_kv_pool.get_extra_key_buffer(layer_id)
+                        if compress_ratio in (4, 128)
+                        else None
+                    ),
+                    compressed_indices=extra_indices,
+                    compressed_active_lens=extra_topk_lengths,
+                    compressed_page_size=(
+                        token_to_kv_pool.get_extra_key_page_size(layer_id)
+                        if compress_ratio in (4, 128)
+                        else None
+                    ),
+                    seq_lens=forward_batch.seq_lens,
+                    softmax_scale=self.softmax_scale,
+                    sinks=attn_sink,
+                ).squeeze(1)
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
