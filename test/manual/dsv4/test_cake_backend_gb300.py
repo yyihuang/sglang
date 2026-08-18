@@ -15,7 +15,6 @@ import statistics
 from dataclasses import dataclass
 
 import torch
-from loom.bench import bench_gpu_time
 from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import _set_k_and_s_triton
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
@@ -190,6 +189,8 @@ def _run_case(case: Case, *, benchmark: bool) -> dict:
         "cake_route_count": adapter.launch_count,
     }
     if benchmark:
+        from loom.bench import bench_gpu_time
+
         timings = {}
         for repeat in range(3):
             order = (("baseline", baseline), ("cake", candidate))
