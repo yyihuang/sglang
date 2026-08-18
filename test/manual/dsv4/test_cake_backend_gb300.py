@@ -72,7 +72,9 @@ def _packed_cache(rows: int, page_size: int, *, seed: int) -> torch.Tensor:
     return cache
 
 
-def _run_case(case: Case, *, benchmark: bool) -> dict:
+def _run_case(
+    case: Case, *, benchmark: bool, adapter: CakeDsv4DecodeWorkspace
+) -> dict:
     torch.manual_seed(1000 + case.batch + case.compressed_width)
     # TP4 owns 32 of the model's 128 heads, but the production DSV4 path pads
     # to FlashMLA's H64 specialization and discards the upper 32 outputs.
@@ -145,8 +147,6 @@ def _run_case(case: Case, *, benchmark: bool) -> dict:
             extra_indices_in_kvcache=compressed_indices,
             extra_topk_length=compressed_lens,
         )[0]
-
-    adapter = CakeDsv4DecodeWorkspace(torch.device("cuda"))
 
     def candidate():
         return adapter.run(
@@ -225,7 +225,13 @@ def main() -> None:
             f"expected GB300 SM103, got {torch.cuda.get_device_name()} "
             f"SM{torch.cuda.get_device_capability()}"
         )
-    rows = [_run_case(case, benchmark=args.benchmark) for case in CASES]
+    # Production owns one workspace across all layers.  Reuse it while widths
+    # and batch sizes change so the probe covers scratch growth and c4/c128/SWA
+    # alternation, not only isolated launches with fresh allocations.
+    adapter = CakeDsv4DecodeWorkspace(torch.device("cuda"))
+    rows = [
+        _run_case(case, benchmark=args.benchmark, adapter=adapter) for case in CASES
+    ]
     print("SGLANG_DSV4_CAKE_GPU_ROWS=" + json.dumps(rows, sort_keys=True), flush=True)
 
 
