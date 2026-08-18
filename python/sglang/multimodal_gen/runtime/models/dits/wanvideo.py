@@ -31,6 +31,10 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     UlyssesAttention_VSA,
     USPAttention,
 )
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_component_forced_attn_backend,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
@@ -87,8 +91,15 @@ def _wan_cross_attention_backends(
     # CAKE_NVFP4 is qualified only for dense self-attention.  Keep Wan's
     # cross-attention on FA so selecting Cake changes exactly one role instead
     # of silently switching cross-attention to the platform-default cuDNN path.
+    selected_backend = get_global_forced_attn_backend()
+    if selected_backend is None:
+        selected_backend = get_component_forced_attn_backend()
+    if selected_backend is None:
+        selected_backend_name = get_global_server_args().attention_backend
+        if selected_backend_name is not None:
+            selected_backend = AttentionBackendEnum[selected_backend_name.upper()]
     if (
-        AttentionBackendEnum.CAKE_NVFP4 in backends
+        selected_backend == AttentionBackendEnum.CAKE_NVFP4
         and AttentionBackendEnum.FA in dense_backends
     ):
         return {AttentionBackendEnum.FA}

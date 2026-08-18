@@ -19,27 +19,39 @@ class TestWanAttentionBackendRole(unittest.TestCase):
             AttentionBackendEnum.CAKE_NVFP4,
             WanTransformer3DModel._supported_attention_backends,
         )
-        cross = _wan_cross_attention_backends(
-            {
-                AttentionBackendEnum.CAKE_NVFP4,
-                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-            }
-        )
+        with (
+            patch(f"{_WAN}.get_global_forced_attn_backend", return_value=None),
+            patch(
+                f"{_WAN}.get_component_forced_attn_backend",
+                return_value=AttentionBackendEnum.CAKE_NVFP4,
+            ),
+        ):
+            cross = _wan_cross_attention_backends(
+                {
+                    AttentionBackendEnum.CAKE_NVFP4,
+                    AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                }
+            )
         self.assertEqual(
             cross,
             {AttentionBackendEnum.FA},
         )
 
     def test_non_cake_cross_attention_preserves_dense_candidates(self):
-        cross = _wan_cross_attention_backends(
-            {
-                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-            }
-        )
+        with patch(
+            f"{_WAN}.get_global_forced_attn_backend",
+            return_value=AttentionBackendEnum.FA,
+        ):
+            cross = _wan_cross_attention_backends(
+                {
+                    AttentionBackendEnum.CAKE_NVFP4,
+                    AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                }
+            )
         self.assertEqual(
             cross,
             {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
