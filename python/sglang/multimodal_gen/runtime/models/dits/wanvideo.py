@@ -90,6 +90,30 @@ def _validate_cake_nvfp4_min_timestep(value: Any) -> float | None:
     return value
 
 
+def _validate_cake_nvfp4_layer_indices(
+    value: Any, num_layers: int
+) -> frozenset[int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("cake_nvfp4_layer_indices must be a list of layer indices")
+    indices: list[int] = []
+    for index in value:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError(
+                "cake_nvfp4_layer_indices must contain only integer layer indices"
+            )
+        if not 0 <= index < num_layers:
+            raise ValueError(
+                "cake_nvfp4_layer_indices entries must be within "
+                f"[0, {num_layers - 1}]"
+            )
+        indices.append(index)
+    if len(indices) != len(set(indices)):
+        raise ValueError("cake_nvfp4_layer_indices must not contain duplicates")
+    return frozenset(indices)
+
+
 def _use_cake_nvfp4_for_timestep(
     timestep: torch.Tensor, min_timestep: float | None
 ) -> bool:
@@ -125,6 +149,7 @@ def _wan_cross_attention_backends(
     ):
         return {AttentionBackendEnum.FA}
     return dense_backends
+
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -649,10 +674,7 @@ class WanTransformerBlock(nn.Module):
         value, _ = self.to_v(norm_hidden_states)
         cos, sin = freqs_cis
 
-        if (
-            self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4
-            and use_cake_nvfp4
-        ):
+        if self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4 and use_cake_nvfp4:
             if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
                 raise NotImplementedError(
                     "Cake fused Wan serving requires unsharded across-head RMSNorm"
@@ -688,15 +710,9 @@ class WanTransformerBlock(nn.Module):
                     key = tensor_parallel_rms_norm(key, self.norm_k)
                 else:
                     key = self.norm_k(key)
-            query = query.squeeze(1).unflatten(
-                2, (self.local_num_heads, self.dim_head)
-            )
-            key = key.squeeze(1).unflatten(
-                2, (self.local_num_heads, self.dim_head)
-            )
-            value = value.squeeze(1).unflatten(
-                2, (self.local_num_heads, self.dim_head)
-            )
+            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
             # Apply rotary embeddings
             if _is_cuda and query.shape == key.shape:
@@ -1059,6 +1075,10 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.cake_nvfp4_min_timestep = _validate_cake_nvfp4_min_timestep(
             attention_backend_config.get("cake_nvfp4_min_timestep")
         )
+        self.cake_nvfp4_layer_indices = _validate_cake_nvfp4_layer_indices(
+            attention_backend_config.get("cake_nvfp4_layer_indices"),
+            config.num_layers,
+        )
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -1112,12 +1132,21 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             # Component-scoped FA models share the server config with the Cake
             # component. Avoid a needless timestep device synchronization.
             self.cake_nvfp4_min_timestep = None
-        elif self.cake_nvfp4_min_timestep is not None:
-            logger.info_once(
-                "Wan Cake NVFP4 self-attention is enabled at timestep >= "
-                f"{self.cake_nvfp4_min_timestep:g} and falls back to FA below "
-                "the threshold"
-            )
+            self.cake_nvfp4_layer_indices = None
+        else:
+            route_parts = []
+            if self.cake_nvfp4_min_timestep is not None:
+                route_parts.append(f"at timestep >= {self.cake_nvfp4_min_timestep:g}")
+            if self.cake_nvfp4_layer_indices is not None:
+                route_parts.append(
+                    f"for transformer blocks {sorted(self.cake_nvfp4_layer_indices)}"
+                )
+            if route_parts:
+                logger.info_once(
+                    "Wan Cake NVFP4 self-attention is enabled "
+                    + " ".join(route_parts)
+                    + " and falls back to FA elsewhere"
+                )
 
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
@@ -1365,10 +1394,13 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     ],
                     dim=-1,
                 )
-            for block in self.blocks:
+            for block_index, block in enumerate(self.blocks):
                 block_kwargs = {"rope_cos_sin_cache": rope_cos_sin_cache}
                 if isinstance(block, WanTransformerBlock):
-                    block_kwargs["use_cake_nvfp4"] = use_cake_nvfp4
+                    block_kwargs["use_cake_nvfp4"] = use_cake_nvfp4 and (
+                        self.cake_nvfp4_layer_indices is None
+                        or block_index in self.cake_nvfp4_layer_indices
+                    )
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states,

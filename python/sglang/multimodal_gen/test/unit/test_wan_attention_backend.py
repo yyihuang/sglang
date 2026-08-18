@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanSelfAttention,
     WanTransformer3DModel,
     _use_cake_nvfp4_for_timestep,
+    _validate_cake_nvfp4_layer_indices,
     _validate_cake_nvfp4_min_timestep,
     _wan_cross_attention_backends,
 )
@@ -19,18 +20,10 @@ _WAN = "sglang.multimodal_gen.runtime.models.dits.wanvideo"
 
 class TestWanAttentionBackendRole(unittest.TestCase):
     def test_cake_nvfp4_timestep_threshold(self):
-        self.assertTrue(
-            _use_cake_nvfp4_for_timestep(torch.tensor([999]), 975.0)
-        )
-        self.assertTrue(
-            _use_cake_nvfp4_for_timestep(torch.tensor([975]), 975.0)
-        )
-        self.assertFalse(
-            _use_cake_nvfp4_for_timestep(torch.tensor([972]), 975.0)
-        )
-        self.assertTrue(
-            _use_cake_nvfp4_for_timestep(torch.tensor([0]), None)
-        )
+        self.assertTrue(_use_cake_nvfp4_for_timestep(torch.tensor([999]), 975.0))
+        self.assertTrue(_use_cake_nvfp4_for_timestep(torch.tensor([975]), 975.0))
+        self.assertFalse(_use_cake_nvfp4_for_timestep(torch.tensor([972]), 975.0))
+        self.assertTrue(_use_cake_nvfp4_for_timestep(torch.tensor([0]), None))
 
     def test_cake_nvfp4_timestep_threshold_validation(self):
         self.assertEqual(_validate_cake_nvfp4_min_timestep(975), 975.0)
@@ -38,6 +31,17 @@ class TestWanAttentionBackendRole(unittest.TestCase):
         for invalid in (True, "975", -1, 1001, float("inf")):
             with self.subTest(invalid=invalid), pytest.raises(ValueError):
                 _validate_cake_nvfp4_min_timestep(invalid)
+
+    def test_cake_nvfp4_layer_indices_validation(self):
+        self.assertEqual(
+            _validate_cake_nvfp4_layer_indices([0, 39], 40),
+            frozenset({0, 39}),
+        )
+        self.assertEqual(_validate_cake_nvfp4_layer_indices([], 40), frozenset())
+        self.assertIsNone(_validate_cake_nvfp4_layer_indices(None, 40))
+        for invalid in (True, 1, "0", [False], [1.0], [-1], [40], [3, 3]):
+            with self.subTest(invalid=invalid), pytest.raises(ValueError):
+                _validate_cake_nvfp4_layer_indices(invalid, 40)
 
     def test_cake_nvfp4_is_admitted_for_wan_self_attention_only(self):
         self.assertIn(
