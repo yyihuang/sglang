@@ -13,6 +13,7 @@ selected with ``SGLANG_HACK_FLASHMLA_BACKEND=cake`` on SM103.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
@@ -190,6 +191,23 @@ class CakeDsv4DecodeWorkspace:
             sparse_width=expected_width,
         )
         out = self._output(q.shape)
+
+        if os.getenv("SGLANG_CAKE_DSV4_DEBUG_SHAPES") == "1":
+            lens_host = active_lens.tolist()
+            if any(length < 0 or length > expected_width for length in lens_host):
+                raise ValueError(
+                    "CAKE DSV4 active length exceeds gathered sparse width: "
+                    f"lens={lens_host}, width={expected_width}"
+                )
+            logger.info(
+                "CAKE DSV4 debug launch: queries=%d heads=%d width=%d "
+                "active_lens=%s workspace_bytes=%d",
+                num_queries,
+                num_heads,
+                expected_width,
+                lens_host,
+                workspace.numel(),
+            )
 
         result = _flashinfer_dsv4()(
             q,
