@@ -191,8 +191,8 @@ def _run_case(
     torch.testing.assert_close(
         actual[:, :, :LOCAL_HEADS],
         expected[:, :, :LOCAL_HEADS],
-        atol=2e-2,
-        rtol=2e-2,
+        atol=1e-2,
+        rtol=1e-2,
     )
     result = {
         "case": case.name,
