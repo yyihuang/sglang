@@ -242,6 +242,7 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             ) from error
 
         packed, output, correction_workspace = self._get_workspace_and_output(query)
+        seq_len = query.shape[1]
         qk_correction = self._prepare_qk_correction(
             query, key, packed, correction_workspace
         )
