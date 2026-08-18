@@ -67,6 +67,7 @@ class CakeDsv4DecodeWorkspace:
         self._indices: torch.Tensor | None = None
         self._workspace: torch.Tensor | None = None
         self._out: torch.Tensor | None = None
+        self._logged_shapes: set[tuple[int, int, int]] = set()
         self.launch_count = 0
 
     def _bf16_rows(self, name: str, rows: int) -> torch.Tensor:
@@ -209,12 +210,18 @@ class CakeDsv4DecodeWorkspace:
             backend="cake",
         )
         self.launch_count += 1
-        if self.launch_count == 1:
+        route_shape = (num_queries, num_heads, expected_width)
+        if route_shape not in self._logged_shapes:
             logger.info(
                 "SGLang DSV4 decode routed to FlashInfer backend='cake' "
-                "without fallback (packed-KV gather width=%d)",
+                "without fallback (queries=%d, heads=%d, packed-KV gather "
+                "width=%d, compressed-page-size=%s)",
+                num_queries,
+                num_heads,
                 expected_width,
+                compressed_page_size,
             )
+            self._logged_shapes.add(route_shape)
         return result
 
 

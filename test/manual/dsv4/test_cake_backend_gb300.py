@@ -39,6 +39,9 @@ class Case:
 CASES = (
     Case("tp4_b1_swa128", 1, 0, None),
     Case("tp4_b8_swa128", 8, 0, None),
+    Case("tp4_b1_c4_topk512", 1, 512, 64),
+    Case("tp4_b8_c4_topk512", 8, 512, 64),
+    Case("tp4_b16_c4_topk512", 16, 512, 64),
     Case("tp4_b1_topk4x", 1, 1024, 64),
     Case("tp4_b8_topk4x", 8, 1024, 64),
     Case("tp4_b1_topk128x", 1, 128, 2),
