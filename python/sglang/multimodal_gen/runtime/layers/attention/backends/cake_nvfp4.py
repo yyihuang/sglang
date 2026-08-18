@@ -18,10 +18,8 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 class _CakeNVFP4CorrectionWorkspace(NamedTuple):
     q_padded: torch.Tensor
     q_mean: torch.Tensor
-    q_mean_fp32: torch.Tensor
     k_mean: torch.Tensor
     k_centered: torch.Tensor
-    k_centered_fp32_t: torch.Tensor
     qk_correction: torch.Tensor
 
 
@@ -104,18 +102,8 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
         return _CakeNVFP4CorrectionWorkspace(
             q_padded=torch.empty((batch, padded_seq_len, heads, head_dim), **common),
             q_mean=torch.empty((batch, q_blocks, heads, head_dim), **common),
-            q_mean_fp32=torch.empty(
-                (batch, heads, q_blocks, head_dim),
-                device=query.device,
-                dtype=torch.float32,
-            ),
             k_mean=torch.empty((batch, 1, heads, head_dim), **common),
             k_centered=torch.empty_like(query),
-            k_centered_fp32_t=torch.empty(
-                (batch, heads, head_dim, padded_seq_len),
-                device=query.device,
-                dtype=torch.float32,
-            ),
             qk_correction=torch.empty(
                 (batch, heads, q_blocks, padded_seq_len),
                 device=query.device,
@@ -177,15 +165,12 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
 
         torch.mean(key, dim=1, keepdim=True, out=workspace.k_mean)
         torch.sub(key, workspace.k_mean, out=workspace.k_centered)
-        workspace.q_mean_fp32.copy_(workspace.q_mean.permute(0, 2, 1, 3))
-        workspace.k_centered_fp32_t.zero_()
-        workspace.k_centered_fp32_t[..., :seq_len].copy_(
-            workspace.k_centered.permute(0, 2, 3, 1)
-        )
-        torch.matmul(
-            workspace.q_mean_fp32,
-            workspace.k_centered_fp32_t,
-            out=workspace.qk_correction,
+        workspace.qk_correction.zero_()
+        torch.bmm(
+            workspace.q_mean.permute(0, 2, 1, 3).squeeze(0),
+            workspace.k_centered.permute(0, 2, 3, 1).squeeze(0),
+            out_dtype=torch.float32,
+            out=workspace.qk_correction.squeeze(0)[..., :seq_len],
         )
 
         centered_query = workspace.q_padded[:, :seq_len]
