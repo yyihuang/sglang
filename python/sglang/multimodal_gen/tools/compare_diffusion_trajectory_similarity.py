@@ -299,7 +299,11 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
     if component_attention_backends:
         kwargs["component_attention_backends"] = component_attention_backends
     if attention_backend_config:
-        kwargs["attention_backend_config"] = attention_backend_config
+        # ServerArgs normalizes its string form into addict.Dict, which keeps
+        # the attribute access used by existing sparse-attention request code.
+        kwargs["attention_backend_config"] = json.dumps(
+            attention_backend_config, sort_keys=True, separators=(",", ":")
+        )
     attention_backend = getattr(args, f"{variant}_attention_backend")
     if attention_backend is not None:
         kwargs["attention_backend"] = attention_backend

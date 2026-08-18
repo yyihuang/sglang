@@ -95,9 +95,9 @@ def test_build_server_kwargs_forwards_attention_backend_config():
 
     candidate = build_server_kwargs(args, variant="candidate")
 
-    assert candidate["attention_backend_config"] == {
-        "cake_nvfp4_min_timestep": 975
-    }
+    assert candidate["attention_backend_config"] == (
+        '{"cake_nvfp4_min_timestep":975}'
+    )
 
 
 def test_build_server_kwargs_rejects_non_object_attention_backend_config():
