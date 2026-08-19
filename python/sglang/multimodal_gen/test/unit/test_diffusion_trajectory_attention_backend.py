@@ -6,13 +6,17 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MODEL_QUALIFICATION_THRESHOLDS,
     _cosine_similarity,
+    _extract_cake_nvfp4_hit_count,
     _extract_generation_time_s,
+    _with_candidate_backend_hit_qualification,
     build_sampling_kwargs,
     build_server_kwargs,
+    evaluate_candidate_backend_hit_qualification,
     evaluate_correctness_qualification,
     evaluate_performance_qualification,
     summarize_cross_variant_metrics,
@@ -139,6 +143,29 @@ def test_extract_generation_time_rejects_missing_measurement():
 
     with pytest.raises(ValueError, match="neither a positive generation_time"):
         _extract_generation_time_s(result)
+
+
+def test_extract_cake_nvfp4_hit_count_requires_integer_metric():
+    assert (
+        _extract_cake_nvfp4_hit_count(
+            SimpleNamespace(metrics={"cake_nvfp4_hit_count": 7})
+        )
+        == 7
+    )
+    for metrics in (
+        {},
+        {"cake_nvfp4_hit_count": None},
+        {"cake_nvfp4_hit_count": True},
+    ):
+        assert _extract_cake_nvfp4_hit_count(SimpleNamespace(metrics=metrics)) is None
+
+
+def test_request_metrics_transports_cake_nvfp4_hit_count():
+    metrics = RequestMetrics("request")
+
+    assert metrics.to_dict()["cake_nvfp4_hit_count"] == 0
+    metrics.cake_nvfp4_hit_count = 11
+    assert metrics.to_dict()["cake_nvfp4_hit_count"] == 11
 
 
 def _generation_result(latent_offset=0.0, frame_offset=0):
@@ -300,6 +327,39 @@ def test_performance_qualification_enforces_finite_speedup_floor(speedup, passed
     )
 
     assert qualification["passed"] is passed
+
+
+@pytest.mark.parametrize(
+    ("hit_counts", "passed"),
+    [
+        ([1], True),
+        ([1, 4, 2], True),
+        ([0], False),
+        ([1, 0], False),
+        ([None], False),
+        (None, False),
+    ],
+)
+def test_candidate_backend_hit_qualification_requires_every_run(hit_counts, passed):
+    qualification = evaluate_candidate_backend_hit_qualification(hit_counts)
+
+    assert qualification["passed"] is passed
+
+
+def test_candidate_backend_hit_failure_is_part_of_overall_qualification():
+    qualification = _with_candidate_backend_hit_qualification(
+        {"passed": True, "failures": [], "thresholds": {}}, [0]
+    )
+
+    assert qualification["passed"] is False
+    assert qualification["failures"] == [
+        {
+            "scope": "candidate_backend_hits",
+            "reason": "candidate_hit_count_not_positive",
+            "run_index": 0,
+            "hit_count": 0,
+        }
+    ]
 
 
 def test_cosine_similarity_is_clamped_to_valid_metric_range(monkeypatch):

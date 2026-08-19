@@ -39,6 +39,26 @@ _SHARED_SCRATCH_LOCK = threading.Lock()
 _SHARED_SCRATCH: weakref.WeakValueDictionary[tuple, _CakeNVFP4SharedScratch] = (
     weakref.WeakValueDictionary()
 )
+_HIT_COUNT_LOCK = threading.Lock()
+_SUCCESSFUL_FORWARD_HIT_COUNT = 0
+
+
+def reset_cake_nvfp4_hit_count() -> None:
+    global _SUCCESSFUL_FORWARD_HIT_COUNT
+    with _HIT_COUNT_LOCK:
+        _SUCCESSFUL_FORWARD_HIT_COUNT = 0
+
+
+def read_cake_nvfp4_hit_count() -> int:
+    with _HIT_COUNT_LOCK:
+        return _SUCCESSFUL_FORWARD_HIT_COUNT
+
+
+def _record_successful_cake_nvfp4_forward(result: torch.Tensor) -> torch.Tensor:
+    global _SUCCESSFUL_FORWARD_HIT_COUNT
+    with _HIT_COUNT_LOCK:
+        _SUCCESSFUL_FORWARD_HIT_COUNT += 1
+    return result
 
 
 class CakeNVFP4AttentionBackend(AttentionBackend):
@@ -289,14 +309,16 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             packed.v_scale_hi,
             0,
         )
-        return cake_nvfp4_attention_fwd(
-            *packed,
-            seq_len,
-            sm_scale=self.softmax_scale,
-            causal=False,
-            qkv_layout="NHD",
-            qk_correction=qk_correction,
-            out=output,
+        return _record_successful_cake_nvfp4_forward(
+            cake_nvfp4_attention_fwd(
+                *packed,
+                seq_len,
+                sm_scale=self.softmax_scale,
+                causal=False,
+                qkv_layout="NHD",
+                qk_correction=qk_correction,
+                out=output,
+            )
         )
 
     def forward_wan_projections(
@@ -419,16 +441,18 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
 
         from flashinfer import cake_nvfp4_attention_fwd
 
-        return cake_nvfp4_attention_fwd(
-            *packed,
-            seq_len,
-            sm_scale=self.softmax_scale,
-            causal=False,
-            qkv_layout="NHD",
-            qk_correction=correction.qk_correction.view(
-                self.num_heads,
-                int(packed.q_fp4.shape[2]) // 128,
-                int(packed.q_fp4.shape[2]),
-            ),
-            out=output,
+        return _record_successful_cake_nvfp4_forward(
+            cake_nvfp4_attention_fwd(
+                *packed,
+                seq_len,
+                sm_scale=self.softmax_scale,
+                causal=False,
+                qkv_layout="NHD",
+                qk_correction=correction.qk_correction.view(
+                    self.num_heads,
+                    int(packed.q_fp4.shape[2]) // 128,
+                    int(packed.q_fp4.shape[2]),
+                ),
+                out=output,
+            )
         )

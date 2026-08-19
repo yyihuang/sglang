@@ -48,6 +48,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4 import (
+    read_cake_nvfp4_hit_count,
+    reset_cake_nvfp4_hit_count,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
 )
@@ -497,14 +501,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
                 try:
+                    reset_cake_nvfp4_hit_count()
                     result = forward_fn()
                 except Exception:
                     forward_failed = True
                     raise
 
+            cake_nvfp4_hit_count = read_cake_nvfp4_hit_count()
+
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
             if return_req and isinstance(result, Req):
+                if result.metrics is not None:
+                    result.metrics.cake_nvfp4_hit_count = cake_nvfp4_hit_count
                 return result
 
             output_batch = self._to_output_batch(result)
@@ -527,6 +536,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             duration_ms = (time.monotonic() - start_time) * 1000
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
+                metrics.cake_nvfp4_hit_count = cake_nvfp4_hit_count
 
             self._materialize_output_transport(output_batch, req, save_output_paths)
 

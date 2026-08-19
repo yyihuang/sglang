@@ -538,6 +538,51 @@ def evaluate_performance_qualification(
     }
 
 
+def evaluate_candidate_backend_hit_qualification(
+    per_run_hit_counts: Any,
+) -> dict[str, Any]:
+    failures: list[dict[str, Any]] = []
+    if not isinstance(per_run_hit_counts, list) or not per_run_hit_counts:
+        failures.append({"reason": "missing_candidate_hit_counts"})
+    else:
+        for run_index, hit_count in enumerate(per_run_hit_counts):
+            if (
+                isinstance(hit_count, bool)
+                or not isinstance(hit_count, int)
+                or hit_count <= 0
+            ):
+                failures.append(
+                    {
+                        "reason": "candidate_hit_count_not_positive",
+                        "run_index": run_index,
+                        "hit_count": hit_count,
+                    }
+                )
+    return {
+        "passed": not failures,
+        "thresholds": {"candidate_hit_count_min_exclusive": 0},
+        "failures": failures,
+    }
+
+
+def _with_candidate_backend_hit_qualification(
+    qualification: dict[str, Any],
+    per_run_hit_counts: Any,
+) -> dict[str, Any]:
+    hit_qualification = evaluate_candidate_backend_hit_qualification(
+        per_run_hit_counts
+    )
+    hit_failures = [
+        {"scope": "candidate_backend_hits"} | failure
+        for failure in hit_qualification["failures"]
+    ]
+    return qualification | {
+        "passed": qualification["passed"] and hit_qualification["passed"],
+        "failures": qualification["failures"] + hit_failures,
+        "candidate_backend_hits": hit_qualification,
+    }
+
+
 def extract_result_frames(result: Any) -> list[np.ndarray]:
     if result.frames is not None:
         return [np.asarray(frame) for frame in result.frames]
@@ -717,6 +762,16 @@ def _extract_total_duration_ms(result: Any) -> float | None:
     return float(total_duration_ms)
 
 
+def _extract_cake_nvfp4_hit_count(result: Any) -> int | None:
+    metrics = getattr(result, "metrics", None)
+    if not isinstance(metrics, dict):
+        return None
+    hit_count = metrics.get("cake_nvfp4_hit_count")
+    if isinstance(hit_count, bool) or not isinstance(hit_count, int):
+        return None
+    return hit_count
+
+
 def _extract_generation_time_s(result: Any) -> float:
     """Return a populated end-to-end generation duration.
 
@@ -797,6 +852,14 @@ def run_variant(
         )
         if duration is not None
     ]
+    cake_nvfp4_hit_counts = [
+        _extract_cake_nvfp4_hit_count(result) for result in measured_results
+    ]
+    valid_cake_nvfp4_hit_counts = [
+        hit_count
+        for hit_count in cake_nvfp4_hit_counts
+        if hit_count is not None
+    ]
 
     return {
         "result": final_result,
@@ -821,6 +884,12 @@ def run_variant(
             statistics.median(total_duration_ms) if total_duration_ms else None
         ),
         "per_run_total_duration_ms": total_duration_ms,
+        "cake_nvfp4_hit_count": (
+            sum(valid_cake_nvfp4_hit_counts)
+            if len(valid_cake_nvfp4_hit_counts) == len(cake_nvfp4_hit_counts)
+            else None
+        ),
+        "per_run_cake_nvfp4_hit_count": cake_nvfp4_hit_counts,
     }
 
 
@@ -1110,6 +1179,10 @@ def main() -> None:
         result["qualification"] = evaluate_performance_qualification(
             result["performance"]
         )
+    result["qualification"] = _with_candidate_backend_hit_qualification(
+        result["qualification"],
+        result["candidate_generation"]["per_run_cake_nvfp4_hit_count"],
+    )
 
     output_json.write_text(
         json.dumps(_to_jsonable(result), indent=2, sort_keys=True), encoding="utf-8"
@@ -1124,6 +1197,12 @@ def main() -> None:
         ],
         "candidate_median_generation_time_s": result["candidate_generation"][
             "median_generation_time_s"
+        ],
+        "candidate_cake_nvfp4_hit_count": result["candidate_generation"][
+            "cake_nvfp4_hit_count"
+        ],
+        "candidate_per_run_cake_nvfp4_hit_count": result["candidate_generation"][
+            "per_run_cake_nvfp4_hit_count"
         ],
         **result["performance"],
         "qualification_passed": result["qualification"]["passed"],

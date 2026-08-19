@@ -10,11 +10,16 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4 import (
     CakeNVFP4AttentionBackend,
     CakeNVFP4AttentionImpl,
     _SHARED_SCRATCH,
+    read_cake_nvfp4_hit_count,
+    reset_cake_nvfp4_hit_count,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class TestCakeNVFP4AttentionBackend(unittest.TestCase):
+    def setUp(self):
+        reset_cake_nvfp4_hit_count()
+
     def test_backend_contract(self):
         self.assertEqual(
             CakeNVFP4AttentionBackend.get_enum(), AttentionBackendEnum.CAKE_NVFP4
@@ -196,12 +201,79 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         self.assertEqual(get_module.call_count, 2)
         target_for_device.assert_called_with(value.device)
         self.assertEqual(run.call_count, 2)
+        self.assertEqual(read_cake_nvfp4_hit_count(), 2)
         for call in run.call_args_list:
             self.assertEqual(call.args[:7], tuple(packed))
             self.assertEqual(call.args[7], 4800)
             self.assertEqual(call.kwargs["qkv_layout"], "NHD")
             self.assertIs(call.kwargs["qk_correction"], qk_correction)
             self.assertIs(call.kwargs["out"], output)
+
+    def test_failed_forward_does_not_increment_hit_count(self):
+        impl = CakeNVFP4AttentionImpl(
+            num_heads=40,
+            num_kv_heads=40,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            causal=False,
+        )
+        query = Mock()
+        query.shape = (1, 4800, 40, 128)
+        query.ndim = 4
+        query.device = SimpleNamespace(type="cuda", index=0)
+        query.dtype = torch.bfloat16
+        query.is_contiguous.return_value = True
+        key = Mock()
+        key.shape = query.shape
+        key.device = query.device
+        key.dtype = query.dtype
+        key.is_contiguous.return_value = True
+        value = Mock()
+        value.shape = query.shape
+        value.device = query.device
+        value.dtype = query.dtype
+        value.is_contiguous.return_value = True
+        packed_type = namedtuple(
+            "Packed",
+            (
+                "q_fp4",
+                "k_fp4",
+                "v_fp4_t",
+                "q_scale",
+                "k_scale",
+                "v_scale_lo",
+                "v_scale_hi",
+            ),
+        )
+        packed = packed_type(*(object() for _ in packed_type._fields))
+        quantize_module = SimpleNamespace(quantize_v=Mock())
+        fake_flashinfer = ModuleType("flashinfer")
+        fake_flashinfer.cake_nvfp4_attention_fwd = Mock(
+            side_effect=RuntimeError("kernel failed")
+        )
+        fake_cake_module = ModuleType("flashinfer.cake_nvfp4_attention")
+        fake_cake_module._get_module = Mock(return_value=quantize_module)
+        fake_cake_module._target_for_device = Mock(return_value="sm100a")
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "flashinfer": fake_flashinfer,
+                    "flashinfer.cake_nvfp4_attention": fake_cake_module,
+                },
+            ),
+            patch.object(
+                impl,
+                "_get_workspace_and_output",
+                return_value=(packed, object(), object()),
+            ),
+            patch.object(impl, "_prepare_qk_correction", return_value=object()),
+            self.assertRaisesRegex(RuntimeError, "kernel failed"),
+        ):
+            impl.forward(query, key, value, None)
+
+        self.assertEqual(read_cake_nvfp4_hit_count(), 0)
 
     def test_scratch_is_shared_across_layers_on_the_same_stream(self):
         first = CakeNVFP4AttentionImpl(
