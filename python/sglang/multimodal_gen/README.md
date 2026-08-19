@@ -99,20 +99,26 @@ are not supported. Ulysses-only sequence parallelism is supported when each
 rank retains a valid local head count.
 
 This integration is experimental and is not a production quality claim. The
-Cake path directly quantizes Q/K/V and does not implement the Q-centering and
-QK-logit correction used by FlashInfer's SM120 NVFP4 backend. Qualify complete
-diffusion trajectories and generated frames against the dense backend before
-enabling it for a model; isolated attention-kernel agreement is insufficient.
+Wan path fuses RMSNorm, RoPE, Q-centering, and FP4 packing, reuses its packed
+workspace and caller-owned output, and supplies the matching FP32 QK-logit
+correction to FlashInfer. Complete diffusion trajectories and generated frames
+must still be qualified against the dense backend: isolated attention accuracy
+is insufficient for this model.
 
 The current B200 qualification uses the exact ModelOpt checkpoint above at
-640x384, 17 frames, 12 steps, seed 0, one warmup, and two measured requests.
-With native BSHD quantization, reusable workspace, and caller-owned output, FA
-averages 2.619980 seconds and Cake averages 2.674145 seconds (0.9797x, 2.07%
-slower). This removes most of the earlier integration overhead, but does not
-fix model quality: denoising-trajectory cosine falls from 0.999933 at step 0 to
-0.272738 at step 11, and all-frame cosine is 0.688079. The integration is
-therefore retained for correctness and performance follow-up, but is not
-serving qualified and should not be selected by default.
+640x384, 17 frames, 12 steps, seed 0, TP1/SP1, two warmups, and five measured
+requests. BF16 FlashAttention averages 2.718266 seconds and all-layer corrected
+Cake averages 2.739915 seconds (0.9921x). The final denoising-trajectory cosine
+is 0.6591; all-frame cosine is 0.7338 and PSNR is 11.87 dB. Even restricting
+Cake to one transformer block in the final denoising step leaves final-frame
+PSNR near 12.15 dB. The error amplification is therefore a full-model
+sensitivity to FP4 attention, not an unaccounted wrapper allocation or missing
+QK correction.
+
+Cake remains an explicit opt-in and the production route stays on FA. The
+`cake_nvfp4_min_timestep` and `cake_nvfp4_layer_indices` backend options are
+diagnostic gates; a configuration that produces zero Cake calls is not a
+successful Cake serving integration.
 
 ### Component residency
 
