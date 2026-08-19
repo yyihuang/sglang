@@ -8,10 +8,13 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
+    MODEL_QUALIFICATION_THRESHOLDS,
     _cosine_similarity,
     _extract_generation_time_s,
     build_sampling_kwargs,
     build_server_kwargs,
+    evaluate_correctness_qualification,
+    evaluate_performance_qualification,
     summarize_cross_variant_metrics,
     summarize_run_repeatability,
 )
@@ -216,6 +219,87 @@ def test_summarize_run_repeatability_requires_two_runs():
         "num_runs": 1,
         "reason": "repeatability requires at least two measured runs",
     }
+
+
+def _correctness_qualification(reference_results, candidate_results):
+    return evaluate_correctness_qualification(
+        summarize_cross_variant_metrics(reference_results, candidate_results),
+        {
+            "reference": summarize_run_repeatability(reference_results),
+            "candidate": summarize_run_repeatability(candidate_results),
+        },
+    )
+
+
+def test_correctness_qualification_passes_all_pairs_and_exact_repeatability():
+    reference_results = [_generation_result(), _generation_result()]
+    candidate_results = [_generation_result(0.08), _generation_result(0.08)]
+
+    qualification = _correctness_qualification(
+        reference_results, candidate_results
+    )
+
+    assert qualification["passed"] is True
+    assert qualification["failures"] == []
+    assert qualification["thresholds"] == MODEL_QUALIFICATION_THRESHOLDS
+
+
+def test_correctness_qualification_fails_closed_on_quality_and_repeatability():
+    reference_results = [_generation_result(), _generation_result()]
+    candidate_results = [_generation_result(0.25), _generation_result(0.5)]
+
+    qualification = _correctness_qualification(
+        reference_results, candidate_results
+    )
+
+    assert qualification["passed"] is False
+    reasons = {failure["reason"] for failure in qualification["failures"]}
+    assert "mae_above_maximum" in reasons
+    assert "repeatability_mismatch" in reasons
+
+
+def test_correctness_qualification_fails_closed_on_non_finite_trajectory():
+    reference_results = [_generation_result(), _generation_result()]
+    candidate_results = [_generation_result(), _generation_result()]
+    candidate_results[0].trajectory_latents[0, 0, 0, 0] = float("nan")
+
+    qualification = _correctness_qualification(
+        reference_results, candidate_results
+    )
+
+    assert qualification["passed"] is False
+    assert any(
+        failure["reason"] == "non_finite_trajectory"
+        for failure in qualification["failures"]
+    )
+
+
+def test_correctness_qualification_requires_same_instance_repeatability():
+    result = _generation_result()
+    qualification = evaluate_correctness_qualification(
+        summarize_cross_variant_metrics([result], [result]),
+        {
+            "reference": summarize_run_repeatability([result]),
+            "candidate": summarize_run_repeatability([result]),
+        },
+    )
+
+    assert qualification["passed"] is False
+    assert {
+        failure["scope"] for failure in qualification["failures"]
+    } == {"reference_repeatability", "candidate_repeatability"}
+
+
+@pytest.mark.parametrize(
+    ("speedup", "passed"),
+    [(1.0, True), (1.01, True), (0.999, False), (float("nan"), False), (None, False)],
+)
+def test_performance_qualification_enforces_finite_speedup_floor(speedup, passed):
+    qualification = evaluate_performance_qualification(
+        {"wall_median_speedup": speedup}
+    )
+
+    assert qualification["passed"] is passed
 
 
 def test_cosine_similarity_is_clamped_to_valid_metric_range(monkeypatch):

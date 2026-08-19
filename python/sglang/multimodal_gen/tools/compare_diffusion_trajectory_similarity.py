@@ -39,6 +39,17 @@ import torch
 import torch.nn.functional as F
 
 
+MODEL_QUALIFICATION_THRESHOLDS = {
+    "atol": 1.0,
+    "rtol": 0.1,
+    "cosine_min": 0.995,
+    "mae_max": 0.025,
+    "repeatability_atol": 0.0,
+    "repeatability_rtol": 0.0,
+    "speedup_min": 1.0,
+}
+
+
 def parse_component_overrides(entries: Sequence[str] | None) -> dict[str, str]:
     overrides: dict[str, str] = {}
     for entry in entries or []:
@@ -80,7 +91,7 @@ def _cosine_similarity(flat_a: torch.Tensor, flat_b: torch.Tensor) -> float:
     return max(-1.0, min(1.0, similarity))
 
 
-def compute_tensor_metrics(lhs: Any, rhs: Any) -> dict[str, float]:
+def compute_tensor_metrics(lhs: Any, rhs: Any) -> dict[str, Any]:
     lhs_tensor = torch.as_tensor(lhs).detach().cpu().float()
     rhs_tensor = torch.as_tensor(rhs).detach().cpu().float()
     if lhs_tensor.shape != rhs_tensor.shape:
@@ -102,6 +113,19 @@ def compute_tensor_metrics(lhs: Any, rhs: Any) -> dict[str, float]:
         "rmse": rmse,
         "max_abs": max_abs,
         "l2": l2,
+        "finite": bool(
+            torch.isfinite(lhs_tensor).all().item()
+            and torch.isfinite(rhs_tensor).all().item()
+        ),
+        "within_tolerance": bool(
+            torch.allclose(
+                rhs_tensor,
+                lhs_tensor,
+                atol=MODEL_QUALIFICATION_THRESHOLDS["atol"],
+                rtol=MODEL_QUALIFICATION_THRESHOLDS["rtol"],
+            )
+        ),
+        "exact_match": bool(torch.equal(lhs_tensor, rhs_tensor)),
     }
 
 
@@ -168,6 +192,17 @@ def summarize_trajectory_metrics(
         if candidate_timesteps is not None
         else None
     )
+    timesteps_available = ref_t is not None and cand_t is not None
+    timesteps_finite = bool(
+        timesteps_available
+        and torch.isfinite(ref_t).all().item()
+        and torch.isfinite(cand_t).all().item()
+    )
+    timesteps_match = bool(
+        timesteps_available
+        and ref_t.shape == cand_t.shape
+        and torch.equal(ref_t, cand_t)
+    )
 
     per_step: list[dict[str, Any]] = []
     for idx in range(num_steps):
@@ -181,6 +216,9 @@ def summarize_trajectory_metrics(
         "trajectory_shape": list(ref.shape),
         "num_steps": num_steps,
         "selected_step_index": selected_step,
+        "timesteps_available": timesteps_available,
+        "timesteps_finite": timesteps_finite,
+        "timesteps_match": timesteps_match,
         "selected_step_metrics": per_step[selected_step],
         "per_step_metrics": per_step,
     }
@@ -351,6 +389,152 @@ def summarize_cross_variant_metrics(
         "num_pairs": len(comparisons),
         "comparisons": comparisons,
         "envelope": _summarize_comparison_envelope(comparisons),
+    }
+
+
+def _comparison_failures(
+    comparisons: Sequence[dict[str, Any]],
+    *,
+    scope: str,
+    require_exact: bool,
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for comparison in comparisons:
+        pair = {
+            "scope": scope,
+            "reference_run_index": comparison["reference_run_index"],
+            "candidate_run_index": comparison["candidate_run_index"],
+        }
+        trajectory = comparison["trajectory_metrics"]
+        for field in (
+            "timesteps_available",
+            "timesteps_finite",
+            "timesteps_match",
+        ):
+            if not trajectory.get(field, False):
+                failures.append(pair | {"reason": field})
+
+        for metrics in trajectory["per_step_metrics"]:
+            location = pair | {"step_index": metrics["step_index"]}
+            if not metrics["finite"]:
+                failures.append(location | {"reason": "non_finite_trajectory"})
+                continue
+            if require_exact:
+                if not metrics["exact_match"]:
+                    failures.append(
+                        location
+                        | {
+                            "reason": "repeatability_mismatch",
+                            "max_abs": metrics["max_abs"],
+                        }
+                    )
+                continue
+            if not metrics["within_tolerance"]:
+                failures.append(
+                    location
+                    | {
+                        "reason": "outside_atol_rtol",
+                        "max_abs": metrics["max_abs"],
+                    }
+                )
+            if metrics["cosine_similarity"] < MODEL_QUALIFICATION_THRESHOLDS[
+                "cosine_min"
+            ]:
+                failures.append(
+                    location
+                    | {
+                        "reason": "cosine_below_minimum",
+                        "cosine_similarity": metrics["cosine_similarity"],
+                    }
+                )
+            if metrics["mae"] > MODEL_QUALIFICATION_THRESHOLDS["mae_max"]:
+                failures.append(
+                    location
+                    | {
+                        "reason": "mae_above_maximum",
+                        "mae": metrics["mae"],
+                    }
+                )
+
+        output_metrics = comparison["output_metrics"]["all_frames_metrics"]
+        if not output_metrics["finite"]:
+            failures.append(pair | {"reason": "non_finite_output_frames"})
+        elif require_exact and not output_metrics["exact_match"]:
+            failures.append(
+                pair
+                | {
+                    "reason": "output_frame_repeatability_mismatch",
+                    "max_abs": output_metrics["max_abs"],
+                }
+            )
+    return failures
+
+
+def evaluate_correctness_qualification(
+    cross_variant_metrics: dict[str, Any],
+    repeatability: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Fail closed over all trajectory steps, run pairs, and output finiteness."""
+    failures = _comparison_failures(
+        cross_variant_metrics.get("comparisons", []),
+        scope="cross_variant",
+        require_exact=False,
+    )
+    if not cross_variant_metrics.get("comparisons"):
+        failures.append(
+            {"scope": "cross_variant", "reason": "missing_comparisons"}
+        )
+
+    for variant in ("reference", "candidate"):
+        summary = repeatability.get(variant)
+        if not summary or not summary.get("available", False):
+            failures.append(
+                {"scope": f"{variant}_repeatability", "reason": "unavailable"}
+            )
+            continue
+        failures.extend(
+            _comparison_failures(
+                summary.get("comparisons", []),
+                scope=f"{variant}_repeatability",
+                require_exact=True,
+            )
+        )
+        if not summary.get("comparisons"):
+            failures.append(
+                {
+                    "scope": f"{variant}_repeatability",
+                    "reason": "missing_comparisons",
+                }
+            )
+
+    return {
+        "passed": not failures,
+        "thresholds": dict(MODEL_QUALIFICATION_THRESHOLDS),
+        "failures": failures,
+    }
+
+
+def evaluate_performance_qualification(
+    performance: dict[str, Any],
+) -> dict[str, Any]:
+    """Qualify one execution order; callers must run both AB and BA."""
+    speedup = performance.get("wall_median_speedup")
+    failures = []
+    if not isinstance(speedup, (int, float)) or not math.isfinite(speedup):
+        failures.append({"reason": "missing_or_non_finite_wall_median_speedup"})
+    elif speedup < MODEL_QUALIFICATION_THRESHOLDS["speedup_min"]:
+        failures.append(
+            {
+                "reason": "wall_median_speedup_below_minimum",
+                "wall_median_speedup": speedup,
+            }
+        )
+    return {
+        "passed": not failures,
+        "thresholds": {
+            "speedup_min": MODEL_QUALIFICATION_THRESHOLDS["speedup_min"]
+        },
+        "failures": failures,
     }
 
 
@@ -554,6 +738,19 @@ def _extract_generation_time_s(result: Any) -> float:
     return total_duration_ms / 1000.0
 
 
+def _positive_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if (
+        numerator is None
+        or denominator is None
+        or not math.isfinite(numerator)
+        or not math.isfinite(denominator)
+        or numerator <= 0
+        or denominator <= 0
+    ):
+        return None
+    return numerator / denominator
+
+
 def run_variant(
     *,
     server_kwargs: dict[str, Any],
@@ -677,6 +874,14 @@ def main() -> None:
         help=(
             "Execution order for order-bias checks. Semantic reference/candidate "
             "roles and reported speedup direction stay unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--enforce-qualification",
+        action="store_true",
+        help=(
+            "Exit unsuccessfully after writing the report when the fixed Wan "
+            "model correctness/repeatability or E2E speedup gate fails."
         ),
     )
     parser.add_argument("--reference-transformer-path")
@@ -871,16 +1076,13 @@ def main() -> None:
         }
         | {"output_file_path": candidate.output_file_path},
         "performance": {
-            "wall_median_speedup": (
-                reference_run["median_generation_time_s"]
-                / candidate_run["median_generation_time_s"]
+            "wall_median_speedup": _positive_ratio(
+                reference_run["median_generation_time_s"],
+                candidate_run["median_generation_time_s"],
             ),
-            "scheduler_median_speedup": (
-                reference_run["median_total_duration_ms"]
-                / candidate_run["median_total_duration_ms"]
-                if reference_run["median_total_duration_ms"] is not None
-                and candidate_run["median_total_duration_ms"] is not None
-                else None
+            "scheduler_median_speedup": _positive_ratio(
+                reference_run["median_total_duration_ms"],
+                candidate_run["median_total_duration_ms"],
             ),
         },
     }
@@ -901,6 +1103,13 @@ def main() -> None:
             candidate_run["_measured_results"],
             step_index=args.trajectory_step_index,
         )
+        result["qualification"] = evaluate_correctness_qualification(
+            result["cross_variant_metrics"], result["repeatability"]
+        )
+    else:
+        result["qualification"] = evaluate_performance_qualification(
+            result["performance"]
+        )
 
     output_json.write_text(
         json.dumps(_to_jsonable(result), indent=2, sort_keys=True), encoding="utf-8"
@@ -917,12 +1126,16 @@ def main() -> None:
             "median_generation_time_s"
         ],
         **result["performance"],
+        "qualification_passed": result["qualification"]["passed"],
+        "qualification_failures": result["qualification"]["failures"],
     }
     if args.comparison_mode == "correctness":
         summary["cross_variant_envelope"] = result["cross_variant_metrics"][
             "envelope"
         ]
     print(json.dumps(summary, indent=2))
+    if args.enforce_qualification and not result["qualification"]["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
