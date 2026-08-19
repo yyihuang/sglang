@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import itertools
 import json
 import math
 import os
+import statistics
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -74,7 +76,8 @@ def _cosine_similarity(flat_a: torch.Tensor, flat_b: torch.Tensor) -> float:
         return 1.0
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
-    return float(F.cosine_similarity(flat_a, flat_b, dim=0).item())
+    similarity = float(F.cosine_similarity(flat_a, flat_b, dim=0).item())
+    return max(-1.0, min(1.0, similarity))
 
 
 def compute_tensor_metrics(lhs: Any, rhs: Any) -> dict[str, float]:
@@ -213,6 +216,144 @@ def summarize_output_frame_metrics(
     }
 
 
+def _summarize_result_pair(
+    reference: Any,
+    candidate: Any,
+    *,
+    reference_run_index: int,
+    candidate_run_index: int,
+    step_index: int,
+) -> dict[str, Any]:
+    return {
+        "reference_run_index": reference_run_index,
+        "candidate_run_index": candidate_run_index,
+        "trajectory_metrics": summarize_trajectory_metrics(
+            reference.trajectory_latents,
+            candidate.trajectory_latents,
+            reference_timesteps=reference.trajectory_timesteps,
+            candidate_timesteps=candidate.trajectory_timesteps,
+            step_index=step_index,
+        ),
+        "output_metrics": summarize_output_frame_metrics(
+            extract_result_frames(reference),
+            extract_result_frames(candidate),
+        ),
+    }
+
+
+def _summarize_comparison_envelope(
+    comparisons: Sequence[dict[str, Any]],
+) -> dict[str, float]:
+    if not comparisons:
+        raise ValueError("At least one result comparison is required.")
+
+    selected_trajectory = [
+        comparison["trajectory_metrics"]["selected_step_metrics"]
+        for comparison in comparisons
+    ]
+    all_steps_trajectory = [
+        metrics
+        for comparison in comparisons
+        for metrics in comparison["trajectory_metrics"]["per_step_metrics"]
+    ]
+    all_frames = [
+        comparison["output_metrics"]["all_frames_metrics"]
+        for comparison in comparisons
+    ]
+    return {
+        "min_selected_trajectory_cosine": min(
+            metrics["cosine_similarity"] for metrics in selected_trajectory
+        ),
+        "max_selected_trajectory_mae": max(
+            metrics["mae"] for metrics in selected_trajectory
+        ),
+        "min_all_steps_trajectory_cosine": min(
+            metrics["cosine_similarity"] for metrics in all_steps_trajectory
+        ),
+        "max_all_steps_trajectory_mae": max(
+            metrics["mae"] for metrics in all_steps_trajectory
+        ),
+        "max_all_steps_trajectory_max_abs": max(
+            metrics["max_abs"] for metrics in all_steps_trajectory
+        ),
+        "min_all_frames_cosine": min(
+            metrics["cosine_similarity"] for metrics in all_frames
+        ),
+        "max_all_frames_mae": max(metrics["mae"] for metrics in all_frames),
+        "min_all_frames_psnr_db": min(metrics["psnr_db"] for metrics in all_frames),
+    }
+
+
+def summarize_run_repeatability(
+    measured_results: Sequence[Any], *, step_index: int = -1
+) -> dict[str, Any]:
+    """Measure the worst same-variant delta across every measured-run pair.
+
+    Diffusion backends can be nondeterministic even with an identical seed.  The
+    resulting envelope is needed before attributing a reference/candidate delta
+    to a quantized attention backend.
+    """
+    num_runs = len(measured_results)
+    if num_runs < 2:
+        return {
+            "available": False,
+            "num_runs": num_runs,
+            "reason": "repeatability requires at least two measured runs",
+        }
+
+    comparisons = [
+        _summarize_result_pair(
+            measured_results[reference_run_index],
+            measured_results[candidate_run_index],
+            reference_run_index=reference_run_index,
+            candidate_run_index=candidate_run_index,
+            step_index=step_index,
+        )
+        for reference_run_index, candidate_run_index in itertools.combinations(
+            range(num_runs), 2
+        )
+    ]
+    return {
+        "available": True,
+        "num_runs": num_runs,
+        "pairing": "all-pairs",
+        "num_pairs": len(comparisons),
+        "comparisons": comparisons,
+        "envelope": _summarize_comparison_envelope(comparisons),
+    }
+
+
+def summarize_cross_variant_metrics(
+    reference_results: Sequence[Any],
+    candidate_results: Sequence[Any],
+    *,
+    step_index: int = -1,
+) -> dict[str, Any]:
+    """Measure every reference/candidate pair, not only each variant's last run."""
+    if not reference_results or not candidate_results:
+        raise ValueError("Cross-variant metrics require both measured result sets.")
+
+    comparisons = [
+        _summarize_result_pair(
+            reference,
+            candidate,
+            reference_run_index=reference_run_index,
+            candidate_run_index=candidate_run_index,
+            step_index=step_index,
+        )
+        for reference_run_index, reference in enumerate(reference_results)
+        for candidate_run_index, candidate in enumerate(candidate_results)
+    ]
+    return {
+        "reference_num_runs": len(reference_results),
+        "candidate_num_runs": len(candidate_results),
+        "pairing": "cross-product",
+        "num_pairs": len(comparisons),
+        "comparisons": comparisons,
+        "envelope": _summarize_comparison_envelope(comparisons),
+    }
+
+
 def extract_result_frames(result: Any) -> list[np.ndarray]:
     if result.frames is not None:
         return [np.asarray(frame) for frame in result.frames]
@@ -313,6 +454,8 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
 def build_sampling_kwargs(
     args: argparse.Namespace, *, output_dir: str | None = None
 ) -> dict[str, Any]:
+    comparison_mode = getattr(args, "comparison_mode", "correctness")
+    capture_trajectory = comparison_mode == "correctness"
     kwargs: dict[str, Any] = {
         "prompt": args.prompt,
         "width": args.width,
@@ -321,8 +464,10 @@ def build_sampling_kwargs(
         "guidance_scale": args.guidance_scale,
         "seed": args.seed,
         "return_frames": True,
-        "return_trajectory_latents": True,
-        "return_trajectory_decoded": args.return_trajectory_decoded,
+        "return_trajectory_latents": capture_trajectory,
+        "return_trajectory_decoded": (
+            args.return_trajectory_decoded if capture_trajectory else False
+        ),
         "save_output": output_dir is not None,
     }
     if output_dir is not None:
@@ -458,11 +603,13 @@ def run_variant(
 
     return {
         "result": final_result,
+        "_measured_results": measured_results,
         "fp4_gemm_backend": fp4_gemm_backend or "default",
         "warmup_runs": warmup_runs,
         "measure_runs": measure_runs,
         "generation_time_s": generation_times[-1],
         "avg_generation_time_s": sum(generation_times) / len(generation_times),
+        "median_generation_time_s": statistics.median(generation_times),
         "per_run_generation_time_s": generation_times,
         "peak_memory_mb": peak_memories[-1],
         "max_peak_memory_mb": max(peak_memories) if peak_memories else 0.0,
@@ -472,6 +619,9 @@ def run_variant(
             sum(total_duration_ms) / len(total_duration_ms)
             if total_duration_ms
             else None
+        ),
+        "median_total_duration_ms": (
+            statistics.median(total_duration_ms) if total_duration_ms else None
         ),
         "per_run_total_duration_ms": total_duration_ms,
     }
@@ -511,6 +661,24 @@ def main() -> None:
     parser.add_argument("--ulysses-degree", type=int, default=1)
     parser.add_argument("--sp-degree", type=int)
     parser.add_argument("--trajectory-step-index", type=int, default=-1)
+    parser.add_argument(
+        "--comparison-mode",
+        choices=("correctness", "performance"),
+        default="correctness",
+        help=(
+            "correctness captures all trajectory latents and computes all-pairs "
+            "metrics; performance disables trajectory capture and reports timing only."
+        ),
+    )
+    parser.add_argument(
+        "--run-order",
+        choices=("reference-first", "candidate-first"),
+        default="reference-first",
+        help=(
+            "Execution order for order-bias checks. Semantic reference/candidate "
+            "roles and reported speedup direction stay unchanged."
+        ),
+    )
     parser.add_argument("--reference-transformer-path")
     parser.add_argument("--candidate-transformer-path")
     parser.add_argument(
@@ -633,20 +801,32 @@ def main() -> None:
         output_dir=str(save_root / "candidate") if save_root else None,
     )
 
-    reference_run = run_variant(
-        server_kwargs=ref_server_kwargs,
-        sampling_kwargs=ref_sampling_kwargs,
-        fp4_gemm_backend=args.reference_fp4_gemm_backend,
-        warmup_runs=args.warmup_runs,
-        measure_runs=args.measure_runs,
+    variant_calls = {
+        "reference": {
+            "server_kwargs": ref_server_kwargs,
+            "sampling_kwargs": ref_sampling_kwargs,
+            "fp4_gemm_backend": args.reference_fp4_gemm_backend,
+        },
+        "candidate": {
+            "server_kwargs": cand_server_kwargs,
+            "sampling_kwargs": cand_sampling_kwargs,
+            "fp4_gemm_backend": args.candidate_fp4_gemm_backend,
+        },
+    }
+    execution_order = (
+        ("reference", "candidate")
+        if args.run_order == "reference-first"
+        else ("candidate", "reference")
     )
-    candidate_run = run_variant(
-        server_kwargs=cand_server_kwargs,
-        sampling_kwargs=cand_sampling_kwargs,
-        fp4_gemm_backend=args.candidate_fp4_gemm_backend,
-        warmup_runs=args.warmup_runs,
-        measure_runs=args.measure_runs,
-    )
+    runs: dict[str, dict[str, Any]] = {}
+    for variant in execution_order:
+        runs[variant] = run_variant(
+            **variant_calls[variant],
+            warmup_runs=args.warmup_runs,
+            measure_runs=args.measure_runs,
+        )
+    reference_run = runs["reference"]
+    candidate_run = runs["candidate"]
     reference = reference_run["result"]
     candidate = candidate_run["result"]
 
@@ -656,6 +836,8 @@ def main() -> None:
         "seed": args.seed,
         "warmup_runs": args.warmup_runs,
         "measure_runs": args.measure_runs,
+        "comparison_mode": args.comparison_mode,
+        "run_order": args.run_order,
         "server_kwargs": {
             "reference": ref_server_kwargs,
             "candidate": cand_server_kwargs,
@@ -677,53 +859,70 @@ def main() -> None:
             "guidance_scale_2": args.guidance_scale_2,
         },
         "reference_generation": {
-            key: value for key, value in reference_run.items() if key != "result"
+            key: value
+            for key, value in reference_run.items()
+            if key != "result" and not key.startswith("_")
         }
         | {"output_file_path": reference.output_file_path},
         "candidate_generation": {
-            key: value for key, value in candidate_run.items() if key != "result"
+            key: value
+            for key, value in candidate_run.items()
+            if key != "result" and not key.startswith("_")
         }
         | {"output_file_path": candidate.output_file_path},
-        "trajectory_metrics": summarize_trajectory_metrics(
-            reference.trajectory_latents,
-            candidate.trajectory_latents,
-            reference_timesteps=reference.trajectory_timesteps,
-            candidate_timesteps=candidate.trajectory_timesteps,
-            step_index=args.trajectory_step_index,
-        ),
-        "output_metrics": summarize_output_frame_metrics(
-            extract_result_frames(reference),
-            extract_result_frames(candidate),
-        ),
+        "performance": {
+            "wall_median_speedup": (
+                reference_run["median_generation_time_s"]
+                / candidate_run["median_generation_time_s"]
+            ),
+            "scheduler_median_speedup": (
+                reference_run["median_total_duration_ms"]
+                / candidate_run["median_total_duration_ms"]
+                if reference_run["median_total_duration_ms"] is not None
+                and candidate_run["median_total_duration_ms"] is not None
+                else None
+            ),
+        },
     }
+
+    if args.comparison_mode == "correctness":
+        result["repeatability"] = {
+            "reference": summarize_run_repeatability(
+                reference_run["_measured_results"],
+                step_index=args.trajectory_step_index,
+            ),
+            "candidate": summarize_run_repeatability(
+                candidate_run["_measured_results"],
+                step_index=args.trajectory_step_index,
+            ),
+        }
+        result["cross_variant_metrics"] = summarize_cross_variant_metrics(
+            reference_run["_measured_results"],
+            candidate_run["_measured_results"],
+            step_index=args.trajectory_step_index,
+        )
 
     output_json.write_text(
         json.dumps(_to_jsonable(result), indent=2, sort_keys=True), encoding="utf-8"
     )
 
-    selected = result["trajectory_metrics"]["selected_step_metrics"]
-    frame0 = result["output_metrics"]["frame0_metrics"]
-    print(
-        json.dumps(
-            {
-                "output_json": str(output_json),
-                "trajectory_selected_step": result["trajectory_metrics"][
-                    "selected_step_index"
-                ],
-                "reference_avg_generation_time_s": result["reference_generation"][
-                    "avg_generation_time_s"
-                ],
-                "candidate_avg_generation_time_s": result["candidate_generation"][
-                    "avg_generation_time_s"
-                ],
-                "trajectory_cosine": selected["cosine_similarity"],
-                "trajectory_mae": selected["mae"],
-                "frame0_psnr_db": frame0["psnr_db"],
-                "frame0_mae": frame0["mae"],
-            },
-            indent=2,
-        )
-    )
+    summary = {
+        "output_json": str(output_json),
+        "comparison_mode": args.comparison_mode,
+        "run_order": args.run_order,
+        "reference_median_generation_time_s": result["reference_generation"][
+            "median_generation_time_s"
+        ],
+        "candidate_median_generation_time_s": result["candidate_generation"][
+            "median_generation_time_s"
+        ],
+        **result["performance"],
+    }
+    if args.comparison_mode == "correctness":
+        summary["cross_variant_envelope"] = result["cross_variant_metrics"][
+            "envelope"
+        ]
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
