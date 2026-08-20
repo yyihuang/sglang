@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -39,6 +40,14 @@ _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
 _cake_gdn_decode_api = None
 _cake_gdn_decode_api_checked = False
+
+
+def _gdn_activity_region(label: str):
+    """Add a profiler-only call-site label without changing production routing."""
+
+    if os.environ.get("SGLANG_CAKE_GDN_ACTIVITY_TRACE") == "1":
+        return torch.profiler.record_function(label)
+    return nullcontext()
 
 
 def maybe_build_flashinfer_checkpoint_plan(
@@ -690,32 +699,38 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if enable_checkpoints
             else empty_state
         )
-        entry(
-            q,
-            k,
-            v,
-            output,
-            alpha,
-            beta,
-            cu_seqlens,
-            state_indices,
-            state,
-            state,
-            state_checkpoints,
-            cake_state_checkpoint_cu_starts if enable_checkpoints else empty_i32,
-            workspace,
-            state.stride(0),
-            state.stride(0),
-            state_checkpoint_every_n_tokens,
-            128**-0.5,
-            num_seqs,
-            num_q_heads,
-            num_v_heads,
-            total_tiles,
-            grid_x,
-            1,
-            1,
+        trace_label = (
+            f"GDN_TRACE:cake_prefill:B{num_seqs}:tokens{total_tokens}"
+            f":Hq{num_q_heads}:Hv{num_v_heads}"
+            f":checkpoints{num_state_checkpoints}:route={route.route_id}"
         )
+        with _gdn_activity_region(trace_label):
+            entry(
+                q,
+                k,
+                v,
+                output,
+                alpha,
+                beta,
+                cu_seqlens,
+                state_indices,
+                state,
+                state,
+                state_checkpoints,
+                cake_state_checkpoint_cu_starts if enable_checkpoints else empty_i32,
+                workspace,
+                state.stride(0),
+                state.stride(0),
+                state_checkpoint_every_n_tokens,
+                128**-0.5,
+                num_seqs,
+                num_q_heads,
+                num_v_heads,
+                total_tiles,
+                grid_x,
+                1,
+                1,
+            )
         if route.route_id not in self._cake_gdn_logged_routes:
             self._cake_gdn_logged_routes.add(route.route_id)
             logger.info(
@@ -850,23 +865,31 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if route.route_id.endswith(".tile16_fullwarp")
             else 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
         )
-        entry(
-            q,
-            k,
-            v,
-            state,
-            A_log,
-            a,
-            dt_bias,
-            b,
-            output,
-            intermediate_state if intermediate_state is not None else output,
-            state_indices,
-            state_indices,
-            batch_size * num_v_heads * (128 // tile_v),
-            1,
-            1,
+        trace_label = (
+            "GDN_TRACE:cake_decode"
+            f":B{batch_size}:T{seq_len}:Hq{num_q_heads}:Hv{num_v_heads}"
+            f":update{int(not disable_state_update)}"
+            f":cache{int(cache_intermediate_states)}"
+            f":route={route.route_id}"
         )
+        with _gdn_activity_region(trace_label):
+            entry(
+                q,
+                k,
+                v,
+                state,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                output,
+                intermediate_state if intermediate_state is not None else output,
+                state_indices,
+                state_indices,
+                batch_size * num_v_heads * (128 // tile_v),
+                1,
+                1,
+            )
         if route.route_id not in self._cake_gdn_logged_routes:
             self._cake_gdn_logged_routes.add(route.route_id)
             logger.info("Using %s", route.route_id)
@@ -919,19 +942,24 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
             if output_cake is not None:
                 return output_cake
-            output_fi, _ = self._decode_fn(
-                q=query_fi,
-                k=key_fi,
-                v=value_fi,
-                state=None,
-                A_log=A_log.detach().float(),
-                a=a_fi,
-                dt_bias=dt_bias.detach(),
-                b=b_fi,
-                use_qk_l2norm=True,
-                initial_state=ssm_states,
-                initial_state_indices=cache_indices,
+            trace_label = (
+                f"GDN_TRACE:flashinfer_decode:B{batch_size}:T1"
+                f":Hq{num_heads}:Hv{num_v_heads}"
             )
+            with _gdn_activity_region(trace_label):
+                output_fi, _ = self._decode_fn(
+                    q=query_fi,
+                    k=key_fi,
+                    v=value_fi,
+                    state=None,
+                    A_log=A_log.detach().float(),
+                    a=a_fi,
+                    dt_bias=dt_bias.detach(),
+                    b=b_fi,
+                    use_qk_l2norm=True,
+                    initial_state=ssm_states,
+                    initial_state_indices=cache_indices,
+                )
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
             # will no longer be needed here.
@@ -1032,22 +1060,28 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if num_state_checkpoints > 0
             else None
         )
-        output_fi, output_state_fi = self._prefill_fn(
-            q=q_fi,
-            k=k_fi,
-            v=v_fi,
-            g=alpha_fi,
-            beta=beta_fi,
-            scale=None,
-            initial_state=initial_state_fi,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
-            output_state=output_state_fi,
-            state_checkpoints=state_checkpoints,
-            checkpoint_cu_starts=state_checkpoint_cu_starts,
-            checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+        trace_label = (
+            f"GDN_TRACE:flashinfer_prefill:B{cache_indices.numel()}"
+            f":tokens{total_seq_len}:Hv{num_v_heads}"
+            f":checkpoints{num_state_checkpoints}"
         )
+        with _gdn_activity_region(trace_label):
+            output_fi, output_state_fi = self._prefill_fn(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                g=alpha_fi,
+                beta=beta_fi,
+                scale=None,
+                initial_state=initial_state_fi,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=False,
+                output_state=output_state_fi,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=state_checkpoint_cu_starts,
+                checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            )
 
         # Write back state to pool
         ssm_states.index_copy_(
@@ -1137,21 +1171,26 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if output_cake is not None:
             return output_cake
 
-        output_fi, _ = self._mtp_fn(
-            q=query_mtp,
-            k=key_mtp,
-            v=value_mtp,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices,
-            A_log=A_log.detach(),
-            a=a_mtp,
-            dt_bias=dt_bias.detach(),
-            b=b_mtp,
-            scale=None,
-            output=None,
-            intermediate_states_buffer=intermediate_states_buffer_mtp,
-            disable_state_update=True,
-            use_qk_l2norm=True,
+        trace_label = (
+            f"GDN_TRACE:flashinfer_verify:B{batch_size}:T{draft_token_num}"
+            f":Hq{num_heads}:Hv{num_v_heads}:cache{cache_steps}"
         )
+        with _gdn_activity_region(trace_label):
+            output_fi, _ = self._mtp_fn(
+                q=query_mtp,
+                k=key_mtp,
+                v=value_mtp,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+                A_log=A_log.detach(),
+                a=a_mtp,
+                dt_bias=dt_bias.detach(),
+                b=b_mtp,
+                scale=None,
+                output=None,
+                intermediate_states_buffer=intermediate_states_buffer_mtp,
+                disable_state_update=True,
+                use_qk_l2norm=True,
+            )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
