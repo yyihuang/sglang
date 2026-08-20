@@ -39,6 +39,8 @@ def _kernel_and_inputs():
     kernel._cake_gdn_entries = {"prefill_bf16_indexed": entry}
     kernel._cake_gdn_logged_routes = set()
     kernel._cake_gdn_prefill_checkpoints = {}
+    kernel._flashinfer_gdn_prefill_metadata = {}
+    kernel._flashinfer_gdn_prefill_state_buffers = {}
     kernel._flashinfer_gdn_should_use_cp_host = MagicMock(return_value=False)
     kernel._flashinfer_gdn_num_sms = 148
     kernel._flashinfer_gdn_device_name = "NVIDIA B200"
@@ -194,9 +196,19 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
         cake_cu_starts = torch.tensor([0, 1], dtype=torch.int32)
         state = torch.empty(7, 8, 128, 128, dtype=torch.bfloat16)
 
-        with patch(
-            "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
-            side_effect=lambda value: value.contiguous(),
+        with (
+            patch(
+                "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
+                side_effect=lambda value: value.contiguous(),
+            ),
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                return_value=SimpleNamespace(cuda_stream=17),
+            ),
+            patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ),
         ):
             core_attn_out, _, checkpoints = kernel.extend(
                 q=torch.empty(1, 103, 4, 128, dtype=torch.bfloat16),

@@ -559,17 +559,22 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
 
         class CountStateGather(TorchDispatchMode):
             def __init__(self):
-                self.count = 0
+                self.allocating_count = 0
+                self.out_count = 0
 
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
                 if func == torch.ops.aten.index.Tensor:
-                    self.count += 1
+                    self.allocating_count += 1
+                elif func == torch.ops.aten.index_select.out:
+                    self.out_count += 1
                 return func(*args, **(kwargs or {}))
 
         kernel = object.__new__(FlashInferGDNKernel)
         kernel.use_state_pool = True
         kernel._prefill_needs_fp32_state = False
         kernel._try_cake_prefill = MagicMock(return_value=None)
+        kernel._flashinfer_gdn_prefill_metadata = {}
+        kernel._flashinfer_gdn_prefill_state_buffers = {}
         output = torch.empty(2, 1, 2, dtype=torch.bfloat16)
 
         def flashinfer_prefill(**kwargs):
@@ -588,6 +593,14 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
                 side_effect=lambda value: value,
             ),
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                return_value=SimpleNamespace(cuda_stream=23),
+            ),
+            patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ),
             counter,
         ):
             kernel.extend(
@@ -603,7 +616,8 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 layer_id=7,
             )
 
-        self.assertEqual(counter.count, 1)
+        self.assertEqual(counter.allocating_count, 0)
+        self.assertEqual(counter.out_count, 1)
         torch.testing.assert_close(
             state_pool[3], torch.full_like(state_pool[3], 3)
         )
