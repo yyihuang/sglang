@@ -578,6 +578,28 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         empty_state, empty_i32 = self._cake_prefill_dummy_buffers(
             q, state_dtype=state.dtype
         )
+        bindings = {
+            name: (
+                f"0x{tensor.data_ptr():x}",
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+            )
+            for name, tensor in (
+                ("q", q),
+                ("k", k),
+                ("v", v),
+                ("output", output),
+                ("state", state),
+                ("workspace", workspace),
+            )
+        }
+        print(
+            "SGLANG_CAKE_PREFILL_BINDINGS "
+            f"capturing={torch.cuda.is_current_stream_capturing()} "
+            f"stream=0x{int(torch.cuda.current_stream(q.device).cuda_stream):x} "
+            f"bindings={bindings}",
+            flush=True,
+        )
         entry(
             q,
             k,
