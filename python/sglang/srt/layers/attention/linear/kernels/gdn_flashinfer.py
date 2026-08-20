@@ -843,6 +843,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             return None
 
         cache_intermediate_states = intermediate_state is not None
+        if state.dtype == torch.float32 and (
+            seq_len != 1
+            or disable_state_update
+            or cache_intermediate_states
+            or cache_steps != 0
+        ):
+            return None
         if cache_intermediate_states:
             expected_cache_shape = (
                 batch_size,
