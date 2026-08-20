@@ -422,6 +422,21 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         linear_attn_decode_backend="flashinfer",
         linear_attn_prefill_backend="flashinfer",
     )
+    CAKE_TRACED_VERIFY_CASES = tuple(
+        GDNAttentionCase(
+            name=f"flashinfer_cake_gdn_tp4_verify_b{batch_size}_t4",
+            backend="flashinfer",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_k_heads=4,
+            num_v_heads=8,
+            page_size=16,
+            prefix_lens=tuple(range(4, 4 + batch_size)),
+            extend_lens=(4,) * batch_size,
+            linear_attn_decode_backend="flashinfer",
+            linear_attn_prefill_backend="flashinfer",
+        )
+        for batch_size in (1, 4, 6, 7)
+    )
 
     def _cake_api_or_skip(self):
         try:
@@ -776,6 +791,54 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                 cuda_graph_capture_batch_size=8,
             )
         self.assertGreater(load_kernel.call_count, eager_load_count)
+
+    def test_cake_traced_verify_batches_eager_and_cuda_graph(self):
+        cake_api = self._cake_api_or_skip()
+        with mock.patch.object(
+            cake_api,
+            "select_cake_gdn_decode_variant",
+            wraps=cake_api.select_cake_gdn_decode_variant,
+        ) as selector, mock.patch.object(
+            cake_api,
+            "load_cake_gdn_kernel",
+            wraps=cake_api.load_cake_gdn_kernel,
+        ) as load_kernel:
+            for case in self.CAKE_TRACED_VERIFY_CASES:
+                batch_size = len(case.prefix_lens)
+                with self.subTest(batch_size=batch_size):
+                    prior_selects = selector.call_count
+                    prior_loads = load_kernel.call_count
+                    run_gdn_eagle_verify_case(
+                        self,
+                        case,
+                        topk=1,
+                        spec_kind="frozen_kv_mtp",
+                        head_k_dim=self.HEAD_DIM,
+                        head_v_dim=self.HEAD_DIM,
+                    )
+                    self.assertGreater(selector.call_count, prior_selects)
+                    self.assertGreater(load_kernel.call_count, prior_loads)
+                    self.assertTrue(
+                        any(
+                            call.kwargs.get("batch_size") == batch_size
+                            and call.kwargs.get("seq_len") == 4
+                            for call in selector.call_args_list[prior_selects:]
+                        )
+                    )
+
+                    prior_selects = selector.call_count
+                    prior_loads = load_kernel.call_count
+                    run_gdn_eagle_verify_cuda_graph_case(
+                        self,
+                        case,
+                        topk=1,
+                        spec_kind="frozen_kv_mtp",
+                        head_k_dim=self.HEAD_DIM,
+                        head_v_dim=self.HEAD_DIM,
+                        cuda_graph_capture_batch_size=batch_size,
+                    )
+                    self.assertGreater(selector.call_count, prior_selects)
+                    self.assertGreater(load_kernel.call_count, prior_loads)
 
     def test_prefill_tracked_state_checkpoints(self):
         fixture = build_gdn_attention_fixture(
