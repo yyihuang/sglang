@@ -221,6 +221,27 @@ class TestCakeGDNDecodeDispatch(unittest.TestCase):
         self.assertIs(args[10], inputs["state_indices"])
         self.assertEqual(args[11:14], (128, 1, 1))
 
+    def test_fp32_cached_mtp_fails_closed_before_public_selector(self):
+        kernel, api, entry, inputs, _ = _fp32_t1_kernel_and_inputs()
+        inputs.update(
+            q=torch.empty(1, 4, 16, 128, dtype=torch.bfloat16),
+            k=torch.empty(1, 4, 16, 128, dtype=torch.bfloat16),
+            v=torch.empty(1, 4, 32, 128, dtype=torch.bfloat16),
+            a=torch.empty(1, 4, 32, dtype=torch.bfloat16),
+            b=torch.empty(1, 4, 32, dtype=torch.bfloat16),
+            disable_state_update=True,
+            intermediate_state=torch.empty(
+                1, 4, 32, 128, 128, dtype=torch.float32
+            ),
+            cache_steps=4,
+        )
+
+        result = kernel._try_cake_decode(**inputs)
+
+        self.assertIsNone(result)
+        api.select_cake_gdn_decode_variant.assert_not_called()
+        entry.assert_not_called()
+
     def test_traced_tp4_verify_batches_call_public_selector_and_frozen_grid(self):
         for batch_size in (1, 4, 6, 7):
             with self.subTest(batch_size=batch_size):
