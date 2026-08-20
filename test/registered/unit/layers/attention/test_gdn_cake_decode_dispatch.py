@@ -71,7 +71,74 @@ def _kernel_and_inputs(batch_size: int):
     return kernel, api, entry, inputs, output
 
 
+def _fp32_t1_kernel_and_inputs():
+    api = _CakeAPI()
+    api.select_cake_gdn_decode_variant.return_value = SimpleNamespace(
+        route_id="cake.gdn_decode.indexed_fp32_t1_splitv8",
+        variant_name="decode_fp32_t1_splitv8",
+    )
+    entry = MagicMock()
+    output = torch.empty(1, 1, 32, 128, dtype=torch.bfloat16)
+    kernel = object.__new__(FlashInferGDNKernel)
+    kernel._cake_gdn_api = api
+    kernel._cake_gdn_arch = "sm_100a"
+    kernel._cake_gdn_entries = {"decode_fp32_t1_splitv8": entry}
+    kernel._cake_gdn_logged_routes = set()
+    kernel._cake_output_buffer = MagicMock(return_value=output)
+    kernel._cake_fp32_dt_bias = MagicMock(side_effect=lambda value, **_: value)
+
+    inputs = dict(
+        q=torch.empty(1, 1, 16, 128, dtype=torch.bfloat16),
+        k=torch.empty(1, 1, 16, 128, dtype=torch.bfloat16),
+        v=torch.empty(1, 1, 32, 128, dtype=torch.bfloat16),
+        state=torch.empty(4, 32, 128, 128, dtype=torch.float32),
+        state_indices=torch.tensor([3], dtype=torch.int32),
+        A_log=torch.empty(32, dtype=torch.float32),
+        a=torch.empty(1, 1, 32, dtype=torch.bfloat16),
+        dt_bias=torch.empty(32, dtype=torch.float32),
+        b=torch.empty(1, 1, 32, dtype=torch.bfloat16),
+        layer_id=7,
+        disable_state_update=False,
+        intermediate_state=None,
+        cache_steps=0,
+    )
+    return kernel, api, entry, inputs, output
+
+
 class TestCakeGDNDecodeDispatch(unittest.TestCase):
+    def test_fp32_t1_calls_public_selector_and_entry(self):
+        kernel, api, entry, inputs, output = _fp32_t1_kernel_and_inputs()
+
+        result = kernel._try_cake_decode(**inputs)
+
+        self.assertEqual(tuple(result.shape), (1, 1, 32, 128))
+        api.select_cake_gdn_decode_variant.assert_called_once_with(
+            arch="sm_100a",
+            batch_size=1,
+            io_dtype="bfloat16",
+            state_dtype="float32",
+            head_size=128,
+            layout="pretranspose",
+            num_k_heads=16,
+            num_q_heads=16,
+            num_v_heads=32,
+            scale=128**-0.5,
+            seq_len=1,
+            use_qk_l2norm=True,
+            strided_inputs=True,
+            disable_state_update=False,
+            cache_intermediate_states=False,
+            cache_steps=0,
+        )
+        entry.assert_called_once()
+        args = entry.call_args.args
+        self.assertIs(args[0], inputs["q"])
+        self.assertIs(args[3], inputs["state"])
+        self.assertIs(args[8], output)
+        self.assertIs(args[10], inputs["state_indices"])
+        self.assertIs(args[11], inputs["state_indices"])
+        self.assertEqual(args[12:15], (128, 1, 1))
+
     def test_traced_tp4_verify_batches_call_public_selector_and_frozen_grid(self):
         for batch_size in (1, 4, 6, 7):
             with self.subTest(batch_size=batch_size):

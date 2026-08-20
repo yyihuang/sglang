@@ -410,6 +410,29 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         linear_attn_decode_backend="flashinfer",
         linear_attn_prefill_backend="flashinfer",
     )
+    CAKE_CP_PREFILL_T39_CASE = GDNAttentionCase(
+        name="flashinfer_cake_gdn_tp4_cp_prefill_b1_t39",
+        backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=4,
+        num_v_heads=8,
+        page_size=16,
+        prefix_lens=(4,),
+        extend_lens=(39,),
+        linear_attn_decode_backend="flashinfer",
+        linear_attn_prefill_backend="flashinfer",
+    )
+    CAKE_FP32_DECODE_CASE = GDNAttentionCase(
+        name="flashinfer_cake_gdn_fp32_decode_b1_t1",
+        backend="flashinfer",
+        forward_mode=ForwardMode.DECODE,
+        num_k_heads=16,
+        num_v_heads=32,
+        page_size=16,
+        prefix_lens=(4,),
+        linear_attn_decode_backend="flashinfer",
+        linear_attn_prefill_backend="triton",
+    )
     CAKE_VERIFY_CASE = GDNAttentionCase(
         name="flashinfer_cake_gdn_tp4_verify_b8_t4",
         backend="flashinfer",
@@ -609,6 +632,103 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             rtol=1e-2,
         )
 
+    def test_traced_b1_t39_cp_prefill_eager_and_cuda_graph(self):
+        cake_api = self._cake_api_or_skip()
+        cake_cp_api = self._cake_cp_api_or_skip()
+        from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_prefill
+
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CAKE_CP_PREFILL_T39_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=64,
+            runner_batch_size=4,
+        )
+        initial_ssm_states = _ssm_states(fixture).clone()
+        with (
+            mock.patch.object(
+                cake_api,
+                "select_cake_gdn_prefill_variant",
+                wraps=cake_api.select_cake_gdn_prefill_variant,
+            ) as noncp_selector,
+            mock.patch.object(
+                cake_api,
+                "load_cake_gdn_kernel",
+                wraps=cake_api.load_cake_gdn_kernel,
+            ) as noncp_loader,
+            mock.patch.object(
+                cake_gdn_cp_prefill,
+                "load_cake_gdn_cp_kernel",
+                wraps=cake_cp_api.load_cake_gdn_cp_kernel,
+            ) as cp_loader,
+        ):
+            actual = run_gdn_fixture_eager(fixture)
+            expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
+            cache_indices = _cache_indices(fixture)
+
+            noncp_selector.assert_not_called()
+            noncp_loader.assert_not_called()
+            self.assertGreater(cp_loader.call_count, 0)
+            torch.testing.assert_close(actual, expected.output, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(
+                _ssm_states(fixture)[cache_indices],
+                expected.final_states[cache_indices],
+                atol=1e-2,
+                rtol=1e-2,
+            )
+
+            capture_stream = torch.cuda.Stream()
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            _ssm_states(fixture).copy_(initial_ssm_states)
+            with (
+                torch.no_grad(),
+                torch.cuda.stream(capture_stream),
+                forward_context(ForwardContext(attn_backend=fixture.backend)),
+            ):
+                fixture.backend.init_forward_metadata(fixture.forward_batch)
+                fixture.actual_module(
+                    fixture.forward_batch,
+                    fixture.mixed_qkv,
+                    fixture.a,
+                    fixture.b,
+                )
+            capture_stream.synchronize()
+
+            _ssm_states(fixture).copy_(initial_ssm_states)
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with (
+                torch.no_grad(),
+                torch.cuda.stream(capture_stream),
+                forward_context(ForwardContext(attn_backend=fixture.backend)),
+            ):
+                with torch.cuda.graph(graph, stream=capture_stream):
+                    graph_output = fixture.actual_module(
+                        fixture.forward_batch,
+                        fixture.mixed_qkv,
+                        fixture.a,
+                        fixture.b,
+                    )
+            capture_stream.synchronize()
+
+            _ssm_states(fixture).copy_(initial_ssm_states)
+            torch.cuda.current_stream().synchronize()
+            graph.replay()
+            torch.cuda.synchronize()
+
+        noncp_selector.assert_not_called()
+        noncp_loader.assert_not_called()
+        torch.testing.assert_close(
+            graph_output, expected.output, atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            _ssm_states(fixture)[cache_indices],
+            expected.final_states[cache_indices],
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
     def test_cake_exact_checkpoint_prefill_tracks_indexed_state(self):
         cake_api = self._cake_api_or_skip()
         fixture = build_gdn_attention_fixture(
@@ -751,6 +871,63 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
 
         self.assertGreater(load_kernel.call_count, 0)
 
+        # The exact B1/T103 checkpoint route must reuse its caller-stream
+        # buffers during capture and replay, just like the B7/T421 route.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        with (
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            fixture.backend.init_forward_metadata(fixture.forward_batch)
+            fixture.actual_module(
+                fixture.forward_batch,
+                fixture.mixed_qkv,
+                fixture.a,
+                fixture.b,
+            )
+        capture_stream.synchronize()
+
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with (
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            with torch.cuda.graph(graph, stream=capture_stream):
+                graph_output = fixture.actual_module(
+                    fixture.forward_batch,
+                    fixture.mixed_qkv,
+                    fixture.a,
+                    fixture.b,
+                )
+        capture_stream.synchronize()
+
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        torch.cuda.current_stream().synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_output, cake_output, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            cache.temporal[batch.mamba_track_indices],
+            cake_tracked,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            cache.temporal[_cache_indices(fixture)],
+            cake_final,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
         cache.conv[0].copy_(initial_conv)
         cache.temporal.copy_(initial_ssm)
         fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel = (
@@ -763,6 +940,39 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         torch.testing.assert_close(cake_output, triton_output, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(cake_tracked, triton_tracked, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(cake_final, triton_final, atol=1e-2, rtol=1e-2)
+
+    def test_cake_fp32_t1_decode_calls_public_backend(self):
+        cake_api = self._cake_api_or_skip()
+        with (
+            mock.patch.object(
+                cake_api,
+                "select_cake_gdn_decode_variant",
+                wraps=cake_api.select_cake_gdn_decode_variant,
+            ) as selector,
+            mock.patch.object(
+                cake_api,
+                "load_cake_gdn_kernel",
+                wraps=cake_api.load_cake_gdn_kernel,
+            ) as load_kernel,
+        ):
+            run_gdn_attention_case(
+                self,
+                self.CAKE_FP32_DECODE_CASE,
+                head_k_dim=self.HEAD_DIM,
+                head_v_dim=self.HEAD_DIM,
+            )
+
+        self.assertTrue(
+            any(
+                call.kwargs.get("batch_size") == 1
+                and call.kwargs.get("seq_len") == 1
+                and call.kwargs.get("num_q_heads") == 16
+                and call.kwargs.get("num_v_heads") == 32
+                and call.kwargs.get("state_dtype") == "float32"
+                for call in selector.call_args_list
+            )
+        )
+        self.assertGreater(load_kernel.call_count, 0)
 
     def test_cake_exact_verify_eager_and_cuda_graph(self):
         cake_api = self._cake_api_or_skip()
