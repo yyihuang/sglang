@@ -763,7 +763,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             head_size != 128
             or v.shape[-1] != 128
             or any(tensor.device != q.device for tensor in tensors)
-            or any(tensor.dtype != torch.bfloat16 for tensor in (q, k, v, state, a, b))
+            or any(tensor.dtype != torch.bfloat16 for tensor in (q, k, v, a, b))
+            or state.dtype not in (torch.bfloat16, torch.float32)
             or A_log.dtype != torch.float32
             or dt_bias.dtype not in (torch.bfloat16, torch.float32)
             or tuple(A_log.shape) != (num_v_heads,)
@@ -799,7 +800,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
             if (
                 tuple(intermediate_state.shape) != expected_cache_shape
-                or intermediate_state.dtype != torch.bfloat16
+                or intermediate_state.dtype != state.dtype
                 or intermediate_state.device != q.device
                 or not intermediate_state.is_contiguous()
             ):
@@ -810,7 +811,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 arch=self._cake_gdn_arch,
                 batch_size=batch_size,
                 io_dtype="bfloat16",
-                state_dtype="bfloat16",
+                state_dtype=(
+                    "float32" if state.dtype == torch.float32 else "bfloat16"
+                ),
                 head_size=128,
                 layout="pretranspose",
                 num_k_heads=num_q_heads,
