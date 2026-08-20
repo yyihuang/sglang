@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
+    Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
@@ -18,6 +19,10 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+    ForwardMetadata,
+    Mamba2Metadata,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -155,17 +160,20 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
                 self.assertIsNone(self.apply_policy(make_runner(self, **runner_args)))
 
     def test_builds_compact_checkpoint_plan_for_packed_sequences(self):
-        forward_batch = SimpleNamespace(
-            extend_seq_lens=torch.tensor([63, 64, 65, 127, 128, 129]),
-            mamba_track_mask=torch.tensor([False, True, True, True, True, True]),
-            # 65 on the 128-token sequence represents an interior S64
-            # boundary encoded as S64 + 1 by the scheduler.
-            mamba_track_seqlens=torch.tensor([63, 64, 65, 127, 65, 129]),
-            extend_prefix_lens=torch.zeros(6, dtype=torch.int64),
-        )
         metadata = SimpleNamespace(
             track_ssm_h_src=torch.empty(4),
             track_ssm_h_dst=torch.empty(4),
+            checkpoint_extend_seq_lens_cpu=torch.tensor(
+                [63, 64, 65, 127, 128, 129]
+            ),
+            checkpoint_track_mask_cpu=torch.tensor(
+                [False, True, True, True, True, True]
+            ),
+            # 65 on the 128-token sequence represents an interior S64
+            # boundary encoded as S64 + 1 by the scheduler.
+            checkpoint_relative_track_lens_cpu=torch.tensor(
+                [63, 64, 65, 127, 65, 129]
+            ),
         )
 
         # The chunk size is a derived config member; seed its private cache on a
@@ -173,7 +181,7 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         override = get_context().override_server_args(_mamba_cache_chunk_size=64)
         override.install()
         self.addCleanup(override.restore)
-        maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+        maybe_build_flashinfer_checkpoint_plan(metadata, "cpu")
 
         torch.testing.assert_close(
             metadata.state_checkpoint_cu_starts,
@@ -186,6 +194,128 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         torch.testing.assert_close(metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6]))
         self.assertEqual(metadata.num_state_checkpoints, 7)
         self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
+
+    def test_tracked_state_planning_exports_the_same_cpu_intermediates(self):
+        backend = object.__new__(Mamba2AttnBackend)
+        backend.device = "cpu"
+        forward_batch = SimpleNamespace(
+            extend_seq_lens=torch.tensor([64, 65], dtype=torch.int32),
+            extend_prefix_lens=torch.tensor([0, 64], dtype=torch.int32),
+            mamba_track_mask=torch.tensor([True, True]),
+            mamba_track_indices=torch.tensor([7, 8], dtype=torch.int64),
+            mamba_track_seqlens=torch.tensor([64, 65], dtype=torch.int64),
+        )
+
+        override = get_context().override_server_args(_mamba_cache_chunk_size=64)
+        override.install()
+        self.addCleanup(override.restore)
+        outputs = backend._init_track_ssm_indices(
+            torch.tensor([3, 4], dtype=torch.int64), forward_batch
+        )
+
+        torch.testing.assert_close(outputs[4], forward_batch.extend_seq_lens)
+        torch.testing.assert_close(outputs[5], forward_batch.mamba_track_mask)
+        torch.testing.assert_close(outputs[6], torch.tensor([64, 1]))
+        self.assertEqual(outputs[4].device.type, "cpu")
+        self.assertEqual(outputs[5].device.type, "cpu")
+        self.assertEqual(outputs[6].device.type, "cpu")
+
+    def test_checkpoint_plan_fails_closed_without_complete_cpu_metadata(self):
+        base = dict(
+            checkpoint_extend_seq_lens_cpu=torch.tensor([64]),
+            checkpoint_track_mask_cpu=torch.tensor([True]),
+            checkpoint_relative_track_lens_cpu=torch.tensor([64]),
+        )
+
+        for missing in base:
+            with self.subTest(missing=missing):
+                fields = dict(base)
+                fields[missing] = None
+                metadata = SimpleNamespace(
+                    track_ssm_h_src=torch.empty(1),
+                    track_ssm_h_dst=torch.empty(1),
+                    **fields,
+                )
+                with self.assertRaisesRegex(RuntimeError, missing):
+                    maybe_build_flashinfer_checkpoint_plan(metadata, "cpu")
+
+    def test_checkpoint_plan_fails_closed_on_cpu_metadata_length_mismatch(self):
+        metadata = SimpleNamespace(
+            track_ssm_h_src=torch.empty(1),
+            track_ssm_h_dst=torch.empty(1),
+            checkpoint_extend_seq_lens_cpu=torch.tensor([64, 64]),
+            checkpoint_track_mask_cpu=torch.tensor([True]),
+            checkpoint_relative_track_lens_cpu=torch.tensor([64, 64]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "checkpoint_track_mask_cpu"):
+            maybe_build_flashinfer_checkpoint_plan(metadata, "cpu")
+
+    def test_mixed_prefill_decode_uses_cpu_prefix_mirror_without_tensor_sync(self):
+        checkpoint_extend_seq_lens_cpu = torch.tensor([2, 1])
+        checkpoint_track_mask_cpu = torch.tensor([False, False])
+        checkpoint_relative_track_lens_cpu = torch.tensor([2, 1])
+        forward_metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+            checkpoint_extend_seq_lens_cpu=checkpoint_extend_seq_lens_cpu,
+            checkpoint_track_mask_cpu=checkpoint_track_mask_cpu,
+            checkpoint_relative_track_lens_cpu=checkpoint_relative_track_lens_cpu,
+        )
+        forward_batch = SimpleNamespace(
+            extend_num_tokens=3,
+            extend_seq_lens_cpu=[2, 1],
+            extend_seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+            extend_prefix_lens_cpu=[0, 0],
+            extend_prefix_lens=torch.tensor([0, 0], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 1, 9], dtype=torch.int32),
+            _original_batch_size=3,
+            spec_info=None,
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+        )
+
+        with patch.object(
+            torch,
+            "any",
+            side_effect=AssertionError("CPU mirror path must not call torch.any"),
+        ):
+            metadata = Mamba2Metadata.prepare_mixed(
+                forward_metadata, chunk_size=64, forward_batch=forward_batch
+            )
+
+        self.assertFalse(metadata.mixed_metadata.prep_initial_states)
+        self.assertEqual(metadata.num_prefills, 2)
+        self.assertEqual(metadata.num_decodes, 1)
+        self.assertIs(
+            metadata.checkpoint_extend_seq_lens_cpu,
+            checkpoint_extend_seq_lens_cpu,
+        )
+        self.assertIs(metadata.checkpoint_track_mask_cpu, checkpoint_track_mask_cpu)
+        self.assertIs(
+            metadata.checkpoint_relative_track_lens_cpu,
+            checkpoint_relative_track_lens_cpu,
+        )
+
+    def test_mamba_mixed_metadata_fails_closed_on_cpu_mirror_length_mismatch(self):
+        forward_metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([0, 1], dtype=torch.int64),
+        )
+        forward_batch = SimpleNamespace(
+            extend_num_tokens=3,
+            extend_seq_lens_cpu=[2, 1],
+            extend_seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+            extend_prefix_lens_cpu=[0],
+            extend_prefix_lens=torch.tensor([0, 0], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+            spec_info=None,
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+        )
+
+        with self.assertRaisesRegex(ValueError, "expected 2 prefix lengths"):
+            Mamba2Metadata.prepare_mixed(
+                forward_metadata, chunk_size=64, forward_batch=forward_batch
+            )
 
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
@@ -204,6 +334,29 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             backend.init_forward_metadata(forward_batch)
 
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
+
+    def test_target_verify_without_track_mask_skips_checkpoint_planning(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend.device = "cpu"
+        backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
+        metadata = SimpleNamespace(has_mamba_track_mask=False)
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_target_verify=lambda: True)
+        )
+
+        def init_base(instance, _forward_batch):
+            instance.forward_metadata = metadata
+
+        with (
+            patch.object(MambaAttnBackendBase, "init_forward_metadata", init_base),
+            patch(
+                "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+                "maybe_build_flashinfer_checkpoint_plan"
+            ) as checkpoint_plan,
+        ):
+            backend.init_forward_metadata(forward_batch)
+
+        checkpoint_plan.assert_not_called()
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)

@@ -61,6 +61,10 @@ class ForwardMetadata:
     cake_state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
+    # CPU intermediates already resolved while building tracked-state indices.
+    checkpoint_extend_seq_lens_cpu: Optional[torch.Tensor] = None
+    checkpoint_track_mask_cpu: Optional[torch.Tensor] = None
+    checkpoint_relative_track_lens_cpu: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1
@@ -247,7 +251,19 @@ class Mamba2Metadata(ForwardMetadata):
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0
-        prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        if extend_prefix_lens_cpu is not None:
+            if len(extend_prefix_lens_cpu) != num_prefills:
+                raise ValueError(
+                    "Mamba prefill CPU metadata length mismatch: "
+                    f"expected {num_prefills} prefix lengths, got "
+                    f"{len(extend_prefix_lens_cpu)}"
+                )
+            prep_initial_states = any(
+                prefix_len > 0 for prefix_len in extend_prefix_lens_cpu
+            )
+        else:
+            prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
         _seq_idx_output_size = (
@@ -300,6 +316,13 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            checkpoint_extend_seq_lens_cpu=(
+                forward_metadata.checkpoint_extend_seq_lens_cpu
+            ),
+            checkpoint_track_mask_cpu=forward_metadata.checkpoint_track_mask_cpu,
+            checkpoint_relative_track_lens_cpu=(
+                forward_metadata.checkpoint_relative_track_lens_cpu
+            ),
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             mamba_track_mask_indices=mamba_track_mask_indices,
             conv_states_mask_indices=conv_states_mask_indices,

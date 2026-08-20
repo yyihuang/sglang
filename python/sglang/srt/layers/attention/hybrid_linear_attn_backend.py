@@ -96,6 +96,9 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        checkpoint_extend_seq_lens_cpu = None
+        checkpoint_track_mask_cpu = None
+        checkpoint_relative_track_lens_cpu = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -226,6 +229,9 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_h_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
+                        checkpoint_extend_seq_lens_cpu,
+                        checkpoint_track_mask_cpu,
+                        checkpoint_relative_track_lens_cpu,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
@@ -244,6 +250,9 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            checkpoint_extend_seq_lens_cpu=checkpoint_extend_seq_lens_cpu,
+            checkpoint_track_mask_cpu=checkpoint_track_mask_cpu,
+            checkpoint_relative_track_lens_cpu=checkpoint_relative_track_lens_cpu,
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
@@ -364,6 +373,9 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst.to(self.device, non_blocking=True),
             track_ssm_final_src.to(self.device, non_blocking=True),
             track_ssm_final_dst.to(self.device, non_blocking=True),
+            extend_seq_lens,
+            mamba_track_mask,
+            lens_to_track,
         )
 
     def init_forward_metadata_capture_cpu_graph(

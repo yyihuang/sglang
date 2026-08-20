@@ -388,7 +388,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
                 maybe_build_flashinfer_checkpoint_plan(
-                    forward_batch, self.forward_metadata, self.device
+                    self.forward_metadata, self.device
                 )
 
     def forward_decode(

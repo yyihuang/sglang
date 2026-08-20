@@ -26,7 +26,6 @@ from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +42,6 @@ _cake_gdn_decode_api_checked = False
 
 
 def maybe_build_flashinfer_checkpoint_plan(
-    forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
     device: str,
 ) -> None:
@@ -54,13 +52,52 @@ def maybe_build_flashinfer_checkpoint_plan(
     ):
         return
 
-    checkpoint_every_n_tokens = mamba_cache_chunk_size()
-    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
-    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
-    relative_track_lens = forward_batch.mamba_track_seqlens.to(
-        device="cpu", dtype=torch.int64
-    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+    cpu_metadata = {
+        "checkpoint_extend_seq_lens_cpu": (
+            forward_metadata.checkpoint_extend_seq_lens_cpu
+        ),
+        "checkpoint_track_mask_cpu": forward_metadata.checkpoint_track_mask_cpu,
+        "checkpoint_relative_track_lens_cpu": (
+            forward_metadata.checkpoint_relative_track_lens_cpu
+        ),
+    }
+    missing = [name for name, value in cpu_metadata.items() if value is None]
+    if missing:
+        raise RuntimeError(
+            "FlashInfer GDN checkpoint planning requires tracked-state CPU "
+            f"metadata; missing: {', '.join(missing)}"
+        )
 
+    non_cpu = [
+        name
+        for name, value in cpu_metadata.items()
+        if value.device.type != "cpu"
+    ]
+    if non_cpu:
+        raise ValueError(
+            "FlashInfer GDN checkpoint metadata must already be on CPU: "
+            f"{', '.join(non_cpu)}"
+        )
+
+    num_seqs = cpu_metadata["checkpoint_extend_seq_lens_cpu"].numel()
+    mismatched = [
+        name for name, value in cpu_metadata.items() if value.numel() != num_seqs
+    ]
+    if mismatched:
+        raise ValueError(
+            "FlashInfer GDN checkpoint CPU metadata length mismatch: "
+            f"expected {num_seqs}; mismatched: {', '.join(mismatched)}"
+        )
+
+    extend_seq_lens = cpu_metadata["checkpoint_extend_seq_lens_cpu"].to(
+        dtype=torch.int64
+    )
+    track_mask = cpu_metadata["checkpoint_track_mask_cpu"].to(dtype=torch.bool)
+    relative_track_lens = cpu_metadata["checkpoint_relative_track_lens_cpu"].to(
+        dtype=torch.int64
+    )
+
+    checkpoint_every_n_tokens = mamba_cache_chunk_size()
     checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
     checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
