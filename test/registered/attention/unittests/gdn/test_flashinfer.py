@@ -373,6 +373,18 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         linear_attn_decode_backend="flashinfer",
         linear_attn_prefill_backend="flashinfer",
     )
+    CAKE_CP_PREFILL_CASE = GDNAttentionCase(
+        name="flashinfer_cake_gdn_tp4_cp_prefill_b1_s128",
+        backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=4,
+        num_v_heads=8,
+        page_size=16,
+        prefix_lens=(4,),
+        extend_lens=(128,),
+        linear_attn_decode_backend="flashinfer",
+        linear_attn_prefill_backend="flashinfer",
+    )
     CAKE_CHECKPOINT_PREFILL_CASE = GDNAttentionCase(
         name="flashinfer_cake_gdn_tp4_prefill_b7_checkpoint",
         backend="flashinfer",
@@ -419,6 +431,13 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         except ImportError:
             self.skipTest("public FlashInfer Cake GDN loader is unavailable")
         return cake_gdn_noncp_decode
+
+    def _cake_cp_api_or_skip(self):
+        try:
+            from flashinfer.jit import cake_gdn_cp_prefill
+        except ImportError:
+            self.skipTest("public FlashInfer Cake GDN CP loader is unavailable")
+        return cake_gdn_cp_prefill
 
     def test_cake_exact_decode_eager_and_cuda_graph(self):
         cake_api = self._cake_api_or_skip()
@@ -476,6 +495,36 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             fixture.forward_batch.extend_seq_lens_cpu,
         )
         self.assertEqual(extend.call_args.kwargs["layer_id"], 0)
+        torch.testing.assert_close(
+            actual, expected.output, atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            _ssm_states(fixture)[cache_indices],
+            expected.final_states[cache_indices],
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    def test_public_cake_cp_prefill_call_through(self):
+        cake_cp_api = self._cake_cp_api_or_skip()
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CAKE_CP_PREFILL_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=256,
+        )
+        initial_ssm_states = _ssm_states(fixture).clone()
+        with mock.patch.object(
+            cake_cp_api,
+            "load_cake_gdn_cp_kernel",
+            wraps=cake_cp_api.load_cake_gdn_cp_kernel,
+        ) as load_kernel:
+            actual = run_gdn_fixture_eager(fixture)
+        expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
+        cache_indices = _cache_indices(fixture)
+
+        self.assertGreater(load_kernel.call_count, 0)
         torch.testing.assert_close(
             actual, expected.output, atol=1e-2, rtol=1e-2
         )
