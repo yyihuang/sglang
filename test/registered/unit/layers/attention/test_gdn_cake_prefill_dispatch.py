@@ -104,6 +104,7 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
             store_final_state=True,
             checkpoint_every_n_tokens=0,
             use_state_indices=True,
+            seq_lens=(64, 64, 64, 64, 64),
         )
         entry.assert_called_once()
         args = entry.call_args.args
@@ -147,7 +148,7 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
         kernel._cake_prefill_output_buffer.return_value = output
         kernel._cake_prefill_checkpoint_buffer.return_value = state_checkpoints
         api.select_cake_gdn_prefill_variant.return_value = SimpleNamespace(
-            route_id="cake.gdn_prefill.noncp.checkpoints.full_dv",
+            route_id="cake.gdn_prefill.noncp.checkpoints.dvsplit",
             variant_name="prefill_bf16_indexed_checkpoint",
         )
         kernel._cake_gdn_entries = {"prefill_bf16_indexed_checkpoint": entry}
@@ -170,6 +171,7 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
             store_final_state=True,
             checkpoint_every_n_tokens=64,
             use_state_indices=True,
+            seq_lens=(52, 93, 15, 107, 72, 61, 21),
         )
         kernel._cake_prefill_checkpoint_buffer.assert_called_once_with(
             inputs["q"], layer_id=7, num_state_checkpoints=3, num_v_heads=8

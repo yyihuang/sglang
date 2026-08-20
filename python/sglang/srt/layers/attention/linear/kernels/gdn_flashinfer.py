@@ -592,6 +592,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 store_final_state=True,
                 checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
                 use_state_indices=True,
+                seq_lens=tuple(seq_lens_cpu),
             )
         except self._cake_gdn_api.CakeGDNUnsupportedError:
             return None
