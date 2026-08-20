@@ -186,7 +186,7 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
         self.assertEqual(args[13], inputs["state"].stride(0))
         self.assertEqual(args[14], inputs["state"].stride(0))
         self.assertEqual(args[15], 64)
-        self.assertEqual(args[20:24], (56, 56, 1, 1))
+        self.assertEqual(args[20:24], (112, 112, 1, 1))
 
     def test_public_auto_cp_route_is_not_intercepted(self):
         kernel, api, entry, inputs, *_ = _kernel_and_inputs()
