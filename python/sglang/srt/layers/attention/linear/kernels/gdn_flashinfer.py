@@ -220,6 +220,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
+        # Only the SM100/SM103 prefill path accepts an arbitrary-stride state
+        # pool together with per-sequence state indices. SM120 still uses the
+        # packed-state contract even though its decode path uses a state pool.
+        self.supports_indexed_prefill_state_pool = sm_major == 10
         self.supports_target_verify = sm_major in (9, 10)
         self._cake_gdn_api = None
         self._cake_gdn_arch = None

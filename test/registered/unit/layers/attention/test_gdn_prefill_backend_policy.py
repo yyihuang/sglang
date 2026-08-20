@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     flashinfer_gdn_prefill_default,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -414,6 +415,178 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             backend.init_forward_metadata(forward_batch)
 
         checkpoint_plan.assert_not_called()
+
+    def test_indexed_prefill_keeps_original_ssm_pool_when_conv_needs_packing(self):
+        backend = object.__new__(GDNAttnBackend)
+        cache_indices = torch.tensor([3], dtype=torch.int32)
+        conv_states = torch.empty(8, 6, 3, dtype=torch.bfloat16)[::2]
+        ssm_states = torch.empty(8, 1, 2, 2, dtype=torch.bfloat16)[::2]
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba2_layer_cache=lambda _layer_id: SimpleNamespace(
+                conv=[conv_states], temporal=ssm_states
+            )
+        )
+        backend.forward_metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            mamba_cache_indices=cache_indices,
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            retrieve_parent_token=None,
+            has_mamba_track_mask=False,
+            state_checkpoint_cu_starts=None,
+            cake_state_checkpoint_cu_starts=None,
+            num_state_checkpoints=0,
+            state_checkpoint_every_n_tokens=0,
+        )
+        dispatcher = SimpleNamespace(
+            extend_supports_indexed_state_pool=True,
+            extend=MagicMock(
+                return_value=(
+                    torch.empty(1, 2, 1, 2, dtype=torch.bfloat16),
+                    None,
+                    None,
+                )
+            ),
+        )
+        backend.kernel_dispatcher = dispatcher
+        layer = SimpleNamespace(
+            layer_id=7,
+            conv_weights=sentinel.conv_weights,
+            bias=sentinel.bias,
+            activation=sentinel.activation,
+            q_dim=2,
+            k_dim=2,
+            v_dim=2,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=1,
+            head_q_dim=2,
+            head_k_dim=2,
+            head_v_dim=2,
+            A_log=torch.empty(1),
+            dt_bias=torch.empty(1),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+            extend_seq_lens_cpu=[2],
+        )
+        causal_conv = MagicMock(side_effect=lambda value, *_args, **_kwargs: value)
+
+        with (
+            patch.object(gdn_backend, "is_cpu", return_value=False),
+            patch.object(gdn_backend, "causal_conv1d_fn", causal_conv),
+            patch.object(
+                gdn_backend,
+                "fused_qkv_split_gdn_prefill",
+                return_value=(
+                    torch.empty(1, 2, 1, 2, dtype=torch.bfloat16),
+                    torch.empty(1, 2, 1, 2, dtype=torch.bfloat16),
+                    torch.empty(1, 2, 1, 2, dtype=torch.bfloat16),
+                ),
+            ),
+            patch.object(
+                gdn_backend,
+                "fused_gdn_gating",
+                return_value=(torch.empty(1, 2, 1), torch.empty(1, 2, 1)),
+            ),
+        ):
+            backend.forward_extend(
+                layer,
+                forward_batch,
+                torch.empty(2, 6, dtype=torch.bfloat16),
+                torch.empty(2, 1),
+                torch.empty(2, 1),
+            )
+
+        conv_kwargs = causal_conv.call_args.kwargs
+        self.assertTrue(conv_kwargs["conv_states"].is_contiguous())
+        self.assertNotEqual(
+            conv_kwargs["conv_states"].data_ptr(), conv_states.data_ptr()
+        )
+        torch.testing.assert_close(
+            conv_kwargs["cache_indices"], torch.tensor([0], dtype=torch.int32)
+        )
+        extend_kwargs = dispatcher.extend.call_args.kwargs
+        self.assertEqual(extend_kwargs["ssm_states"].data_ptr(), ssm_states.data_ptr())
+        self.assertIs(extend_kwargs["cache_indices"], cache_indices)
+
+    def test_flashinfer_fallback_gathers_noncontiguous_state_once_and_writes_back(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        class CountStateGather(TorchDispatchMode):
+            def __init__(self):
+                self.count = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten.index.Tensor:
+                    self.count += 1
+                return func(*args, **(kwargs or {}))
+
+        kernel = object.__new__(FlashInferGDNKernel)
+        kernel.use_state_pool = True
+        kernel._try_cake_prefill = MagicMock(return_value=None)
+        output = torch.empty(2, 1, 2, dtype=torch.bfloat16)
+
+        def flashinfer_prefill(**kwargs):
+            kwargs["output_state"].copy_(kwargs["initial_state"] + 1)
+            return output, kwargs["output_state"]
+
+        kernel._prefill_fn = MagicMock(side_effect=flashinfer_prefill)
+        state_storage = torch.zeros(8, 1, 2, 2, dtype=torch.bfloat16)
+        state_pool = state_storage[::2]
+        state_pool[3].fill_(2)
+        state_indices = torch.tensor([3], dtype=torch.int32)
+        counter = CountStateGather()
+
+        with (
+            patch(
+                "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
+                side_effect=lambda value: value,
+            ),
+            counter,
+        ):
+            kernel.extend(
+                q=torch.empty(1, 2, 1, 2, dtype=torch.bfloat16),
+                k=torch.empty(1, 2, 1, 2, dtype=torch.bfloat16),
+                v=torch.empty(1, 2, 1, 2, dtype=torch.bfloat16),
+                g=torch.empty(1, 2, 1, dtype=torch.float32),
+                beta=torch.empty(1, 2, 1, dtype=torch.float32),
+                ssm_states=state_pool,
+                cache_indices=state_indices,
+                query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+                seq_lens_cpu=[2],
+                layer_id=7,
+            )
+
+        self.assertEqual(counter.count, 1)
+        torch.testing.assert_close(
+            state_pool[3], torch.full_like(state_pool[3], 3)
+        )
+
+    def test_flashinfer_indexed_prefill_pool_capability_is_sm100_family_only(self):
+        kernels = (True, sentinel.prefill, sentinel.mtp, sentinel.decode, None)
+
+        for capability, expected in (((10, 3), True), ((12, 0), False)):
+            with (
+                self.subTest(capability=capability),
+                patch(
+                    "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+                    "_get_flashinfer_gdn_kernels",
+                    return_value=kernels,
+                ),
+                patch(
+                    "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+                    "_get_cake_gdn_decode_api",
+                    return_value=None,
+                ),
+                patch.object(
+                    torch.cuda, "get_device_capability", return_value=capability
+                ),
+            ):
+                kernel = FlashInferGDNKernel()
+
+            self.assertIs(kernel.supports_indexed_prefill_state_pool, expected)
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)

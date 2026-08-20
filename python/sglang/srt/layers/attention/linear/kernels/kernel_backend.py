@@ -11,6 +11,7 @@ class LinearAttnKernelBase(ABC):
     """
 
     uses_state_checkpoints: bool = False
+    supports_indexed_prefill_state_pool: bool = False
 
     @abstractmethod
     def decode(

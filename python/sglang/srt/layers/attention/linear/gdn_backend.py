@@ -218,6 +218,10 @@ class GDNKernelDispatcher:
     def extend_uses_state_checkpoints(self) -> bool:
         return self.extend_kernel.uses_state_checkpoints
 
+    @property
+    def extend_supports_indexed_state_pool(self) -> bool:
+        return self.extend_kernel.supports_indexed_prefill_state_pool
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -523,34 +527,43 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
-        # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
-        # chunk_gated_delta_rule) write state back in place assuming a contiguous
-        # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-        # scatter the result back. No-op for the default contiguous pool.
+        # Page-major envelope: CUDA causal_conv1d_fwd still requires a packed
+        # conv-state view. Most recurrent prefill kernels require the same for
+        # SSM state, but SM100/SM103 FlashInfer can dispatch exact Cake rows with
+        # the original arbitrary-stride state pool and per-sequence indices.
+        # Pack each state independently so that route avoids a redundant SSM
+        # gather/scatter while its conv state remains correct.
         # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
         # proper indexed writes and handle non-contiguous pools directly via
         # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
-        # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
-        # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
-        # int64 indexing, like packed_decode / causal_conv1d_update already do.
-        needs_state_gather = (
+        needs_conv_state_gather = (
+            (not is_target_verify) and (not is_cpu()) and not conv_states.is_contiguous()
+        )
+        needs_ssm_state_gather = (
             (not is_target_verify)
             and (not is_cpu())
-            and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
+            and not ssm_states.is_contiguous()
+            and not self.kernel_dispatcher.extend_supports_indexed_state_pool
         )
-        if needs_state_gather:
-            conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
-            state_cache_indices = torch.arange(
+        packed_state_cache_indices = None
+        if needs_conv_state_gather or needs_ssm_state_gather:
+            packed_state_cache_indices = torch.arange(
                 cache_indices.shape[0],
                 device=cache_indices.device,
                 dtype=cache_indices.dtype,
             )
+        if needs_conv_state_gather:
+            conv_states_contig = conv_states[cache_indices].contiguous()
+            conv_state_cache_indices = packed_state_cache_indices
         else:
             conv_states_contig = conv_states
+            conv_state_cache_indices = cache_indices
+        if needs_ssm_state_gather:
+            ssm_states_contig = ssm_states[cache_indices].contiguous()
+            ssm_state_cache_indices = packed_state_cache_indices
+        else:
             ssm_states_contig = ssm_states
-            state_cache_indices = cache_indices
+            ssm_state_cache_indices = cache_indices
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
@@ -589,7 +602,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 activation=layer.activation,
                 conv_states=conv_states_contig,
                 has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
+                cache_indices=conv_state_cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
@@ -695,7 +708,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 g=g,
                 beta=beta,
                 ssm_states=ssm_states_contig,
-                cache_indices=state_cache_indices,
+                cache_indices=ssm_state_cache_indices,
                 query_start_loc=query_start_loc,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
@@ -717,10 +730,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            if needs_state_gather:
-                # Scatter the in-place-updated contiguous copies back to the
-                # strided envelope pool (advanced indexing handles the strides).
+            if needs_conv_state_gather:
                 conv_states[cache_indices] = conv_states_contig
+            if needs_ssm_state_gather:
                 ssm_states[cache_indices] = ssm_states_contig
 
             if forward_metadata.has_mamba_track_mask:
