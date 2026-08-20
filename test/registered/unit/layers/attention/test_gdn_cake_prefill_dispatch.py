@@ -33,6 +33,7 @@ def _kernel_and_inputs():
     api = _CakeAPI()
     entry = MagicMock()
     kernel = object.__new__(FlashInferGDNKernel)
+    kernel._prefill_needs_fp32_state = False
     kernel._cake_gdn_api = api
     kernel._cake_gdn_arch = "sm_100a"
     kernel._cake_gdn_entries = {"prefill_bf16_indexed": entry}

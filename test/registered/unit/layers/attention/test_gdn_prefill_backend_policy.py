@@ -568,6 +568,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
 
         kernel = object.__new__(FlashInferGDNKernel)
         kernel.use_state_pool = True
+        kernel._prefill_needs_fp32_state = False
         kernel._try_cake_prefill = MagicMock(return_value=None)
         output = torch.empty(2, 1, 2, dtype=torch.bfloat16)
 
