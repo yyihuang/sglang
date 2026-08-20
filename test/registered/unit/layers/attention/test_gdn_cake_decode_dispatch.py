@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -105,7 +105,89 @@ def _fp32_t1_kernel_and_inputs():
     return kernel, api, entry, inputs, output
 
 
+def _prefill_metadata_kernel():
+    kernel = object.__new__(FlashInferGDNKernel)
+    kernel._flashinfer_gdn_prefill_metadata = {}
+    return kernel
+
+
 class TestCakeGDNDecodeDispatch(unittest.TestCase):
+    def test_prefill_metadata_refreshes_stable_buffers_after_source_change(self):
+        kernel = _prefill_metadata_kernel()
+        query_start_loc = torch.tensor([0, 39], dtype=torch.int32)
+        cache_indices = torch.tensor([-1], dtype=torch.int32)
+        stream = SimpleNamespace(cuda_stream=17)
+        with (
+            patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ),
+        ):
+            indices_1, cu_seqlens_1 = kernel._flashinfer_prefill_metadata(
+                query_start_loc, cache_indices
+            )
+            indices_version_1 = int(indices_1._version)
+            cu_version_1 = int(cu_seqlens_1._version)
+
+            query_start_loc.copy_(torch.tensor([0, 31], dtype=torch.int32))
+            cache_indices.copy_(torch.tensor([3], dtype=torch.int32))
+            indices_2, cu_seqlens_2 = kernel._flashinfer_prefill_metadata(
+                query_start_loc, cache_indices
+            )
+
+        self.assertIs(indices_2, indices_1)
+        self.assertIs(cu_seqlens_2, cu_seqlens_1)
+        self.assertGreater(int(indices_2._version), indices_version_1)
+        self.assertGreater(int(cu_seqlens_2._version), cu_version_1)
+        torch.testing.assert_close(indices_2, torch.tensor([3], dtype=torch.int64))
+        torch.testing.assert_close(
+            cu_seqlens_2, torch.tensor([0, 31], dtype=torch.int64)
+        )
+
+    def test_prefill_metadata_capture_reuses_warmed_objects_unchanged(self):
+        kernel = _prefill_metadata_kernel()
+        query_start_loc = torch.tensor([0, 39], dtype=torch.int32)
+        cache_indices = torch.tensor([2], dtype=torch.int32)
+        stream = SimpleNamespace(cuda_stream=23)
+        with (
+            patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ) as capturing,
+        ):
+            warmed_indices, warmed_cu = kernel._flashinfer_prefill_metadata(
+                query_start_loc, cache_indices
+            )
+            warmed_versions = (
+                int(warmed_indices._version),
+                int(warmed_cu._version),
+            )
+            capturing.return_value = True
+            captured_indices, captured_cu = kernel._flashinfer_prefill_metadata(
+                query_start_loc, cache_indices
+            )
+
+        self.assertIs(captured_indices, warmed_indices)
+        self.assertIs(captured_cu, warmed_cu)
+        self.assertEqual(
+            (int(captured_indices._version), int(captured_cu._version)),
+            warmed_versions,
+        )
+
+    def test_prefill_metadata_capture_without_warm_fails_closed(self):
+        kernel = _prefill_metadata_kernel()
+        query_start_loc = torch.tensor([0, 39], dtype=torch.int32)
+        cache_indices = torch.tensor([2], dtype=torch.int32)
+        stream = SimpleNamespace(cuda_stream=29)
+        with (
+            patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ),
+            self.assertRaisesRegex(RuntimeError, "must be warmed"),
+        ):
+            kernel._flashinfer_prefill_metadata(query_start_loc, cache_indices)
+
     def test_fp32_t1_calls_public_selector_and_entry(self):
         kernel, api, entry, inputs, output = _fp32_t1_kernel_and_inputs()
 
