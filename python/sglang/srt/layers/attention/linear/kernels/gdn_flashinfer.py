@@ -237,6 +237,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._cake_gdn_prefill_workspaces = {}
         self._cake_gdn_prefill_dummies = {}
         self._cake_gdn_dt_bias_fp32 = {}
+        self._flashinfer_gdn_prefill_metadata = {}
         self._cake_gdn_logged_routes = set()
         self._flashinfer_gdn_should_use_cp_host = None
         self._flashinfer_gdn_num_sms = None
@@ -407,6 +408,58 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             converted = dt_bias.detach().float()
             self._cake_gdn_dt_bias_fp32[key] = converted
         return converted
+
+    def _flashinfer_prefill_metadata(
+        self,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reuse the exact CP-prefill metadata objects warmed for capture."""
+
+        stream_handle = int(
+            torch.cuda.current_stream(query_start_loc.device).cuda_stream
+        )
+        key = (query_start_loc.device.index, stream_handle)
+        cached = self._flashinfer_gdn_prefill_metadata.get(key)
+        query_version = int(query_start_loc._version)
+        indices_version = int(cache_indices._version)
+        sources_match = (
+            cached is not None
+            and cached[0] is query_start_loc
+            and cached[1] is cache_indices
+            and cached[2] == query_version
+            and cached[3] == indices_version
+            and tuple(cached[4].shape) == tuple(cache_indices.shape)
+            and tuple(cached[5].shape) == tuple(query_start_loc.shape)
+        )
+        capturing = torch.cuda.is_current_stream_capturing()
+        if sources_match:
+            return cached[4], cached[5]
+        if capturing:
+            raise RuntimeError(
+                "FlashInfer GDN prefill metadata must be warmed with the same "
+                "unchanged tensors before CUDA Graph capture"
+            )
+        if cached is None or tuple(cached[4].shape) != tuple(cache_indices.shape):
+            ssm_cache_indices = torch.empty_like(cache_indices, dtype=torch.int64)
+        else:
+            ssm_cache_indices = cached[4]
+        if cached is None or tuple(cached[5].shape) != tuple(query_start_loc.shape):
+            cu_seqlens = torch.empty_like(query_start_loc, dtype=torch.int64)
+        else:
+            cu_seqlens = cached[5]
+        ssm_cache_indices.copy_(cache_indices)
+        ssm_cache_indices.clamp_min_(0)
+        cu_seqlens.copy_(query_start_loc)
+        self._flashinfer_gdn_prefill_metadata[key] = (
+            query_start_loc,
+            cache_indices,
+            query_version,
+            indices_version,
+            ssm_cache_indices,
+            cu_seqlens,
+        )
+        return ssm_cache_indices, cu_seqlens
 
     @staticmethod
     def _cake_prefill_grid_x(
@@ -1015,13 +1068,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # Negative indices (e.g. -1) are padding markers for slots not yet
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
-            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+            ssm_cache_indices, cu_seqlens = self._flashinfer_prefill_metadata(
+                query_start_loc,
+                cache_indices,
+            )
             initial_state_fi = (
                 ssm_states[ssm_cache_indices].to(torch.float32)
                 if self._prefill_needs_fp32_state
                 else ssm_states[ssm_cache_indices].contiguous()
             )
-            cu_seqlens = query_start_loc.to(torch.int64)  # kernel requires int64
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
             ssm_cache_indices = torch.where(
