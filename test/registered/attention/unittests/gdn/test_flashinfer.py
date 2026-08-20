@@ -729,6 +729,149 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             rtol=1e-2,
         )
 
+    def test_traced_b1_t39_cp_prefill_state_buffers_are_capture_stable(self):
+        self._cake_cp_api_or_skip()
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CAKE_CP_PREFILL_T39_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=64,
+            runner_batch_size=4,
+        )
+        dispatcher = fixture.backend.linear_attn_backend.kernel_dispatcher
+        kernel = dispatcher.extend_kernel
+        original_prefill = kernel._prefill_fn
+        observed = []
+
+        def record_prefill(**kwargs):
+            capturing = torch.cuda.is_current_stream_capturing()
+            initial_state = kwargs["initial_state"]
+            output_state = kwargs["output_state"]
+            checkpoints = kwargs["state_checkpoints"]
+            observed.append(
+                {
+                    "capturing": capturing,
+                    "initial_state": initial_state,
+                    "initial_version": int(initial_state._version),
+                    "initial_snapshot": (
+                        None if capturing else initial_state.detach().clone()
+                    ),
+                    "output_state": output_state,
+                    "output_version": int(output_state._version),
+                    "checkpoints": checkpoints,
+                    "checkpoint_version": (
+                        None if checkpoints is None else int(checkpoints._version)
+                    ),
+                }
+            )
+            return original_prefill(**kwargs)
+
+        cache_indices = _cache_indices(fixture)
+        refreshed_state = torch.randn_like(_ssm_states(fixture)[cache_indices]) * 0.01
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with (
+            mock.patch.object(kernel, "_prefill_fn", side_effect=record_prefill),
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            fixture.backend.init_forward_metadata(fixture.forward_batch)
+            fixture.actual_module(
+                fixture.forward_batch,
+                fixture.mixed_qkv,
+                fixture.a,
+                fixture.b,
+            )
+            _ssm_states(fixture)[cache_indices] = refreshed_state
+            fixture.actual_module(
+                fixture.forward_batch,
+                fixture.mixed_qkv,
+                fixture.a,
+                fixture.b,
+            )
+        capture_stream.synchronize()
+
+        with (
+            mock.patch.object(kernel, "_prefill_fn", side_effect=record_prefill),
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                fixture.actual_module(
+                    fixture.forward_batch,
+                    fixture.mixed_qkv,
+                    fixture.a,
+                    fixture.b,
+                )
+        capture_stream.synchronize()
+
+        self.assertEqual(len(observed), 3)
+        warm_1, warm_2, captured = observed
+        self.assertFalse(warm_1["capturing"])
+        self.assertFalse(warm_2["capturing"])
+        self.assertTrue(captured["capturing"])
+        self.assertIs(warm_2["initial_state"], warm_1["initial_state"])
+        self.assertIs(captured["initial_state"], warm_1["initial_state"])
+        self.assertIs(warm_2["output_state"], warm_1["output_state"])
+        self.assertIs(captured["output_state"], warm_1["output_state"])
+        self.assertIs(warm_2["checkpoints"], warm_1["checkpoints"])
+        self.assertIs(captured["checkpoints"], warm_1["checkpoints"])
+        self.assertIsNone(warm_1["checkpoints"])
+        self.assertEqual(
+            captured["initial_version"], warm_2["initial_version"]
+        )
+        self.assertEqual(captured["output_version"], warm_2["output_version"])
+        torch.testing.assert_close(
+            warm_2["initial_snapshot"], refreshed_state, atol=0, rtol=0
+        )
+
+    def test_traced_b1_t39_cp_prefill_state_buffers_require_warmup(self):
+        self._cake_cp_api_or_skip()
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CAKE_CP_PREFILL_T39_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=64,
+            runner_batch_size=4,
+        )
+        kernel = fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with (
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            fixture.backend.init_forward_metadata(fixture.forward_batch)
+            fixture.actual_module(
+                fixture.forward_batch,
+                fixture.mixed_qkv,
+                fixture.a,
+                fixture.b,
+            )
+        capture_stream.synchronize()
+
+        kernel._flashinfer_gdn_prefill_state_buffers = {}
+        with (
+            self.assertRaisesRegex(RuntimeError, "state buffers must be warmed"),
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                fixture.actual_module(
+                    fixture.forward_batch,
+                    fixture.mixed_qkv,
+                    fixture.a,
+                    fixture.b,
+                )
+
     def test_cake_exact_checkpoint_prefill_tracks_indexed_state(self):
         cake_api = self._cake_api_or_skip()
         fixture = build_gdn_attention_fixture(
