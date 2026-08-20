@@ -616,7 +616,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             or cake_state_checkpoint_cu_starts is not None
         ):
             return None
-        if self._flashinfer_gdn_should_use_cp_host(
+        if not enable_checkpoints and self._flashinfer_gdn_should_use_cp_host(
             num_seqs * num_v_heads,
             self._flashinfer_gdn_num_sms,
             self._flashinfer_gdn_device_name,
@@ -624,7 +624,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ):
             # The frozen public API defaults to use_cp="auto". Preserve that
             # independent route instead of intercepting the call with Cake's
-            # explicitly non-CP backend.
+            # explicitly non-CP backend. Checkpoint rows are selected first:
+            # FlashInfer's public auto-CP route does not make a promoted exact
+            # Cake checkpoint row ineligible, and an unsupported Cake selector
+            # result below still fails closed to the unchanged public call.
             return None
 
         try:
