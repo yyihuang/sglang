@@ -916,8 +916,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if route.route_id.endswith(".tile16_fullwarp")
             else 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
         )
-        grid_x = batch_size * num_v_heads * (128 // tile_v)
         if route.route_id == "cake.gdn_decode.indexed_fp32_t1_splitv8":
+            grid_x = batch_size * num_v_heads * 8
             entry(
                 q,
                 k,
@@ -935,6 +935,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 1,
             )
         else:
+            grid_x = batch_size * num_v_heads * (128 // tile_v)
             entry(
                 q,
                 k,

@@ -219,7 +219,7 @@ class TestCakeGDNDecodeDispatch(unittest.TestCase):
         self.assertIs(args[8], output)
         self.assertIs(args[9], inputs["state_indices"])
         self.assertIs(args[10], inputs["state_indices"])
-        self.assertEqual(args[11:14], (128, 1, 1))
+        self.assertEqual(args[11:14], (256, 1, 1))
 
     def test_fp32_cached_mtp_fails_closed_before_public_selector(self):
         kernel, api, entry, inputs, _ = _fp32_t1_kernel_and_inputs()
