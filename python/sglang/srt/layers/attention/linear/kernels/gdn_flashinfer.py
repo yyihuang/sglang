@@ -909,23 +909,42 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if route.route_id.endswith(".tile16_fullwarp")
             else 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
         )
-        entry(
-            q,
-            k,
-            v,
-            state,
-            A_log,
-            a,
-            dt_bias,
-            b,
-            output,
-            intermediate_state if intermediate_state is not None else output,
-            state_indices,
-            state_indices,
-            batch_size * num_v_heads * (128 // tile_v),
-            1,
-            1,
-        )
+        grid_x = batch_size * num_v_heads * (128 // tile_v)
+        if route.route_id == "cake.gdn_decode.indexed_fp32_t1_splitv8":
+            entry(
+                q,
+                k,
+                v,
+                state,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                output,
+                state_indices,
+                state_indices,
+                grid_x,
+                1,
+                1,
+            )
+        else:
+            entry(
+                q,
+                k,
+                v,
+                state,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                output,
+                intermediate_state if intermediate_state is not None else output,
+                state_indices,
+                state_indices,
+                grid_x,
+                1,
+                1,
+            )
         if route.route_id not in self._cake_gdn_logged_routes:
             self._cake_gdn_logged_routes.add(route.route_id)
             logger.info("Using %s", route.route_id)
