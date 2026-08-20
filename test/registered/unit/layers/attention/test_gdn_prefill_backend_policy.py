@@ -296,6 +296,63 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             checkpoint_relative_track_lens_cpu,
         )
 
+    def test_ordinary_prefill_uses_cpu_prefix_mirror_without_tensor_sync(self):
+        forward_metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([0, 1], dtype=torch.int64),
+        )
+        forward_batch = SimpleNamespace(
+            extend_num_tokens=3,
+            extend_seq_lens_cpu=[2, 1],
+            extend_seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+            extend_prefix_lens_cpu=[0, 0],
+            extend_prefix_lens=torch.tensor([0, 0], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+            spec_info=None,
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+        )
+
+        with patch.object(
+            torch,
+            "any",
+            side_effect=AssertionError("CPU mirror path must not call torch.any"),
+        ):
+            metadata = Mamba2Metadata.prepare_mixed(
+                forward_metadata, chunk_size=64, forward_batch=forward_batch
+            )
+
+        self.assertFalse(metadata.mixed_metadata.prep_initial_states)
+        self.assertEqual(metadata.num_prefills, 2)
+        self.assertEqual(metadata.num_decodes, 0)
+
+    def test_mamba_prefill_missing_cpu_prefix_mirror_fails_closed_without_sync(self):
+        forward_metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([0], dtype=torch.int64),
+        )
+        forward_batch = SimpleNamespace(
+            extend_num_tokens=2,
+            extend_seq_lens_cpu=[2],
+            extend_seq_lens=torch.tensor([2], dtype=torch.int32),
+            extend_prefix_lens_cpu=None,
+            extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([2], dtype=torch.int32),
+            spec_info=None,
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+        )
+
+        with (
+            patch.object(
+                torch,
+                "any",
+                side_effect=AssertionError("fail-closed path must not call torch.any"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "extend_prefix_lens_cpu"),
+        ):
+            Mamba2Metadata.prepare_mixed(
+                forward_metadata, chunk_size=64, forward_batch=forward_batch
+            )
+
     def test_mamba_mixed_metadata_fails_closed_on_cpu_mirror_length_mismatch(self):
         forward_metadata = ForwardMetadata(
             query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),

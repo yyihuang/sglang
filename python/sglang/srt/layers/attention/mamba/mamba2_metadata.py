@@ -252,18 +252,20 @@ class Mamba2Metadata(ForwardMetadata):
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0
         extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-        if extend_prefix_lens_cpu is not None:
-            if len(extend_prefix_lens_cpu) != num_prefills:
-                raise ValueError(
-                    "Mamba prefill CPU metadata length mismatch: "
-                    f"expected {num_prefills} prefix lengths, got "
-                    f"{len(extend_prefix_lens_cpu)}"
-                )
-            prep_initial_states = any(
-                prefix_len > 0 for prefix_len in extend_prefix_lens_cpu
+        if extend_prefix_lens_cpu is None:
+            raise RuntimeError(
+                "Mamba prefill requires extend_prefix_lens_cpu; refusing a "
+                "device-to-host synchronization to recover the missing CPU mirror"
             )
-        else:
-            prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
+        if len(extend_prefix_lens_cpu) != num_prefills:
+            raise ValueError(
+                "Mamba prefill CPU metadata length mismatch: "
+                f"expected {num_prefills} prefix lengths, got "
+                f"{len(extend_prefix_lens_cpu)}"
+            )
+        prep_initial_states = any(
+            prefix_len > 0 for prefix_len in extend_prefix_lens_cpu
+        )
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
         _seq_idx_output_size = (

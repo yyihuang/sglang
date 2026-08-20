@@ -6,10 +6,15 @@ crashed TBO cuda-graph capture until reset. CPU-only.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+    ForwardMetadata,
+    Mamba2Metadata,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -49,7 +54,57 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
         )
 
 
+def _make_extend_batch() -> ForwardBatch:
+    return ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=2,
+        input_ids=torch.tensor([10, 11, 12], dtype=torch.long),
+        positions=torch.arange(3, dtype=torch.long),
+        out_cache_loc=torch.arange(3, dtype=torch.long),
+        req_pool_indices=torch.arange(2, dtype=torch.long),
+        seq_lens=torch.tensor([2, 5], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([2, 5], dtype=torch.int32),
+        seq_lens_sum=7,
+        extend_num_tokens=3,
+        extend_seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0, 4], dtype=torch.int32),
+        extend_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        extend_prefix_lens_cpu=[0, 4],
+        extend_seq_lens_cpu=[2, 1],
+        extend_logprob_start_lens_cpu=[0, 0],
+    )
+
+
 class TestTboFilterBatchMarker(CustomTestCase):
+    def test_extend_child_keeps_cpu_prefix_mirror_without_tensor_sync(self):
+        parent = _make_extend_batch()
+        with get_context().override_server_args(
+            attention_backend="fa3", moe_dense_tp_size=None
+        ), get_parallel().override(attn_tp_size=1):
+            child = TboForwardBatchPreparer.filter_batch(
+                parent,
+                start_token_index=0,
+                end_token_index=2,
+                start_seq_index=0,
+                end_seq_index=1,
+                out_num_token_non_padded=torch.tensor(2),
+            )
+
+        self.assertEqual(child.extend_prefix_lens_cpu, [0])
+        self.assertEqual(child.extend_seq_lens_cpu, [2])
+        metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([0], dtype=torch.int64),
+        )
+        with patch.object(
+            torch,
+            "any",
+            side_effect=AssertionError("TBO CPU mirror path must not call torch.any"),
+        ):
+            mixed = Mamba2Metadata.prepare_mixed(metadata, 64, child)
+
+        self.assertFalse(mixed.mixed_metadata.prep_initial_states)
+
     def test_filter_batch_clears_mlp_sync_unpad_fields_on_children(self):
         # MLP-sync padding records _original_batch_size/_original_num_tokens
         # before TBO splits the batch (prepare_mlp_sync_batch pads first, then
