@@ -753,16 +753,11 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                 {
                     "capturing": capturing,
                     "initial_state": initial_state,
-                    "initial_version": int(initial_state._version),
                     "initial_snapshot": (
                         None if capturing else initial_state.detach().clone()
                     ),
                     "output_state": output_state,
-                    "output_version": int(output_state._version),
                     "checkpoints": checkpoints,
-                    "checkpoint_version": (
-                        None if checkpoints is None else int(checkpoints._version)
-                    ),
                 }
             )
             return original_prefill(**kwargs)
@@ -821,10 +816,6 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         self.assertIs(warm_2["checkpoints"], warm_1["checkpoints"])
         self.assertIs(captured["checkpoints"], warm_1["checkpoints"])
         self.assertIsNone(warm_1["checkpoints"])
-        self.assertEqual(
-            captured["initial_version"], warm_2["initial_version"]
-        )
-        self.assertEqual(captured["output_version"], warm_2["output_version"])
         torch.testing.assert_close(
             warm_2["initial_snapshot"], refreshed_state, atol=0, rtol=0
         )
@@ -871,6 +862,83 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                     fixture.a,
                     fixture.b,
                 )
+
+    def test_b1_t103_flashinfer_checkpoint_buffer_is_capture_stable(self):
+        self._cake_api_or_skip()
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CAKE_CHECKPOINT_PREFILL_B1_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=128,
+            runner_batch_size=4,
+        )
+        batch = fixture.forward_batch
+        batch.mamba_track_mask = torch.tensor(
+            [True], dtype=torch.bool, device="cuda"
+        )
+        batch.mamba_track_indices = torch.tensor(
+            [3], dtype=torch.int64, device="cuda"
+        )
+        batch.mamba_track_seqlens = torch.tensor(
+            [107], dtype=torch.int64, device="cuda"
+        )
+
+        kernel = fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel
+        original_prefill = kernel._prefill_fn
+        checkpoints = []
+
+        def record_prefill(**kwargs):
+            checkpoints.append(kwargs["state_checkpoints"])
+            return original_prefill(**kwargs)
+
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with (
+            mock.patch.object(kernel, "_try_cake_prefill", return_value=None),
+            mock.patch.object(kernel, "_prefill_fn", side_effect=record_prefill),
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            fixture.backend.init_forward_metadata(fixture.forward_batch)
+            fixture.actual_module(
+                fixture.forward_batch,
+                fixture.mixed_qkv,
+                fixture.a,
+                fixture.b,
+            )
+            fixture.actual_module(
+                fixture.forward_batch,
+                fixture.mixed_qkv,
+                fixture.a,
+                fixture.b,
+            )
+        capture_stream.synchronize()
+
+        with (
+            mock.patch.object(kernel, "_try_cake_prefill", return_value=None),
+            mock.patch.object(kernel, "_prefill_fn", side_effect=record_prefill),
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                fixture.actual_module(
+                    fixture.forward_batch,
+                    fixture.mixed_qkv,
+                    fixture.a,
+                    fixture.b,
+                )
+        capture_stream.synchronize()
+
+        self.assertEqual(len(checkpoints), 3)
+        warm_1, warm_2, captured = checkpoints
+        self.assertIsNotNone(warm_1)
+        self.assertEqual(tuple(warm_1.shape), (1, 8, 128, 128))
+        self.assertIs(warm_2, warm_1)
+        self.assertIs(captured, warm_1)
 
     def test_cake_exact_checkpoint_prefill_tracks_indexed_state(self):
         cake_api = self._cake_api_or_skip()

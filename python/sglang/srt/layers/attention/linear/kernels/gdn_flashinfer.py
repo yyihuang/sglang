@@ -238,6 +238,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._cake_gdn_prefill_dummies = {}
         self._cake_gdn_dt_bias_fp32 = {}
         self._flashinfer_gdn_prefill_metadata = {}
+        self._flashinfer_gdn_prefill_state_buffers = {}
         self._cake_gdn_logged_routes = set()
         self._flashinfer_gdn_should_use_cp_host = None
         self._flashinfer_gdn_num_sms = None
@@ -460,6 +461,63 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             cu_seqlens,
         )
         return ssm_cache_indices, cu_seqlens
+
+    def _flashinfer_prefill_state_buffer_views(
+        self,
+        ssm_states: torch.Tensor,
+        ssm_cache_indices: torch.Tensor,
+        *,
+        layer_id: Optional[int],
+        num_state_checkpoints: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Gather into stream-local state buffers with graph-stable addresses."""
+
+        stream_handle = int(
+            torch.cuda.current_stream(ssm_states.device).cuda_stream
+        )
+        state_shape = (ssm_cache_indices.numel(), *ssm_states.shape[1:])
+        checkpoint_shape = (num_state_checkpoints, *ssm_states.shape[1:])
+        key = (
+            ssm_states.device.index,
+            stream_handle,
+            layer_id,
+            ssm_states.data_ptr(),
+            ssm_cache_indices.data_ptr(),
+            state_shape,
+            checkpoint_shape,
+            ssm_states.dtype,
+        )
+        buffers = self._flashinfer_gdn_prefill_state_buffers.get(key)
+        if buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "FlashInfer GDN prefill state buffers must be warmed before "
+                    "CUDA Graph capture"
+                )
+            initial_state = torch.empty(
+                state_shape, dtype=ssm_states.dtype, device=ssm_states.device
+            )
+            output_state = torch.empty_like(initial_state)
+            state_checkpoints = (
+                torch.empty(
+                    checkpoint_shape,
+                    dtype=ssm_states.dtype,
+                    device=ssm_states.device,
+                )
+                if num_state_checkpoints > 0
+                else None
+            )
+            buffers = (initial_state, output_state, state_checkpoints)
+            self._flashinfer_gdn_prefill_state_buffers[key] = buffers
+
+        initial_state, output_state, state_checkpoints = buffers
+        torch.index_select(
+            ssm_states,
+            0,
+            ssm_cache_indices,
+            out=initial_state,
+        )
+        return initial_state, output_state, state_checkpoints
 
     @staticmethod
     def _cake_prefill_grid_x(
@@ -1091,6 +1149,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             core_attn_out, h = output_cake
             return core_attn_out, None, h
 
+        output_state_fi = None
+        state_checkpoints = None
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
@@ -1099,11 +1159,19 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 query_start_loc,
                 cache_indices,
             )
-            initial_state_fi = (
-                ssm_states[ssm_cache_indices].to(torch.float32)
-                if self._prefill_needs_fp32_state
-                else ssm_states[ssm_cache_indices].contiguous()
-            )
+            if self._prefill_needs_fp32_state:
+                initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
+            else:
+                (
+                    initial_state_fi,
+                    output_state_fi,
+                    state_checkpoints,
+                ) = self._flashinfer_prefill_state_buffer_views(
+                    ssm_states,
+                    ssm_cache_indices,
+                    layer_id=kwargs.get("layer_id"),
+                    num_state_checkpoints=num_state_checkpoints,
+                )
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
             ssm_cache_indices = torch.where(
@@ -1116,14 +1184,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             cu_seqlens = query_start_loc.to(torch.int64)
 
         # Keep final state and checkpoints in the same kernel state dtype.
-        output_state_fi = torch.empty_like(initial_state_fi)
-        state_checkpoints = (
-            initial_state_fi.new_empty(
-                (num_state_checkpoints, *initial_state_fi.shape[1:])
+        if output_state_fi is None:
+            output_state_fi = torch.empty_like(initial_state_fi)
+            state_checkpoints = (
+                initial_state_fi.new_empty(
+                    (num_state_checkpoints, *initial_state_fi.shape[1:])
+                )
+                if num_state_checkpoints > 0
+                else None
             )
-            if num_state_checkpoints > 0
-            else None
-        )
         output_fi, output_state_fi = self._prefill_fn(
             q=q_fi,
             k=k_fi,
