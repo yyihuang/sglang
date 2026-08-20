@@ -507,6 +507,8 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
 
     def test_public_cake_cp_prefill_call_through(self):
         cake_cp_api = self._cake_cp_api_or_skip()
+        from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_prefill
+
         fixture = build_gdn_attention_fixture(
             self,
             self.CAKE_CP_PREFILL_CASE,
@@ -516,7 +518,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         )
         initial_ssm_states = _ssm_states(fixture).clone()
         with mock.patch.object(
-            cake_cp_api,
+            cake_gdn_cp_prefill,
             "load_cake_gdn_cp_kernel",
             wraps=cake_cp_api.load_cake_gdn_cp_kernel,
         ) as load_kernel:
