@@ -217,9 +217,9 @@ class TestCakeGDNDecodeDispatch(unittest.TestCase):
         self.assertIs(args[0], inputs["q"])
         self.assertIs(args[3], inputs["state"])
         self.assertIs(args[8], output)
+        self.assertIs(args[9], inputs["state_indices"])
         self.assertIs(args[10], inputs["state_indices"])
-        self.assertIs(args[11], inputs["state_indices"])
-        self.assertEqual(args[12:15], (128, 1, 1))
+        self.assertEqual(args[11:14], (128, 1, 1))
 
     def test_traced_tp4_verify_batches_call_public_selector_and_frozen_grid(self):
         for batch_size in (1, 4, 6, 7):
