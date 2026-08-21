@@ -211,6 +211,23 @@ class SfS2TCopies(NamedTuple):
     tCtSFK_s2t: cute.Tensor
 
 
+class PvNvfp4SfCopies(NamedTuple):
+    """Native BlockScaledBasicChunk scale operands for one P/V stage."""
+
+    tCtSFA: cute.Tensor
+    tiled_copy_sfa: cute.TiledCopy
+    tCsSFA_s2t: cute.Tensor
+    tCtSFA_s2t: cute.Tensor
+    tCtSFBBase: cute.Tensor
+    tCtSFBResidual: cute.Tensor
+    tiled_copy_sfb_base: cute.TiledCopy
+    tiled_copy_sfb_residual: cute.TiledCopy
+    tCsSFBBase_s2t: cute.Tensor
+    tCtSFBBase_s2t: cute.Tensor
+    tCsSFBResidual_s2t: cute.Tensor
+    tCtSFBResidual_s2t: cute.Tensor
+
+
 class FlashAttentionForwardSm100:
 
     def __init__(
@@ -240,6 +257,7 @@ class FlashAttentionForwardSm100:
         rel_extent_padded: int = 128,
         qk_blockscaled: bool = False,
         v_dequant: bool = False,
+        pv_nvfp4: bool = False,
         q_sf_interleaved: bool = False,
         kv_sf_interleaved: bool = False,
         batch_invariant: bool = False,
@@ -260,6 +278,26 @@ class FlashAttentionForwardSm100:
         # into two flags (e.g. v_blockscaled_storage vs v_needs_dequant) if a
         # non-dequant blockscaled-V (fp8 PV) path is ever added.
         self.v_dequant = v_dequant
+        # Experimental Wan exact-shape specialization.  This is deliberately
+        # additive and default-off: Q/K, score accumulation, online-softmax,
+        # correction, epilogue, and scheduling remain the production BF16 path;
+        # only P@V changes to native NVFP4 block-scaled MMA.
+        self.pv_nvfp4 = pv_nvfp4
+        if self.pv_nvfp4:
+            # E4M3 cannot directly encode amax(P) / 6 for diffuse Wan rows
+            # (uniform P at S=4800 would underflow the scale to zero).  Scale
+            # the unnormalized P operand before FP4 quantization, then undo the
+            # same constant in the final softmax epilogue.
+            self.pv_p_quant_multiplier = 512.0
+            assert not qk_blockscaled, "pv_nvfp4 keeps Q/K BF16"
+            assert not v_dequant, "pv_nvfp4 and v_dequant are mutually exclusive"
+            assert head_dim == 128 and (head_dim_v is None or head_dim_v == 128)
+            assert not is_causal and not is_local and not is_split_kv
+            assert not pack_gqa and qhead_per_kvhead == 1
+            assert not is_varlen_q and not paged_kv_non_tma
+            assert not has_bias and score_mod is None and mask_mod is None
+            assert m_block_size == 128 and n_block_size == 128
+            assert q_stage == 2 and use_2cta_instrs and is_persistent
         self.q_sf_interleaved = q_sf_interleaved
         self.kv_sf_interleaved = kv_sf_interleaved
         self.use_cpasync_to_load_sfq = self.qk_blockscaled and not self.q_sf_interleaved
@@ -292,10 +330,15 @@ class FlashAttentionForwardSm100:
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
-        self.split_P_arrive = n_block_size // 4 * 3
-        self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
-        assert self.split_P_arrive % 32 == 0
-        assert self.split_P_arrive < self.n_block_size
+        if self.pv_nvfp4:
+            # The first native-P prototype publishes all eight per-16 groups,
+            # including SFA, before either base or residual PV MMA starts.
+            self.split_P_arrive = 0
+        else:
+            self.split_P_arrive = n_block_size // 4 * 3
+            self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
+            assert self.split_P_arrive % 32 == 0
+            assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
         assert self.arch.is_family_of(Arch.sm_100f) or self.arch.is_family_of(
             Arch.sm_110f
@@ -482,6 +525,11 @@ class FlashAttentionForwardSm100:
         self.tmem_p_offset = [
             self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)
         ]  # 0, 128
+        self.tmem_p_sfa_offset = [offset + 16 for offset in self.tmem_p_offset]
+        self.tmem_v_sfb_base_offset = [offset + 24 for offset in self.tmem_p_offset]
+        self.tmem_v_sfb_residual_offset = [
+            offset + 32 for offset in self.tmem_p_offset
+        ]
 
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
@@ -584,6 +632,17 @@ class FlashAttentionForwardSm100:
         smem_size_v_per_stage = (
             self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
         )
+        if self.pv_nvfp4:
+            # A full V2 epoch carries base + residual FP4 and one native E4M3
+            # scale byte per 16 sequence values for each level.
+            smem_size_v_per_stage *= 2
+            smem_size_v_per_stage += 2 * (
+                self.n_block_size
+                * self.head_dim_v_padded
+                // self.pv_sf_vec_size
+                * self.pv_sf_dtype.width
+                // 8
+            )
         if self.v_dequant:
             # fp8 V scale bytes + the dequantized bf16 V (the fp8 V and its
             # dequant target both live in smem; K and V no longer share).
@@ -600,6 +659,17 @@ class FlashAttentionForwardSm100:
         if self.v_dequant:
             # v_dequant uses separate K and V pipelines, so their smem is not shared.
             smem_size_kv_per_stage = smem_size_k_per_stage + smem_size_v_per_stage
+        elif self.pv_nvfp4:
+            # A 2-CTA QK MMA partitions each K stage across the CTA pair, but
+            # the PV V/SFB operands are multicast and therefore occupy their
+            # full footprint in each CTA.  Budget the per-CTA alternatives
+            # before taking their maximum.  In particular, the two 1-KiB SFB
+            # tensors must not be hidden by the 2-CTA division: base+residual
+            # FP4 already consume the complete 16-KiB physical K-stage slot.
+            smem_size_kv_per_stage = max(
+                smem_size_k_per_stage // self.cta_group_size,
+                smem_size_v_per_stage,
+            )
         else:
             smem_size_kv_per_stage = (
                 max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
@@ -711,6 +781,10 @@ class FlashAttentionForwardSm100:
         mSFV: Optional[cute.Tensor] = None,  # UE8M0 per-32 scales for V (v_dequant)
         qk_sf_vec_size: cutlass.Constexpr[Optional[int]] = None,
         v_sf_vec_size: cutlass.Constexpr[Optional[int]] = None,
+        mVBase: Optional[cute.Tensor] = None,
+        mVResidual: Optional[cute.Tensor] = None,
+        mSFVBase: Optional[cute.Tensor] = None,
+        mSFVResidual: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -730,20 +804,29 @@ class FlashAttentionForwardSm100:
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
-        self.v_dtype = mV.element_type
+        self.v_dtype = (
+            cutlass.Float4E2M1FN if const_expr(self.pv_nvfp4) else mV.element_type
+        )
         self.o_dtype = mO.element_type
         self.kv_size_ratio = self.v_dtype.width // self.k_dtype.width
         # scale-factor setup for blockscaled / v_dequant
         self.sfq_dtype = mSFQ.element_type if const_expr(mSFQ is not None) else None
         self.sfk_dtype = mSFK.element_type if const_expr(mSFK is not None) else None
         self.sfv_dtype = mSFV.element_type if const_expr(mSFV is not None) else None
+        self.pv_sf_dtype = (
+            cutlass.Float8E4M3FN if const_expr(self.pv_nvfp4) else None
+        )
+        self.pv_sf_vec_size = 16
         self.qk_sf_vec_size = (
             qk_sf_vec_size if const_expr(qk_sf_vec_size is not None) else 1
         )
         self.v_sf_vec_size = (
             v_sf_vec_size if const_expr(v_sf_vec_size is not None) else 1
         )
-        if const_expr(self.v_dequant):
+        if const_expr(self.pv_nvfp4):
+            self.v_mma_dtype = cutlass.Float4E2M1FN
+            self.kv_size_ratio = 1
+        elif const_expr(self.v_dequant):
             # V is dequantized to bf16 in-kernel; PV MMA (and P) run in bf16.
             self.v_mma_dtype = cutlass.BFloat16
             self.kv_size_ratio = 1
@@ -753,6 +836,48 @@ class FlashAttentionForwardSm100:
             mBias.element_type if const_expr(mBias is not None) else self.q_dtype
         )
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        if const_expr(self.pv_nvfp4):
+            if const_expr(
+                mVBase is None
+                or mVResidual is None
+                or mSFVBase is None
+                or mSFVResidual is None
+            ):
+                raise ValueError(
+                    "pv_nvfp4 requires packed V base/residual and both E4M3 scale tensors"
+                )
+            if const_expr(
+                mVBase.element_type != cutlass.Uint8
+                or mVResidual.element_type != cutlass.Uint8
+            ):
+                raise TypeError("pv_nvfp4 packed V tensors must use uint8 storage")
+            if const_expr(
+                mSFVBase.element_type != cutlass.Float8E4M3FN
+                or mSFVResidual.element_type != cutlass.Float8E4M3FN
+            ):
+                raise TypeError("pv_nvfp4 scale tensors must be Float8E4M3FN")
+            # The interface validates the exact Wan shape before compilation.
+            # The packed inputs expose two logical FP4 values per uint8 element.
+            packed_v_layout = cute.make_layout(
+                (128, 4864, 40, 1),
+                stride=(4864, 1, 128 * 4864, 40 * 128 * 4864),
+            )
+            mVBase = cute.make_tensor(
+                cute.recast_ptr(mVBase.iterator, dtype=cutlass.Float4E2M1FN),
+                packed_v_layout,
+            )
+            mVResidual = cute.make_tensor(
+                cute.recast_ptr(mVResidual.iterator, dtype=cutlass.Float4E2M1FN),
+                packed_v_layout,
+            )
+            mVBase, mVResidual, mSFVBase, mSFVResidual = [
+                assume_tensor_aligned(t) for t in (
+                    mVBase,
+                    mVResidual,
+                    mSFVBase,
+                    mSFVResidual,
+                )
+            ]
         if const_expr(mBias is not None):
             mBias = assume_tensor_aligned(mBias)
         mSFQ, mSFK, mSFV = [
@@ -808,7 +933,9 @@ class FlashAttentionForwardSm100:
         # V's SF is laid out over (tokens-M, head_dim_v/32 sf_k) -- identical to
         # K's SF (per-token, per-head-dim). Capture V's shape BEFORE the (d, s)
         # transpose so the SF atom tiles the token axis as M, same as mK.shape.
-        mV_sf_shape = mV.shape  # (page_size/s_k, dv, h, b) -- token-major, like mK
+        mV_sf_shape = (
+            mVBase.shape if const_expr(self.pv_nvfp4) else mV.shape
+        )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = (
             [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
@@ -816,6 +943,8 @@ class FlashAttentionForwardSm100:
         mV = cute.make_tensor(
             mV.iterator, cute.select(mV.layout, mode=V_layout_transpose)
         )
+        if const_expr(self.pv_nvfp4):
+            mV = mVBase
 
         # Broadcast SF tensors to the blockscaled BasicChunk atom layout (or the
         # transposed dense layout for the non-interleaved / paged fallback).
@@ -858,6 +987,13 @@ class FlashAttentionForwardSm100:
                 mSFV = cute.make_tensor(
                     mSFV.iterator, cute.select(mSFV.layout, mode=KV_layout_transpose)
                 )
+        if const_expr(self.pv_nvfp4):
+            sfv_atom = blockscaled_layout.BlockScaledBasicChunk(
+                self.pv_sf_vec_size
+            ).layout
+            sfv_layout = cute.tile_to_shape(sfv_atom, mV_sf_shape, _SF_TILE_ORDER)
+            mSFVBase = cute.make_tensor(mSFVBase.iterator, sfv_layout)
+            mSFVResidual = cute.make_tensor(mSFVResidual.iterator, sfv_layout)
 
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
@@ -865,6 +1001,7 @@ class FlashAttentionForwardSm100:
         if const_expr(
             not self.qk_blockscaled
             and not self.v_dequant
+            and not self.pv_nvfp4
             and self.q_dtype != self.v_dtype
         ):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
@@ -935,7 +1072,11 @@ class FlashAttentionForwardSm100:
         )
         q_major_mode = tcgen05.OperandMajorMode.K
         k_major_mode = tcgen05.OperandMajorMode.K
-        v_major_mode = tcgen05.OperandMajorMode.MN
+        v_major_mode = (
+            tcgen05.OperandMajorMode.K
+            if const_expr(self.pv_nvfp4)
+            else tcgen05.OperandMajorMode.MN
+        )
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
@@ -977,16 +1118,50 @@ class FlashAttentionForwardSm100:
                     mma_inst_shape_mn_sfk,
                 )
             )
-        # PV MMA is always plain (v_mma_dtype == v_dtype, or bf16 under v_dequant).
-        tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
-            self.v_mma_dtype,
-            p_major_mode,
-            v_major_mode,
-            self.pv_acc_dtype,
-            cta_group,
-            self.mma_tiler_pv[:2],
-            p_source,
-        )
+        if const_expr(self.pv_nvfp4):
+            tiled_mma_pv = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                cutlass.Float4E2M1FN,
+                cutlass.Float4E2M1FN,
+                p_major_mode,
+                v_major_mode,
+                cutlass.Float8E4M3FN,
+                self.pv_sf_vec_size,
+                cta_group,
+                self.mma_tiler_pv[:2],
+                p_source,
+            )
+            # As with SFK above, use a 1-CTA block-scaled MMA only to derive
+            # the SFB TMA / shared-memory layout.  The actual P @ V MMAs remain
+            # the 2-CTA tiled_mma_pv operation.
+            mma_inst_shape_mn_pv_sfb = (
+                self.mma_tiler_pv[0] // (2 if self.use_2cta_instrs else 1),
+                cute.round_up(self.mma_tiler_pv[1], 128),
+            )
+            mma_tiler_pv_sfb = (*mma_inst_shape_mn_pv_sfb, self.mma_tiler_pv[2])
+            self.mma_tiler_pv_sfb = mma_tiler_pv_sfb
+            tiled_mma_pv_sfb = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                cutlass.Float4E2M1FN,
+                cutlass.Float4E2M1FN,
+                p_major_mode,
+                v_major_mode,
+                cutlass.Float8E4M3FN,
+                self.pv_sf_vec_size,
+                tcgen05.CtaGroup.ONE,
+                mma_inst_shape_mn_pv_sfb,
+                p_source,
+            )
+        else:
+            # Plain production PV (v_mma_dtype == v_dtype, or bf16 under
+            # v_dequant).  Keep this construction unchanged for the default.
+            tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
+                self.v_mma_dtype,
+                p_major_mode,
+                v_major_mode,
+                self.pv_acc_dtype,
+                cta_group,
+                self.mma_tiler_pv[:2],
+                p_source,
+            )
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         cta_layout_vmnk = cute.tiled_divide(
@@ -996,6 +1171,11 @@ class FlashAttentionForwardSm100:
             cta_layout_sfk_vmnk = cute.tiled_divide(
                 cute.make_layout(self.cluster_shape_mnk),
                 (self.tiled_mma_qk_sfk.thr_id.shape,),
+            )
+        if const_expr(self.pv_nvfp4):
+            cta_layout_pv_sfb_vmnk = cute.tiled_divide(
+                cute.make_layout(self.cluster_shape_mnk),
+                (tiled_mma_pv_sfb.thr_id.shape,),
             )
 
         # epi_tile is per-CTA (not full 2CTA) since each CTA writes its own O portion
@@ -1065,6 +1245,115 @@ class FlashAttentionForwardSm100:
         sV_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_pv, self.mma_tiler_pv, self.v_mma_dtype, self.v_mma_stage
         )
+        if const_expr(self.pv_nvfp4):
+            sVResidual_layout = sm100_utils_basic.make_smem_layout_b(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.v_mma_dtype,
+                self.v_mma_stage,
+            )
+            sSFP_layout = blockscaled_layout.make_smem_layout_sfa(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.pv_sf_vec_size,
+                self.s_stage,
+            )
+            sSFVBase_layout = blockscaled_layout.make_smem_layout_sfb(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.pv_sf_vec_size,
+                self.v_mma_stage,
+            )
+            sSFVResidual_layout = blockscaled_layout.make_smem_layout_sfb(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.pv_sf_vec_size,
+                self.v_mma_stage,
+            )
+            # Reuse each physical sK stage for the alternating V epoch.  The
+            # 2-CTA K footprint is 16 KiB per CTA, which holds the two FP4 V
+            # levels but not their two 1-KiB SFB tensors.  Give every physical
+            # stage the complete 18-KiB V epoch stride so scales neither alias
+            # the next stage nor run beyond the final stage.
+            sK_stage_stride_bytes = (
+                const_expr(max(sK_layout.outer.stride[-1], 0))
+                * self.k_dtype.width
+                // 8
+            )
+            v_epoch_stage_stride_bytes = (
+                2
+                * self.n_block_size
+                * self.head_dim_v_padded
+                * self.v_mma_dtype.width
+                // 8
+                + 2
+                * self.n_block_size
+                * self.head_dim_v_padded
+                // self.pv_sf_vec_size
+                * self.pv_sf_dtype.width
+                // 8
+            )
+            self.pv_kv_stage_stride_bytes = max(
+                sK_stage_stride_bytes, v_epoch_stage_stride_bytes
+            )
+            k_stage_stride = (
+                self.pv_kv_stage_stride_bytes * 8 // self.k_dtype.width
+            )
+            sK_layout = cute.make_composed_layout(
+                sK_layout.inner,
+                0,
+                cute.make_layout(
+                    sK_layout.outer.shape,
+                    stride=(*sK_layout.outer.stride[:-1], k_stage_stride),
+                ),
+            )
+            v_stage_stride = (
+                self.pv_kv_stage_stride_bytes * 8 // self.v_mma_dtype.width
+            )
+            sV_layout = cute.make_composed_layout(
+                sV_layout.inner,
+                0,
+                cute.make_layout(
+                    sV_layout.outer.shape,
+                    stride=(*sV_layout.outer.stride[:-1], v_stage_stride),
+                ),
+            )
+            sVResidual_layout = cute.make_composed_layout(
+                sVResidual_layout.inner,
+                0,
+                cute.make_layout(
+                    sVResidual_layout.outer.shape,
+                    stride=(*sVResidual_layout.outer.stride[:-1], v_stage_stride),
+                ),
+            )
+            self.pv_v_residual_smem_offset = (
+                self.n_block_size * self.head_dim_v_padded
+            )
+            sf_stage_stride = self.pv_kv_stage_stride_bytes
+            sSFVBase_layout = cute.make_layout(
+                sSFVBase_layout.shape,
+                stride=(*sSFVBase_layout.stride[:-1], sf_stage_stride),
+            )
+            sSFVResidual_layout = cute.make_layout(
+                sSFVResidual_layout.shape,
+                stride=(*sSFVResidual_layout.stride[:-1], sf_stage_stride),
+            )
+            self.pv_sfv_base_smem_offset = (
+                2 * self.n_block_size * self.head_dim_v_padded
+                * self.v_mma_dtype.width
+                // 8
+            )
+            self.pv_sfv_residual_smem_offset = (
+                self.pv_sfv_base_smem_offset
+                + self.n_block_size
+                * self.head_dim_v_padded
+                // self.pv_sf_vec_size
+            )
+        else:
+            sVResidual_layout = None
+            sSFP_layout = None
+            sSFVBase_layout = None
+            sSFVResidual_layout = None
         if const_expr(self.v_dequant):
             # fp8 V lands in sVq (plain MMA layout for the fp8 dtype); the
             # correction warp dequantizes it into sV (bf16).
@@ -1141,13 +1430,33 @@ class FlashAttentionForwardSm100:
                 ("Q", mQ, sQ_layout),
                 ("K", mK, sK_layout),
                 ("V", mV, sV_layout if const_expr(not self.v_dequant) else sVq_layout),
+                ("VResidual", mVResidual, sVResidual_layout),
                 ("SFQ", mSFQ, sSFQ_layout),
                 ("SFK", mSFK, sSFK_layout),
                 ("SFV", mSFV, sSFV_layout),
+                ("SFVBase", mSFVBase, sSFVBase_layout),
+                ("SFVResidual", mSFVResidual, sSFVResidual_layout),
             ]
         }
-        for name in ("Q", "K", "V", "SFQ", "SFK", "SFV"):
+        for name in (
+            "Q",
+            "K",
+            "V",
+            "VResidual",
+            "SFQ",
+            "SFK",
+            "SFV",
+            "SFVBase",
+            "SFVResidual",
+        ):
             self.tma_copy_bytes[name] *= self.cta_group_size
+        if const_expr(self.pv_nvfp4):
+            # The SFB loads use TMA multicast rather than the 2-CTA TMA atom
+            # used by V.  Each CTA's mbarrier receives one scale-tile payload,
+            # so multiplying those payloads by cta_group_size makes the V-epoch
+            # barrier wait for 2 KiB that will never arrive.
+            self.tma_copy_bytes["SFVBase"] //= self.cta_group_size
+            self.tma_copy_bytes["SFVResidual"] //= self.cta_group_size
 
         # TMA load for Q
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
@@ -1183,6 +1492,9 @@ class FlashAttentionForwardSm100:
         tma_atom_SFQ = None
         tma_atom_SFK = None
         tma_atom_SFV = None
+        tma_atom_VResidual = None
+        tma_atom_SFVBase = None
+        tma_atom_SFVResidual = None
         gmem_tiled_copy_SFQ = None
         if const_expr(self.use_tma_KV):
             # TMA load for K
@@ -1207,6 +1519,15 @@ class FlashAttentionForwardSm100:
                 tiled_mma_pv_vq if const_expr(self.v_dequant) else tiled_mma_pv,
                 cta_layout_vmnk.shape,
             )
+            if const_expr(self.pv_nvfp4):
+                tma_atom_VResidual, mVResidual = cute.nvgpu.make_tiled_tma_atom_B(
+                    tma_load_op,
+                    mVResidual,
+                    cute.select(sVResidual_layout, mode=[0, 1, 2]),
+                    self.mma_tiler_pv,
+                    tiled_mma_pv,
+                    cta_layout_vmnk.shape,
+                )
 
         if const_expr(self.qk_blockscaled):
             sfq_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_A(
@@ -1264,6 +1585,28 @@ class FlashAttentionForwardSm100:
                 mma_tiler_pv_sfv,
                 self.tiled_mma_pv_sfv,
                 cta_layout_sfv_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
+        if const_expr(self.pv_nvfp4):
+            sfv_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
+                self.cluster_shape_mn, tiled_mma_pv_sfb.thr_id
+            )
+            tma_atom_SFVBase, mSFVBase = cute.nvgpu.make_tiled_tma_atom_B(
+                sfv_tma_op,
+                mSFVBase,
+                cute.select(sSFVBase_layout, mode=[0, 1, 2]),
+                mma_tiler_pv_sfb,
+                tiled_mma_pv_sfb,
+                cta_layout_pv_sfb_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
+            tma_atom_SFVResidual, mSFVResidual = cute.nvgpu.make_tiled_tma_atom_B(
+                sfv_tma_op,
+                mSFVResidual,
+                cute.select(sSFVResidual_layout, mode=[0, 1, 2]),
+                mma_tiler_pv_sfb,
+                tiled_mma_pv_sfb,
+                cta_layout_pv_sfb_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
 
@@ -1405,8 +1748,17 @@ class FlashAttentionForwardSm100:
         sSFQ_size = cute.cosize(sSFQ_layout) if const_expr(self.qk_blockscaled) else 0
         sSFK_size = cute.cosize(sSFK_layout) if const_expr(self.qk_blockscaled) else 0
         sSFV_size = cute.cosize(sSFV_layout) if const_expr(self.v_dequant) else 0
+        sSFP_size = cute.cosize(sSFP_layout) if const_expr(self.pv_nvfp4) else 0
         sVq_size = cute.cosize(sVq_layout) if const_expr(self.v_dequant) else 0
         sV_dequant_size = cute.cosize(sV_layout) if const_expr(self.v_dequant) else 0
+        sK_size = (
+            self.pv_kv_stage_stride_bytes
+            * self.kv_stage
+            * 8
+            // self.k_dtype.width
+            if const_expr(self.pv_nvfp4)
+            else cute.cosize(sK_layout)
+        )
         use_sf_mbar = 1 if const_expr(self.qk_blockscaled and self.q_stage == 2) else 0
         use_vq_mbar = 1 if const_expr(self.v_dequant) else 0
         use_sfq_mbar = 1 if const_expr(self.use_cpasync_to_load_sfq) else 0
@@ -1440,6 +1792,9 @@ class FlashAttentionForwardSm100:
             # Smem tensors
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
+            sSFP: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float8E4M3FN, sSFP_size], 16
+            ]
             # CLC buffers placed here to utilize padding before sO's 1024-byte alignment.
             # This avoids adding bytes at the end when we're at the smem limit.
             # PipelineClcFetchAsync expects 2 * sched_stages mbarriers (full + empty).
@@ -1454,8 +1809,9 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.q_dtype, sQ_size], self.buffer_align_bytes
             ]
             sK: cute.struct.Align[
-                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
-                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                # pv_nvfp4 reserves the SFB tail of the final physical stage;
+                # other paths use the canonical (including uneven) K layout.
+                cute.struct.MemRange[self.k_dtype, sK_size],
                 self.buffer_align_bytes,
             ]
             sBias: cute.struct.Align[
@@ -1613,6 +1969,18 @@ class FlashAttentionForwardSm100:
             tiled_mma_pv_vq,
             self.tiled_mma_qk_sfk if const_expr(self.qk_blockscaled) else None,
             self.tiled_mma_pv_sfv if const_expr(self.v_dequant) else None,
+            tiled_mma_pv_sfb if const_expr(self.pv_nvfp4) else None,
+            cta_layout_pv_sfb_vmnk if const_expr(self.pv_nvfp4) else None,
+            mVResidual,
+            mSFVBase,
+            mSFVResidual,
+            tma_atom_VResidual,
+            tma_atom_SFVBase,
+            tma_atom_SFVResidual,
+            sVResidual_layout,
+            sSFP_layout,
+            sSFVBase_layout,
+            sSFVResidual_layout,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1699,6 +2067,18 @@ class FlashAttentionForwardSm100:
         tiled_mma_pv_vq: Optional[cute.TiledMma] = None,
         tiled_mma_qk_sfk: Optional[cute.TiledMma] = None,
         tiled_mma_pv_sfv: Optional[cute.TiledMma] = None,
+        tiled_mma_pv_sfb: Optional[cute.TiledMma] = None,
+        cta_layout_pv_sfb_vmnk: Optional[cute.Layout] = None,
+        mVResidual: Optional[cute.Tensor] = None,
+        mSFVBase: Optional[cute.Tensor] = None,
+        mSFVResidual: Optional[cute.Tensor] = None,
+        tma_atom_VResidual: Optional[cute.CopyAtom] = None,
+        tma_atom_SFVBase: Optional[cute.CopyAtom] = None,
+        tma_atom_SFVResidual: Optional[cute.CopyAtom] = None,
+        sVResidual_layout: Optional[cute.ComposedLayout] = None,
+        sSFP_layout=None,
+        sSFVBase_layout=None,
+        sSFVResidual_layout=None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1726,6 +2106,9 @@ class FlashAttentionForwardSm100:
                 tma_atom_SFQ,
                 tma_atom_SFK,
                 tma_atom_SFV,
+                tma_atom_VResidual,
+                tma_atom_SFVBase,
+                tma_atom_SFVResidual,
             ):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
@@ -1740,6 +2123,28 @@ class FlashAttentionForwardSm100:
         else:
             mma_tile_coord_v = bidx % cute.size(tiled_mma_qk.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
+        if const_expr(self.pv_nvfp4):
+            cta_rank_in_cluster = cute.arch.make_warp_uniform(
+                cute.arch.block_idx_in_cluster()
+            )
+            block_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(
+                cta_rank_in_cluster
+            )
+            block_in_cluster_coord_pv_sfb_vmnk = (
+                cta_layout_pv_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
+            )
+            pv_v_mcast_mask = cpasync.create_tma_multicast_mask(
+                cta_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+            )
+            pv_sfb_mcast_mask = cpasync.create_tma_multicast_mask(
+                cta_layout_pv_sfb_vmnk,
+                block_in_cluster_coord_pv_sfb_vmnk,
+                mcast_mode=1,
+            )
+        else:
+            pv_v_mcast_mask = None
+            pv_sfb_mcast_mask = None
+            block_in_cluster_coord_pv_sfb_vmnk = None
 
         # Alloc
         smem = cutlass.utils.SmemAllocator()
@@ -1986,11 +2391,33 @@ class FlashAttentionForwardSm100:
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
         sVq, sSFQ, sSFK, sSFV = None, None, None, None
+        sVResidual, sSFP, sSFVBase, sSFVResidual = None, None, None, None
         if const_expr(self.v_dequant):
             # Separate fp8-V staging (sVq) and dequantized bf16-V (sV) buffers.
             sV = storage.sV_dequant.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
             sVq = storage.sVq.get_tensor(sVq_layout.outer, swizzle=sVq_layout.inner)
             sSFV = storage.sSFV.get_tensor(sSFV_layout)
+        elif const_expr(self.pv_nvfp4):
+            sSFP = storage.sSFP.get_tensor(sSFP_layout)
+            sV = cute.make_tensor(
+                cute.recast_ptr(sK.iterator, sV_layout.inner, self.v_mma_dtype),
+                sV_layout.outer,
+            )
+            sVResidual = cute.make_tensor(
+                cute.recast_ptr(sK.iterator, sVResidual_layout.inner, self.v_mma_dtype)
+                + self.pv_v_residual_smem_offset,
+                sVResidual_layout.outer,
+            )
+            sSFVBase = cute.make_tensor(
+                cute.recast_ptr(sK.iterator, dtype=cutlass.Float8E4M3FN)
+                + self.pv_sfv_base_smem_offset,
+                sSFVBase_layout,
+            )
+            sSFVResidual = cute.make_tensor(
+                cute.recast_ptr(sK.iterator, dtype=cutlass.Float8E4M3FN)
+                + self.pv_sfv_residual_smem_offset,
+                sSFVResidual_layout,
+            )
         else:
             # Strip swizzle info to reuse sK's smem for V.
             sV = cute.make_tensor(
@@ -2028,6 +2455,11 @@ class FlashAttentionForwardSm100:
         thr_mma_pv_sfv = (
             tiled_mma_pv_sfv.get_slice(mma_tile_coord_v)
             if const_expr(self.v_dequant)
+            else None
+        )
+        thr_mma_pv_sfb = (
+            tiled_mma_pv_sfb.get_slice(mma_tile_coord_v)
+            if const_expr(self.pv_nvfp4)
             else None
         )
         thr_mma_pv_vq = (
@@ -2206,6 +2638,9 @@ class FlashAttentionForwardSm100:
                 mSFQ=mSFQ,
                 mSFK=mSFK,
                 mSFV=mSFV,
+                mVResidual=mVResidual,
+                mSFVBase=mSFVBase,
+                mSFVResidual=mSFVResidual,
                 sSFQ=sSFQ,
                 sSFK=sSFK,
                 sSFV=sSFV,
@@ -2213,11 +2648,24 @@ class FlashAttentionForwardSm100:
                 tma_atom_SFQ=tma_atom_SFQ,
                 tma_atom_SFK=tma_atom_SFK,
                 tma_atom_SFV=tma_atom_SFV,
+                tma_atom_VResidual=tma_atom_VResidual,
+                tma_atom_SFVBase=tma_atom_SFVBase,
+                tma_atom_SFVResidual=tma_atom_SFVResidual,
                 gmem_tiled_copy_SFQ=gmem_tiled_copy_SFQ,
                 thr_mma_qk_sfk=thr_mma_qk_sfk,
                 thr_mma_pv_sfv=thr_mma_pv_sfv,
+                thr_mma_pv_sfb=thr_mma_pv_sfb,
+                pv_v_mcast_mask=pv_v_mcast_mask,
+                pv_sfb_mcast_mask=pv_sfb_mcast_mask,
+                cta_layout_pv_sfb_vmnk=cta_layout_pv_sfb_vmnk,
+                block_in_cluster_coord_pv_sfb_vmnk=(
+                    block_in_cluster_coord_pv_sfb_vmnk
+                ),
                 pipeline_sfq=pipeline_sfq,
                 pipeline_vq=pipeline_vq,
+                sVResidual=sVResidual,
+                sSFVBase=sSFVBase,
+                sSFVResidual=sSFVResidual,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -2254,6 +2702,13 @@ class FlashAttentionForwardSm100:
                 sSFK=sSFK,
                 sSFQ_layout=sSFQ_layout,
                 sSFK_layout=sSFK_layout,
+                sVResidual=sVResidual,
+                sSFP=sSFP,
+                sSFP_layout=sSFP_layout,
+                sSFVBase=sSFVBase,
+                sSFVResidual=sSFVResidual,
+                sSFVBase_layout=sSFVBase_layout,
+                sSFVResidual_layout=sSFVResidual_layout,
                 pipeline_sfq=pipeline_sfq,
                 pipeline_sf_overlap=pipeline_sf_overlap,
                 pipeline_v_mma=pipeline_v_mma,
@@ -2303,6 +2758,9 @@ class FlashAttentionForwardSm100:
                 softmax_scale=softmax_scale,
                 descale_tensors=descale_tensors,
                 thr_mma_qk=thr_mma_qk,
+                tiled_mma_pv=tiled_mma_pv,
+                sSFP=sSFP,
+                sSFP_layout=sSFP_layout,
                 sScale=sScale,
                 mLSE=mLSE,
                 pipeline_s_p_o=pipeline_s_p_o,
@@ -2418,6 +2876,9 @@ class FlashAttentionForwardSm100:
         mSFQ: Optional[cute.Tensor] = None,
         mSFK: Optional[cute.Tensor] = None,
         mSFV: Optional[cute.Tensor] = None,
+        mVResidual: Optional[cute.Tensor] = None,
+        mSFVBase: Optional[cute.Tensor] = None,
+        mSFVResidual: Optional[cute.Tensor] = None,
         sSFQ: Optional[cute.Tensor] = None,
         sSFK: Optional[cute.Tensor] = None,
         sSFV: Optional[cute.Tensor] = None,
@@ -2425,11 +2886,22 @@ class FlashAttentionForwardSm100:
         tma_atom_SFQ: Optional[cute.CopyAtom] = None,
         tma_atom_SFK: Optional[cute.CopyAtom] = None,
         tma_atom_SFV: Optional[cute.CopyAtom] = None,
+        tma_atom_VResidual: Optional[cute.CopyAtom] = None,
+        tma_atom_SFVBase: Optional[cute.CopyAtom] = None,
+        tma_atom_SFVResidual: Optional[cute.CopyAtom] = None,
         gmem_tiled_copy_SFQ: Optional[cute.TiledCopy] = None,
         thr_mma_qk_sfk: Optional[cute.ThrMma] = None,
         thr_mma_pv_sfv: Optional[cute.ThrMma] = None,
+        thr_mma_pv_sfb: Optional[cute.ThrMma] = None,
+        pv_v_mcast_mask=None,
+        pv_sfb_mcast_mask=None,
+        cta_layout_pv_sfb_vmnk: Optional[cute.Layout] = None,
+        block_in_cluster_coord_pv_sfb_vmnk=None,
         pipeline_sfq: Optional[pipeline.PipelineAsync] = None,
         pipeline_vq: Optional[pipeline.PipelineAsync] = None,
+        sVResidual: Optional[cute.Tensor] = None,
+        sSFVBase: Optional[cute.Tensor] = None,
+        sSFVResidual: Optional[cute.Tensor] = None,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -2523,6 +2995,14 @@ class FlashAttentionForwardSm100:
                         mSFK_cur = mSFK[None, None, head_idx_kv, batch_idx]
                     if const_expr(self.v_dequant):
                         mSFV_cur = mSFV[None, None, head_idx_kv, batch_idx]
+                    if const_expr(self.pv_nvfp4):
+                        mVResidual_cur = mVResidual[
+                            None, None, head_idx_kv, batch_idx
+                        ]
+                        mSFVBase_cur = mSFVBase[None, None, head_idx_kv, batch_idx]
+                        mSFVResidual_cur = mSFVResidual[
+                            None, None, head_idx_kv, batch_idx
+                        ]
                 else:
                     mK_cur = cute.domain_offset(
                         (seqlen.offset_k, 0), mK[None, None, head_idx_kv]
@@ -2556,6 +3036,22 @@ class FlashAttentionForwardSm100:
                         mSFV_cur,
                         cute.select(self.mma_tiler_pv_sfv, mode=[1, 2]),
                         (None, 0),
+                    )
+                if const_expr(self.pv_nvfp4):
+                    gVResidual = cute.local_tile(
+                        mVResidual_cur,
+                        cute.select(self.mma_tiler_pv, mode=[1, 2]),
+                        (0, None),
+                    )
+                    gSFVBase = cute.local_tile(
+                        mSFVBase_cur,
+                        cute.select(self.mma_tiler_pv_sfb, mode=[1, 2]),
+                        (0, None),
+                    )
+                    gSFVResidual = cute.local_tile(
+                        mSFVResidual_cur,
+                        cute.select(self.mma_tiler_pv_sfb, mode=[1, 2]),
+                        (0, None),
                     )
             else:
                 # Need to keep batch coord None since we'll index into it with page idx
@@ -2632,6 +3128,9 @@ class FlashAttentionForwardSm100:
                 )
                 tKsSFK, tKgSFK = None, None
                 tVsSFV, tVgSFV = None, None
+                tVsVResidual, tVgVResidual = None, None
+                tVsSFVBase, tVgSFVBase = None, None
+                tVsSFVResidual, tVgSFVResidual = None, None
                 if const_expr(self.qk_blockscaled):
                     tSgSFK = thr_mma_qk_sfk.partition_B(gSFK)
                     tKsSFK, tKgSFK = cpasync.tma_partition(
@@ -2654,6 +3153,40 @@ class FlashAttentionForwardSm100:
                     )
                     tVsSFV = cute.filter_zeros(tVsSFV)
                     tVgSFV = cute.filter_zeros(tVgSFV)
+                if const_expr(self.pv_nvfp4):
+                    tOgVResidual = thr_mma_pv.partition_B(gVResidual)
+                    tVsVResidual, tVgVResidual = cpasync.tma_partition(
+                        tma_atom_VResidual,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sVResidual, 0, 3),
+                        cute.group_modes(tOgVResidual, 0, 3),
+                    )
+                    sfb_cta_layout = cute.make_layout(
+                        cute.slice_(
+                            cta_layout_pv_sfb_vmnk, (0, None, 0, 0)
+                        ).shape
+                    )
+                    tOgSFVBase = thr_mma_pv_sfb.partition_B(gSFVBase)
+                    tVsSFVBase, tVgSFVBase = cpasync.tma_partition(
+                        tma_atom_SFVBase,
+                        block_in_cluster_coord_pv_sfb_vmnk[1],
+                        sfb_cta_layout,
+                        cute.group_modes(sSFVBase, 0, 3),
+                        cute.group_modes(tOgSFVBase, 0, 3),
+                    )
+                    tOgSFVResidual = thr_mma_pv_sfb.partition_B(gSFVResidual)
+                    tVsSFVResidual, tVgSFVResidual = cpasync.tma_partition(
+                        tma_atom_SFVResidual,
+                        block_in_cluster_coord_pv_sfb_vmnk[1],
+                        sfb_cta_layout,
+                        cute.group_modes(sSFVResidual, 0, 3),
+                        cute.group_modes(tOgSFVResidual, 0, 3),
+                    )
+                    tVsSFVBase = cute.filter_zeros(tVsSFVBase)
+                    tVgSFVBase = cute.filter_zeros(tVgSFVBase)
+                    tVsSFVResidual = cute.filter_zeros(tVsSFVResidual)
+                    tVgSFVResidual = cute.filter_zeros(tVgSFVResidual)
                 paged_kv_manager = None
             else:
                 page_size = mK.shape[0]
@@ -2695,20 +3228,40 @@ class FlashAttentionForwardSm100:
                 sSFX=sSFK if const_expr(self.qk_blockscaled) else None,
                 stage_dilation=self.kv_size_ratio,
             )
-            load_V = partial(
-                self.load_KV,
-                tma_atom_V,
-                tVgV,
-                tVsV,
-                paged_kv_manager,
-                sV,
-                pipeline_kv=pipeline_vq if const_expr(self.v_dequant) else pipeline_kv,
-                K_or_V="V",
-                tma_atom_sf=tma_atom_SFV if const_expr(self.v_dequant) else None,
-                tXgSFX=tVgSFV if const_expr(self.v_dequant) else None,
-                tXsSFX=tVsSFV if const_expr(self.v_dequant) else None,
-                sSFX=sSFV if const_expr(self.v_dequant) else None,
-            )
+            if const_expr(self.pv_nvfp4):
+                load_V = partial(
+                    self.load_V_nvfp4,
+                    tma_atom_V,
+                    tVgV,
+                    tVsV,
+                    tma_atom_VResidual,
+                    tVgVResidual,
+                    tVsVResidual,
+                    tma_atom_SFVBase,
+                    tVgSFVBase,
+                    tVsSFVBase,
+                    tma_atom_SFVResidual,
+                    tVgSFVResidual,
+                    tVsSFVResidual,
+                    pv_v_mcast_mask,
+                    pv_sfb_mcast_mask,
+                    pipeline_kv=pipeline_kv,
+                )
+            else:
+                load_V = partial(
+                    self.load_KV,
+                    tma_atom_V,
+                    tVgV,
+                    tVsV,
+                    paged_kv_manager,
+                    sV,
+                    pipeline_kv=pipeline_vq if const_expr(self.v_dequant) else pipeline_kv,
+                    K_or_V="V",
+                    tma_atom_sf=tma_atom_SFV if const_expr(self.v_dequant) else None,
+                    tXgSFX=tVgSFV if const_expr(self.v_dequant) else None,
+                    tXsSFX=tVsSFV if const_expr(self.v_dequant) else None,
+                    sSFX=sSFV if const_expr(self.v_dequant) else None,
+                )
             if const_expr(tma_atom_bias is not None):
                 # (seqlen, rel_extent_padded)
                 mBias_cur = seqlen.offset_batch_Q(mBias, batch_idx, dim=3)[
@@ -3269,6 +3822,118 @@ class FlashAttentionForwardSm100:
         )
 
     @cute.jit
+    def make_pv_nvfp4_sf_copies(
+        self,
+        tmem_ptr,
+        stage,
+        tiled_mma_pv,
+        sSFP,
+        sSFP_layout,
+        sSFVBase,
+        sSFVResidual,
+        sSFVBase_layout,
+        sSFVResidual_layout,
+    ) -> PvNvfp4SfCopies:
+        """Materialize native P-SFA and both V-SFB operands in score-tail TMEM."""
+        tCtSFA = cute.make_tensor(
+            cute.recast_ptr(
+                tmem_ptr + self.tmem_p_sfa_offset[stage],
+                dtype=cutlass.Float8E4M3FN,
+            ),
+            blockscaled_layout.make_tmem_layout_sfa(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.pv_sf_vec_size,
+                cute.slice_(sSFP_layout, (None, None, None, 0)),
+            ),
+        )
+
+        tCtSFACompact = cute.filter_zeros(tCtSFA)
+        copy_atom_sfa = cute.make_copy_atom(
+            tcgen05.Cp4x32x128bOp(
+                tcgen05.CtaGroup.TWO
+                if self.use_2cta_instrs
+                else tcgen05.CtaGroup.ONE
+            ),
+            cutlass.Float8E4M3FN,
+        )
+        tiled_copy_sfa = tcgen05.make_s2t_copy(copy_atom_sfa, tCtSFACompact)
+        thr_copy_sfa = tiled_copy_sfa.get_slice(0)
+        tCsSFA_s2t = tcgen05.get_s2t_smem_desc_tensor(
+            tiled_copy_sfa,
+            thr_copy_sfa.partition_S(cute.filter_zeros(sSFP)),
+        )
+        tCtSFA_s2t = thr_copy_sfa.partition_D(tCtSFACompact)
+        tCtSFBBase = cute.make_tensor(
+            cute.recast_ptr(
+                tmem_ptr + self.tmem_v_sfb_base_offset[stage],
+                dtype=cutlass.Float8E4M3FN,
+            ),
+            blockscaled_layout.make_tmem_layout_sfb(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.pv_sf_vec_size,
+                cute.slice_(sSFVBase_layout, (None, None, None, 0)),
+            ),
+        )
+        tCtSFBResidual = cute.make_tensor(
+            cute.recast_ptr(
+                tmem_ptr + self.tmem_v_sfb_residual_offset[stage],
+                dtype=cutlass.Float8E4M3FN,
+            ),
+            blockscaled_layout.make_tmem_layout_sfb(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.pv_sf_vec_size,
+                cute.slice_(sSFVResidual_layout, (None, None, None, 0)),
+            ),
+        )
+
+        def make_sfb_copy(sSFB, tCtSFB):
+            tCtSFBCompact = cute.filter_zeros(tCtSFB)
+            copy_atom = cute.make_copy_atom(
+                tcgen05.Cp4x32x128bOp(
+                    tcgen05.CtaGroup.TWO
+                    if self.use_2cta_instrs
+                    else tcgen05.CtaGroup.ONE
+                ),
+                cutlass.Float8E4M3FN,
+            )
+            tiled_copy = tcgen05.make_s2t_copy(copy_atom, tCtSFBCompact)
+            thr_copy = tiled_copy.get_slice(0)
+            tCsSFB = tcgen05.get_s2t_smem_desc_tensor(
+                tiled_copy,
+                thr_copy.partition_S(cute.filter_zeros(sSFB)),
+            )
+            tCtSFBPartition = thr_copy.partition_D(tCtSFBCompact)
+            return tiled_copy, tCsSFB, tCtSFBPartition
+
+        (
+            tiled_copy_sfb_base,
+            tCsSFBBase_s2t,
+            tCtSFBBase_s2t,
+        ) = make_sfb_copy(sSFVBase, tCtSFBBase)
+        (
+            tiled_copy_sfb_residual,
+            tCsSFBResidual_s2t,
+            tCtSFBResidual_s2t,
+        ) = make_sfb_copy(sSFVResidual, tCtSFBResidual)
+        return PvNvfp4SfCopies(
+            tCtSFA=tCtSFA,
+            tiled_copy_sfa=tiled_copy_sfa,
+            tCsSFA_s2t=tCsSFA_s2t,
+            tCtSFA_s2t=tCtSFA_s2t,
+            tCtSFBBase=tCtSFBBase,
+            tCtSFBResidual=tCtSFBResidual,
+            tiled_copy_sfb_base=tiled_copy_sfb_base,
+            tiled_copy_sfb_residual=tiled_copy_sfb_residual,
+            tCsSFBBase_s2t=tCsSFBBase_s2t,
+            tCtSFBBase_s2t=tCtSFBBase_s2t,
+            tCsSFBResidual_s2t=tCsSFBResidual_s2t,
+            tCtSFBResidual_s2t=tCtSFBResidual_s2t,
+        )
+
+    @cute.jit
     def mma(
         self,
         tiled_mma_qk: cute.ThrMma,
@@ -3295,6 +3960,13 @@ class FlashAttentionForwardSm100:
         sSFK: Optional[cute.Tensor] = None,
         sSFQ_layout=None,
         sSFK_layout=None,
+        sVResidual: Optional[cute.Tensor] = None,
+        sSFP: Optional[cute.Tensor] = None,
+        sSFP_layout=None,
+        sSFVBase: Optional[cute.Tensor] = None,
+        sSFVResidual: Optional[cute.Tensor] = None,
+        sSFVBase_layout=None,
+        sSFVResidual_layout=None,
         pipeline_sfq: Optional[pipeline.PipelineAsync] = None,
         pipeline_sf_overlap: Optional[pipeline.PipelineAsync] = None,
         pipeline_v_mma: Optional[pipeline.PipelineAsync] = None,
@@ -3302,15 +3974,40 @@ class FlashAttentionForwardSm100:
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
+        tOrVResidual = (
+            tiled_mma_pv.make_fragment_B(sVResidual)
+            if const_expr(self.pv_nvfp4)
+            else None
+        )
         if const_expr(self.q_stage == 2):
             tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 1])
         else:
             tSrQs = (tSrQ[None, None, None, 0],)
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
-        pv_mma_idesc = sm100_desc.mma_op_to_idesc(pv_mma_op)
-        v_smem_base = sm100_desc.smem_desc_base_from_tensor(sV, sm100_desc.Major.MN)
-        sm100_utils.declare_ptx_idesc(pv_mma_op, var_name="fa_fwd_pv_mma_idesc")
+        if const_expr(not self.pv_nvfp4):
+            pv_mma_idesc = sm100_desc.mma_op_to_idesc(pv_mma_op)
+            v_smem_base = sm100_desc.smem_desc_base_from_tensor(
+                sV, sm100_desc.Major.MN
+            )
+            sm100_utils.declare_ptx_idesc(
+                pv_mma_op, var_name="fa_fwd_pv_mma_idesc"
+            )
+        else:
+            pv_sf_copies = [
+                self.make_pv_nvfp4_sf_copies(
+                    tmem_ptr,
+                    stage,
+                    tiled_mma_pv,
+                    sSFP,
+                    sSFP_layout,
+                    sSFVBase,
+                    sSFVResidual,
+                    sSFVBase_layout,
+                    sSFVResidual_layout,
+                )
+                for stage in range(self.q_stage)
+            ]
         # The QK PTX-descriptor path only supports the plain MMA kinds; the
         # block-scaled QK^T (MmaMXF8F6F4Op) uses cute.gemm via gemm_blockscaled
         # and must not touch _tcgen05_mma_kind / the precomputed smem desc.
@@ -3373,23 +4070,48 @@ class FlashAttentionForwardSm100:
                 )
                 for stage in range(self.q_stage)
             ]
-        gemm_Pi = [
-            partial(
-                sm100_utils.gemm_ptx_partial,
-                pv_mma_op,
-                self.tmem_o_offset[stage],
-                tOrP[None, None, None, stage],
-                sA=None,
-                split_arrive=self.split_P_arrive if self.split_P_arrive > 0 else None,
-                tA_addr=(
-                    self.tmem_p_offset[stage]
-                    if const_expr(self.qk_blockscaled or self.v_dequant)
-                    else None
-                ),
-                cta_group=self.cta_group_size,
-            )
-            for stage in range(self.q_stage)
-        ]
+        if const_expr(self.pv_nvfp4):
+            gemm_Pi = [
+                partial(
+                    sm100_utils.gemm_blockscaled,
+                    tiled_mma_pv,
+                    tOtO[None, None, None, stage],
+                    tOrP[None, None, None, stage],
+                    tCtSFA=pv_sf_copies[stage].tCtSFA,
+                    tCtSFB=pv_sf_copies[stage].tCtSFBBase,
+                )
+                for stage in range(self.q_stage)
+            ]
+            gemm_Pi_residual = [
+                partial(
+                    sm100_utils.gemm_blockscaled,
+                    tiled_mma_pv,
+                    tOtO[None, None, None, stage],
+                    tOrP[None, None, None, stage],
+                    tCtSFA=pv_sf_copies[stage].tCtSFA,
+                    tCtSFB=pv_sf_copies[stage].tCtSFBResidual,
+                    zero_init=False,
+                )
+                for stage in range(self.q_stage)
+            ]
+        else:
+            gemm_Pi = [
+                partial(
+                    sm100_utils.gemm_ptx_partial,
+                    pv_mma_op,
+                    self.tmem_o_offset[stage],
+                    tOrP[None, None, None, stage],
+                    sA=None,
+                    split_arrive=self.split_P_arrive if self.split_P_arrive > 0 else None,
+                    tA_addr=(
+                        self.tmem_p_offset[stage]
+                        if const_expr(self.qk_blockscaled or self.v_dequant)
+                        else None
+                    ),
+                    cta_group=self.cta_group_size,
+                )
+                for stage in range(self.q_stage)
+            ]
         # gemm_Pi = [
         #     partial(
         #         sm100_utils.gemm, tOtO[None, None, None, stage], tCrA=tOrP[None, None, None, stage]
@@ -3520,6 +4242,11 @@ class FlashAttentionForwardSm100:
                             mma_kv_consumer_state.phase,
                         )
                     tOrVi = tOrV[None, None, None, Vi_index]
+                    tOrViResidual = (
+                        tOrVResidual[None, None, None, Vi_index]
+                        if const_expr(self.pv_nvfp4)
+                        else None
+                    )
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # 2. acquire corrected O0/O1_partial and P0 / P1
                         # For the first iteration in this work tile, waiting for O0/O1_partial
@@ -3534,6 +4261,28 @@ class FlashAttentionForwardSm100:
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                        if const_expr(self.pv_nvfp4):
+                            cute.copy(
+                                pv_sf_copies[stage].tiled_copy_sfa,
+                                pv_sf_copies[stage].tCsSFA_s2t[
+                                    (None, None, None, None, stage)
+                                ],
+                                pv_sf_copies[stage].tCtSFA_s2t,
+                            )
+                            cute.copy(
+                                pv_sf_copies[stage].tiled_copy_sfb_base,
+                                pv_sf_copies[stage].tCsSFBBase_s2t[
+                                    (None, None, None, None, Vi_index)
+                                ],
+                                pv_sf_copies[stage].tCtSFBBase_s2t,
+                            )
+                            cute.copy(
+                                pv_sf_copies[stage].tiled_copy_sfb_residual,
+                                pv_sf_copies[stage].tCsSFBResidual_s2t[
+                                    (None, None, None, None, Vi_index)
+                                ],
+                                pv_sf_copies[stage].tCtSFBResidual_s2t,
+                            )
                         gemm_Pi[stage](
                             tCrB=tOrVi,
                             sB=sV_cur,
@@ -3546,6 +4295,11 @@ class FlashAttentionForwardSm100:
                             ),
                             mbar_phase=P_full_O_rescaled_phase,
                         )
+                        if const_expr(self.pv_nvfp4):
+                            gemm_Pi_residual[stage](
+                                tCrB=tOrViResidual,
+                                sB=sVResidual[None, None, None, Vi_index],
+                            )
                         # Don't need to signal O_full to the correction warps since the
                         # correction warps wait for the softmax warps anyway. By the time the softmax
                         # warps finished, S_i for the next iteration must have been done, so O_i-1
@@ -3639,6 +4393,11 @@ class FlashAttentionForwardSm100:
                         mma_kv_consumer_state.phase,
                     )
                 tOrVi = tOrV[None, None, None, Vi_index]
+                tOrViResidual = (
+                    tOrVResidual[None, None, None, Vi_index]
+                    if const_expr(self.pv_nvfp4)
+                    else None
+                )
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # 2. acquire corrected Oi_partial and Pi
                     pipeline_s_p_o.producer_acquire_w_index_phase(
@@ -3650,6 +4409,28 @@ class FlashAttentionForwardSm100:
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                    if const_expr(self.pv_nvfp4):
+                        cute.copy(
+                            pv_sf_copies[stage].tiled_copy_sfa,
+                            pv_sf_copies[stage].tCsSFA_s2t[
+                                (None, None, None, None, stage)
+                            ],
+                            pv_sf_copies[stage].tCtSFA_s2t,
+                        )
+                        cute.copy(
+                            pv_sf_copies[stage].tiled_copy_sfb_base,
+                            pv_sf_copies[stage].tCsSFBBase_s2t[
+                                (None, None, None, None, Vi_index)
+                            ],
+                            pv_sf_copies[stage].tCtSFBBase_s2t,
+                        )
+                        cute.copy(
+                            pv_sf_copies[stage].tiled_copy_sfb_residual,
+                            pv_sf_copies[stage].tCsSFBResidual_s2t[
+                                (None, None, None, None, Vi_index)
+                            ],
+                            pv_sf_copies[stage].tCtSFBResidual_s2t,
+                        )
                     gemm_Pi[stage](
                         tCrB=tOrVi,
                         sB=sV_cur,
@@ -3662,6 +4443,11 @@ class FlashAttentionForwardSm100:
                         ),
                         mbar_phase=P_full_O_rescaled_phase,
                     )
+                    if const_expr(self.pv_nvfp4):
+                        gemm_Pi_residual[stage](
+                            tCrB=tOrViResidual,
+                            sB=sVResidual[None, None, None, Vi_index],
+                        )
                     # 4. release accumulated O0_partial
                     # We do need O_full here since for the last tile, by the time the softmax warp
                     # has signaled to the correction warps, the softmax warp has just finished
@@ -3733,6 +4519,9 @@ class FlashAttentionForwardSm100:
         softmax_scale: Float32 | None,
         descale_tensors: Optional[DescaleTensors],
         thr_mma_qk: cute.ThrMma,
+        tiled_mma_pv: cute.TiledMma,
+        sSFP: Optional[cute.Tensor],
+        sSFP_layout,
         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
@@ -3814,6 +4603,25 @@ class FlashAttentionForwardSm100:
         )
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
         tStP_r2t = thr_tmem_store.partition_D(tStP)  # (((16,32),1),1,4)
+        if const_expr(self.pv_nvfp4):
+            # Canonical BlockScaledBasicChunk for M=128,K=128 occupies 1 KiB
+            # per stage, exposed here as 256 packed 32-bit words.  Softmax
+            # writes this shared tile; the MMA warp performs the replicated
+            # 2-CTA SFA copy into TMEM after the P-ready handoff.
+            sSFPWords = cute.make_tensor(
+                cute.recast_ptr(sSFP.iterator, dtype=Float32),
+                cute.make_layout(
+                    (
+                        self.q_stage
+                        * self.m_block_size
+                        * self.n_block_size
+                        // self.pv_sf_vec_size
+                        // 4,
+                    )
+                ),
+            )
+        else:
+            sSFPWords = None
 
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
@@ -3975,6 +4783,7 @@ class FlashAttentionForwardSm100:
                 tStS_t2r=tStS_t2r,
                 tStScale_r2t=tStScale_r2t,
                 tStP_r2t=tStP_r2t,
+                sSFPWords=sSFPWords,
                 sScale=sScale,
                 stage=stage,
                 batch_idx=batch_idx,
@@ -4268,6 +5077,7 @@ class FlashAttentionForwardSm100:
         tStS_t2r: cute.Tensor,
         tStScale_r2t: cute.Tensor,
         tStP_r2t: cute.Tensor,
+        sSFPWords: Optional[cute.Tensor],
         sScale: cute.Tensor,
         stage: int | Int32,
         batch_idx: Int32,
@@ -4415,6 +5225,7 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_mma_dtype),
             tSrS_t2r.layout,
         )
+        exp2_output = tSrS_t2r if const_expr(self.pv_nvfp4) else tSrP_r2t
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         if const_expr(mask_fn is None and self.has_bias and apply_bias):
             # The sheared bias holds -inf (the causal/local mask) only on blocks where the
@@ -4423,24 +5234,71 @@ class FlashAttentionForwardSm100:
             if bias_emu_off:
                 softmax.apply_exp2_convert(
                     tSrS_t2r,
-                    tSrP_r2t,
+                    exp2_output,
                     ex2_emu_freq=0,
                     ex2_emu_start_frg=self.ex2_emu_start_frg,
                 )
             else:
                 softmax.apply_exp2_convert(
                     tSrS_t2r,
-                    tSrP_r2t,
+                    exp2_output,
                     ex2_emu_freq=self.ex2_emu_freq,
                     ex2_emu_start_frg=self.ex2_emu_start_frg,
                 )
         else:
             softmax.apply_exp2_convert(
                 tSrS_t2r,
-                tSrP_r2t,
+                exp2_output,
                 ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None) else 0,
                 ex2_emu_start_frg=self.ex2_emu_start_frg,
             )
+        if const_expr(self.pv_nvfp4):
+            p_quant_multiplier = Float32(self.pv_p_quant_multiplier)
+            p_blocks = cute.zipped_divide(
+                tSrS_t2r, (self.pv_sf_vec_size,)
+            )
+            p_fp4_blocks = cute.zipped_divide(
+                tSrP_r2t, (self.pv_sf_vec_size,)
+            )
+            sf_words = cute.make_rmem_tensor((2,), Float32)
+            sf_values = cute.make_tensor(
+                cute.recast_ptr(sf_words.iterator, dtype=cutlass.Float8E4M3FN),
+                cute.make_layout((8,)),
+            )
+            for sf_idx in cutlass.range_constexpr(8):
+                p_block = p_blocks[None, sf_idx]
+                p_scaled = p_block.load() * p_quant_multiplier
+                amax = p_scaled.reduce(
+                    cute.ReductionOp.MAX, Float32(0.0), 0
+                )
+                sfc = (amax * Float32(1.0 / 6.0)).to(
+                    cutlass.Float8E4M3FN
+                )
+                sfc_rt = Float32(sfc)
+                # E4M3's smallest subnormal is 2^-9.  If a negligible P
+                # block still underflows after the fixed scaling, use a finite
+                # reciprocal and force its FP4 payload to zero instead of
+                # forming inf * 0 and publishing NaNs.
+                p_quant_scale = cute.arch.rcp_approx(
+                    cute.arch.fmax(sfc_rt, Float32(0.001953125))
+                )
+                mask = cute.arch.fmin(
+                    sfc_rt * Float32(1.0e30), Float32(1.0)
+                )
+                p_quant_scale = p_quant_scale * mask
+                p_fp4_blocks[None, sf_idx].store(
+                    (p_scaled * p_quant_scale).to(cutlass.Float4E2M1FN)
+                )
+                sf_values[sf_idx] = sfc
+            sf_row = thr_tmem_load.thr_idx
+            sf_word_offset = (
+                (sf_row % cute.arch.WARP_SIZE) * 4
+                + sf_row // cute.arch.WARP_SIZE
+                + stage * 256
+            )
+            sSFPWords[sf_word_offset] = sf_words[0]
+            sSFPWords[sf_word_offset + 128] = sf_words[1]
+            cute.arch.fence_view_async_shared()
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
@@ -4777,6 +5635,10 @@ class FlashAttentionForwardSm100:
                         row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0
                     )
                     scale = scale * v_descale
+                    if const_expr(self.pv_nvfp4):
+                        scale = scale * Float32(
+                            1.0 / self.pv_p_quant_multiplier
+                        )
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(
                         stage, o_corr_consumer_phase
@@ -5512,8 +6374,61 @@ class FlashAttentionForwardSm100:
                 paged_kv_manager.load_sf_KV(
                     block, sSFX[None, None, None, sf_stage], K_or_V
                 )
-            cute.arch.cp_async_commit_group()
-            pipeline_kv.sync_object_full.arrive_cp_async_mbarrier(stage)
+
+    @cute.jit
+    def load_V_nvfp4(
+        self,
+        tma_atom_VBase: cute.CopyAtom,
+        tVgVBase: cute.Tensor,
+        tVsVBase: cute.Tensor,
+        tma_atom_VResidual: cute.CopyAtom,
+        tVgVResidual: cute.Tensor,
+        tVsVResidual: cute.Tensor,
+        tma_atom_SFVBase: cute.CopyAtom,
+        tVgSFVBase: cute.Tensor,
+        tVsSFVBase: cute.Tensor,
+        tma_atom_SFVResidual: cute.CopyAtom,
+        tVgSFVResidual: cute.Tensor,
+        tVsSFVResidual: cute.Tensor,
+        v_mcast_mask,
+        sfb_mcast_mask,
+        block: Int32,
+        pipeline_kv: pipeline.PipelineAsync,
+        producer_state: pipeline.PipelineState,
+        page_idx: Optional[Int32] = None,
+    ):
+        """Publish one atomic native-V2 epoch on the production KV pipeline."""
+        assert page_idx is None, "pv_nvfp4 exact specialization does not use paged KV"
+        stage = producer_state.index
+        extra_tx_count = (
+            self.tma_copy_bytes["V"]
+            + self.tma_copy_bytes["VResidual"]
+            + self.tma_copy_bytes["SFVBase"]
+            + self.tma_copy_bytes["SFVResidual"]
+            - self.tma_copy_bytes["K"]
+        )
+        pipeline_kv.producer_acquire(
+            producer_state, extra_tx_count=extra_tx_count
+        )
+        mbar_ptr = pipeline_kv.producer_get_barrier(producer_state)
+        for tma_atom, src, dst, mcast_mask in (
+            (tma_atom_VBase, tVgVBase, tVsVBase, v_mcast_mask),
+            (tma_atom_VResidual, tVgVResidual, tVsVResidual, v_mcast_mask),
+            (tma_atom_SFVBase, tVgSFVBase, tVsSFVBase, sfb_mcast_mask),
+            (
+                tma_atom_SFVResidual,
+                tVgSFVResidual,
+                tVsSFVResidual,
+                sfb_mcast_mask,
+            ),
+        ):
+            cute.copy(
+                tma_atom,
+                src[None, block],
+                dst[None, stage],
+                tma_bar_ptr=mbar_ptr,
+                mcast_mask=mcast_mask,
+            )
 
     @cute.jit
     def offset_kv_smem(self, sX: cute.Tensor, stage: Int32, phase: Int32):

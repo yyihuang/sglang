@@ -289,6 +289,215 @@ def _group_tile_bias(qhead_per_kvhead_packgqa=1):
     return 128
 
 
+_WAN_PV_NVFP4_SHAPE = (1, 4800, 40, 128)
+_WAN_PV_NVFP4_SOFTMAX_SCALE = 1.0 / math.sqrt(_WAN_PV_NVFP4_SHAPE[-1])
+_WAN_PV_NVFP4_PADDED_SEQLEN = 4864
+_WAN_PV_NVFP4_PACKED_SHAPE = (1, 40, 128, _WAN_PV_NVFP4_PADDED_SEQLEN // 2)
+_WAN_PV_NVFP4_SF_VEC_SIZE = 16
+_WAN_PV_NVFP4_SF_NUMEL = (
+    _WAN_PV_NVFP4_SHAPE[0]
+    * _WAN_PV_NVFP4_SHAPE[2]
+    * _WAN_PV_NVFP4_SHAPE[3]
+    * (_WAN_PV_NVFP4_PADDED_SEQLEN // _WAN_PV_NVFP4_SF_VEC_SIZE)
+)
+
+
+def _validate_wan_pv_nvfp4_exact_options(
+    *,
+    softmax_scale: Optional[float],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+) -> None:
+    """Validate optional arguments that can alter the exact Wan problem."""
+    if (
+        softmax_scale is not None
+        and softmax_scale != _WAN_PV_NVFP4_SOFTMAX_SCALE
+    ):
+        raise ValueError(
+            "pv_nvfp4 softmax_scale must be None or "
+            f"1/sqrt(128) ({_WAN_PV_NVFP4_SOFTMAX_SCALE}), got {softmax_scale}"
+        )
+    for name, value in (
+        ("max_seqlen_q", max_seqlen_q),
+        ("max_seqlen_k", max_seqlen_k),
+    ):
+        if value is not None and value != _WAN_PV_NVFP4_SHAPE[1]:
+            raise ValueError(
+                f"pv_nvfp4 {name} must be None or {_WAN_PV_NVFP4_SHAPE[1]}, "
+                f"got {value}"
+            )
+
+
+def _validate_wan_pv_nvfp4_inputs(
+    *,
+    arch: int,
+    q: Optional[torch.Tensor],
+    k: Optional[torch.Tensor],
+    v: torch.Tensor,
+    out: Optional[torch.Tensor],
+    v_base: Optional[torch.Tensor],
+    v_residual: Optional[torch.Tensor],
+    sfv_base: Optional[torch.Tensor],
+    sfv_residual: Optional[torch.Tensor],
+    qv: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    page_table: Optional[torch.Tensor],
+    softmax_scale: Optional[float],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    causal: bool,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    learnable_sink: Optional[torch.Tensor],
+    softcap: Optional[float],
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    tile_mn: Optional[Tuple[int, int]],
+    score_mod: Optional[Callable],
+    mask_mod: Optional[Callable],
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch],
+    aux_tensors: Optional[list[torch.Tensor]],
+    aux_scalars: Optional[tuple],
+    q_descale: Optional[torch.Tensor],
+    k_descale: Optional[torch.Tensor],
+    v_descale: Optional[torch.Tensor],
+    gather_kv_indices: Optional[torch.Tensor],
+    rel_bias: Optional[torch.Tensor],
+    sfq: Optional[torch.Tensor],
+    sfk: Optional[torch.Tensor],
+    sfv: Optional[torch.Tensor],
+    return_lse: bool,
+    lse: Optional[torch.Tensor],
+) -> None:
+    """Fail closed around the first exact-shape Wan P1/V2 compile prototype.
+
+    The packed payload tensors retain their honest torch/TVM-FFI ABI as
+    contiguous uint8 ``[1, 40, 128, 2432]`` storage.  The SM100 kernel recasts
+    each pointer to a K(sequence)-major logical Float4E2M1FN
+    ``[128, 4864, 40, 1]`` view and consumes the first 4800 sequence values.
+    Each flat E4M3 scale tensor contains one byte per contiguous 16-value
+    sequence block; the kernel applies the native
+    ``BlockScaledBasicChunk(16)`` layout.  Padding the sequence to 4864 keeps
+    the exact-shape tail TMA in bounds.
+    """
+    _validate_wan_pv_nvfp4_exact_options(
+        softmax_scale=softmax_scale,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+    )
+    if arch != 100:
+        raise ValueError(f"pv_nvfp4 requires exact SM100, got sm_{arch}")
+    if q is None or k is None or qv is not None:
+        raise ValueError("pv_nvfp4 requires dense BF16 Q and K and does not support QV")
+    if out is None:
+        raise ValueError("pv_nvfp4 requires a caller-owned BF16 output tensor")
+
+    for name, tensor in (("q", q), ("k", k), ("v", v), ("out", out)):
+        if tuple(tensor.shape) != _WAN_PV_NVFP4_SHAPE:
+            raise ValueError(
+                f"pv_nvfp4 {name} shape must be {_WAN_PV_NVFP4_SHAPE}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if tensor.dtype != torch.bfloat16:
+            raise TypeError(f"pv_nvfp4 {name} must be BF16, got {tensor.dtype}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"pv_nvfp4 {name} must be contiguous NHD")
+
+    packed_inputs = (("v_base", v_base), ("v_residual", v_residual))
+    scale_inputs = (("sfv_base", sfv_base), ("sfv_residual", sfv_residual))
+    for name, tensor in (*packed_inputs, *scale_inputs):
+        if tensor is None:
+            raise ValueError(f"pv_nvfp4 requires explicit {name}")
+    for name, tensor in packed_inputs:
+        if tensor.dtype != torch.uint8:
+            raise TypeError(f"pv_nvfp4 {name} must be packed uint8, got {tensor.dtype}")
+        if tuple(tensor.shape) != _WAN_PV_NVFP4_PACKED_SHAPE:
+            raise ValueError(
+                f"pv_nvfp4 {name} shape must be {_WAN_PV_NVFP4_PACKED_SHAPE}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"pv_nvfp4 {name} must be contiguous")
+    for name, tensor in scale_inputs:
+        if tensor.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                f"pv_nvfp4 {name} must be E4M3 per-16 scales, got {tensor.dtype}"
+            )
+        if tuple(tensor.shape) != (_WAN_PV_NVFP4_SF_NUMEL,):
+            raise ValueError(
+                f"pv_nvfp4 {name} shape must be ({_WAN_PV_NVFP4_SF_NUMEL},), "
+                f"got {tuple(tensor.shape)}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"pv_nvfp4 {name} must be contiguous")
+
+    unsupported = {
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "seqused_q": seqused_q,
+        "seqused_k": seqused_k,
+        "page_table": page_table,
+        "learnable_sink": learnable_sink,
+        "score_mod": score_mod,
+        "mask_mod": mask_mod,
+        "block_sparse_tensors": block_sparse_tensors,
+        "aux_tensors": aux_tensors,
+        "aux_scalars": aux_scalars,
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+        "gather_kv_indices": gather_kv_indices,
+        "rel_bias": rel_bias,
+        "sfq": sfq,
+        "sfk": sfk,
+        "sfv": sfv,
+        "lse": lse,
+    }
+    enabled = [name for name, value in unsupported.items() if value is not None]
+    if enabled:
+        raise ValueError(f"pv_nvfp4 does not support: {', '.join(enabled)}")
+    if causal or window_size_left is not None or window_size_right is not None:
+        raise ValueError("pv_nvfp4 supports dense noncausal attention only")
+    if softcap not in (None, 0.0):
+        raise ValueError("pv_nvfp4 does not support softcap")
+    if num_splits != 1:
+        raise ValueError("pv_nvfp4 does not support split-KV")
+    if pack_gqa not in (None, False):
+        raise ValueError("pv_nvfp4 requires MHA without pack_gqa")
+    if tile_mn not in (None, (128, 128)):
+        raise ValueError("pv_nvfp4 requires the production 128x128 tile")
+    if return_lse:
+        raise ValueError("pv_nvfp4 does not support returning LSE")
+
+    tensors = (q, k, v, out, v_base, v_residual, sfv_base, sfv_residual)
+    if any(tensor.device != q.device for tensor in tensors):
+        raise ValueError("pv_nvfp4 inputs and output must be on one device")
+    if any(tensor.requires_grad for tensor in tensors):
+        raise ValueError("pv_nvfp4 is a forward-only inference path")
+    if not is_fake_mode():
+        if any(not tensor.is_cuda for tensor in tensors):
+            raise ValueError("pv_nvfp4 inputs and output must be CUDA tensors")
+        for name, tensor in (*packed_inputs, *scale_inputs):
+            if tensor.data_ptr() % 16:
+                raise ValueError(f"pv_nvfp4 {name} must be at least 16-byte aligned")
+        raw_ptrs = {q.data_ptr(), k.data_ptr(), v.data_ptr()}
+        workspace_ptrs = [
+            v_base.data_ptr(),
+            v_residual.data_ptr(),
+            sfv_base.data_ptr(),
+            sfv_residual.data_ptr(),
+        ]
+        if out.data_ptr() in raw_ptrs or out.data_ptr() in workspace_ptrs:
+            raise ValueError("pv_nvfp4 caller-owned output must not alias an input")
+        if len(set(workspace_ptrs)) != len(workspace_ptrs) or any(
+            pointer in raw_ptrs for pointer in workspace_ptrs
+        ):
+            raise ValueError("pv_nvfp4 workspaces must be distinct from all inputs")
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -334,6 +543,11 @@ def _flash_attn_fwd(
     qk_sf_vec_size: Optional[int] = None,
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    pv_nvfp4: bool = False,
+    v_base: Optional[torch.Tensor] = None,
+    v_residual: Optional[torch.Tensor] = None,
+    sfv_base: Optional[torch.Tensor] = None,
+    sfv_residual: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -351,12 +565,60 @@ def _flash_attn_fwd(
     """
     fake_mode = is_fake_mode()
     arch = _get_device_arch() if _arch is None else _arch
+    pv_nvfp4_inputs = (v_base, v_residual, sfv_base, sfv_residual)
+    if pv_nvfp4:
+        _validate_wan_pv_nvfp4_inputs(
+            arch=arch,
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            v_base=v_base,
+            v_residual=v_residual,
+            sfv_base=sfv_base,
+            sfv_residual=sfv_residual,
+            qv=qv,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
+            softmax_scale=softmax_scale,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            tile_mn=tile_mn,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            gather_kv_indices=gather_kv_indices,
+            rel_bias=rel_bias,
+            sfq=sfq,
+            sfk=sfk,
+            sfv=sfv,
+            return_lse=return_lse,
+            lse=lse,
+        )
+    elif any(tensor is not None for tensor in pv_nvfp4_inputs):
+        raise ValueError("pv_nvfp4 workspace tensors require pv_nvfp4=True")
     arch_forward_host = get_forward_host(arch)
     requested_num_splits = num_splits
     if (
         not fake_mode
         and arch_forward_host is not None
         and not return_lse
+        and not pv_nvfp4
         and lse is None
         and softcap in (None, 0.0)
         and all(
@@ -376,6 +638,10 @@ def _flash_attn_fwd(
                 sfq,
                 sfk,
                 sfv,
+                v_base,
+                v_residual,
+                sfv_base,
+                sfv_residual,
             )
         )
     ):
@@ -872,6 +1138,8 @@ def _flash_attn_fwd(
         arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    if pv_nvfp4 and not use_2cta_instrs:
+        raise ValueError("pv_nvfp4 requires the production SM100 2-CTA work graph")
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -1267,6 +1535,7 @@ def _flash_attn_fwd(
         sfq.ndim if sfq is not None else None,
         sfk.ndim if sfk is not None else None,
         sfv.ndim if sfv is not None else None,
+        pv_nvfp4,
         batch_invariant,
         fa_logging.get_fa_log_level(),
     )
@@ -1299,6 +1568,10 @@ def _flash_attn_fwd(
             sfq_tensor = None
             sfk_tensor = None
         sfv_tensor = to_cute_tensor(sfv) if v_blockscaled else None
+        v_base_tensor = to_cute_tensor(v_base) if pv_nvfp4 else None
+        v_residual_tensor = to_cute_tensor(v_residual) if pv_nvfp4 else None
+        sfv_base_tensor = to_cute_tensor(sfv_base) if pv_nvfp4 else None
+        sfv_residual_tensor = to_cute_tensor(sfv_residual) if pv_nvfp4 else None
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         elif lse is not None:
@@ -1492,6 +1765,7 @@ def _flash_attn_fwd(
                             q_sf_interleaved=q_sf_interleaved,
                             kv_sf_interleaved=kv_sf_interleaved,
                             batch_invariant=batch_invariant,
+                            pv_nvfp4=pv_nvfp4,
                         )
                     ),
                 )
@@ -1588,6 +1862,10 @@ def _flash_attn_fwd(
                             sfv_tensor,  # mSFV
                             qk_sf_vec_size,
                             v_sf_vec_size,
+                            v_base_tensor,  # mVBase (packed uint8 physical storage)
+                            v_residual_tensor,  # mVResidual
+                            sfv_base_tensor,  # mSFVBase (E4M3, native BasicChunk)
+                            sfv_residual_tensor,  # mSFVResidual
                         ]
                     )
             if arch_forward_host is not None:
@@ -1620,6 +1898,11 @@ def _flash_attn_fwd(
         # SF tensors are e8m0fnu; the compile-time cute tensors keep that dtype,
         # so pass them through unchanged (matches to_cute_tensor(sfq/sfk/sfv)).
         sfq_call, sfk_call, sfv_call = sfq, sfk, sfv
+        v_base_call, v_residual_call = v_base, v_residual
+        sfv_base_call, sfv_residual_call = [
+            tensor.view(torch.uint8) if tensor is not None else None
+            for tensor in (sfv_base, sfv_residual)
+        ]
         descale_tensors = (
             DescaleTensors(
                 q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
@@ -1696,6 +1979,10 @@ def _flash_attn_fwd(
                             sfq_call,  # mSFQ (None unless qk_blockscaled)
                             sfk_call,  # mSFK (None unless qk_blockscaled)
                             sfv_call,  # mSFV (None unless v_blockscaled)
+                            v_base_call,  # mVBase (None unless pv_nvfp4)
+                            v_residual_call,  # mVResidual
+                            sfv_base_call,  # mSFVBase
+                            sfv_residual_call,  # mSFVResidual
                         ]
                     )
             if arch_forward_host is not None:
