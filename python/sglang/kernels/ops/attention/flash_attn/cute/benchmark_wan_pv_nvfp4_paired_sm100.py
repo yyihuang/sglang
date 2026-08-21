@@ -193,6 +193,32 @@ def _candidate(
         raise RuntimeError("candidate did not honor the caller-owned output ABI")
 
 
+def _candidate_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    workspace: CandidateWorkspace,
+) -> None:
+    """Run only attention against an already prepared V2 workspace."""
+
+    returned_out, returned_lse = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        out=out,
+        _arch=100,
+        pack_gqa=False,
+        pv_nvfp4=True,
+        v_base=workspace.v_base,
+        v_residual=workspace.v_residual,
+        sfv_base=workspace.sfv_base,
+        sfv_residual=workspace.sfv_residual,
+    )
+    if returned_out.data_ptr() != out.data_ptr() or returned_lse is not None:
+        raise RuntimeError("candidate did not honor the caller-owned output ABI")
+
+
 def _measure_leg(fn: Callable[[], None]) -> list[float]:
     return [
         float(sample)
@@ -240,6 +266,49 @@ def _measure_order(
     }
 
 
+def _measure_components(
+    quantize_fn: Callable[[], None],
+    attention_fn: Callable[[], None],
+    fa4_fn: Callable[[], None],
+) -> dict:
+    """Attribute the complete boundary without treating parts as a speedup."""
+
+    functions = {
+        "quantizer": quantize_fn,
+        "attention": attention_fn,
+        "production_fa4": fa4_fn,
+    }
+    order = (
+        "quantizer",
+        "attention",
+        "production_fa4",
+        "production_fa4",
+        "attention",
+        "quantizer",
+    )
+    pooled = {name: [] for name in functions}
+    legs = []
+    for leg_index, name in enumerate(order):
+        samples = _measure_leg(functions[name])
+        pooled[name].extend(samples)
+        legs.append(
+            {
+                "leg": leg_index,
+                "component": name,
+                "median_ms": statistics.median(samples),
+                "samples_ms": samples,
+            }
+        )
+    medians = {name: statistics.median(samples) for name, samples in pooled.items()}
+    return {
+        "diagnostic_only": True,
+        "order": "/".join(order),
+        "legs": legs,
+        "pooled_median_ms": medians,
+        "quantizer_plus_attention_ms": medians["quantizer"] + medians["attention"],
+    }
+
+
 def main() -> None:
     cupti_version = _require_cupti()
     if "out" in inspect.signature(fp4_quantize).parameters:
@@ -280,6 +349,10 @@ def main() -> None:
     candidate_fn = lambda: _candidate(
         q, k, v, v_rows_source, out_candidate, workspace
     )
+    quantize_fn = lambda: _quantize_v2_into(v_rows_source, workspace)
+    attention_fn = lambda: _candidate_attention(
+        q, k, v, out_candidate, workspace
+    )
     fa4_fn = lambda: _production_fa4(q, k, v, out_fa4)
 
     # Materialize JIT kernels and allocator pools before either paired order.
@@ -288,6 +361,7 @@ def main() -> None:
     candidate_fn()
     torch.cuda.synchronize()
 
+    components = _measure_components(quantize_fn, attention_fn, fa4_fn)
     orders = [
         _measure_order(order, candidate_fn, fa4_fn) for order in _PAIRED_ORDERS
     ]
@@ -338,6 +412,7 @@ def main() -> None:
             ),
         },
         "cupti_python_version": cupti_version,
+        "components": components,
         "orders": orders,
     }
     print(json.dumps(report, indent=2, sort_keys=True))
