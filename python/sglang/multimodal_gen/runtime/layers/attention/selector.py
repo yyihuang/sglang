@@ -203,7 +203,10 @@ def get_attn_backend(
     allowed_fallback_reason = None
     if selected_backend is None:
         allowed_fallback_reason = "platform default fallback"
-    elif is_cross_attention and selected_backend.is_sparse:
+    elif is_cross_attention and (
+        selected_backend.is_sparse
+        or selected_backend == AttentionBackendEnum.WAN_HYBRID
+    ):
         allowed_fallback_reason = "dense cross-attention fallback"
     elif selected_from_global_cli and (
         default_attention_backend is not None

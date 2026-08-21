@@ -69,6 +69,16 @@ class _FakeAITERBackend:
         return ("packed varlen attention",) if requirements.packed_varlen else ()
 
 
+class _FakeWanHybridBackend:
+    @classmethod
+    def get_enum(cls) -> AttentionBackendEnum:
+        return AttentionBackendEnum.WAN_HYBRID
+
+    @classmethod
+    def unsupported_requirements(cls, _requirements) -> tuple[str, ...]:
+        return ()
+
+
 class _FakeSparseBackend:
     @classmethod
     def get_enum(cls) -> AttentionBackendEnum:
@@ -88,6 +98,8 @@ class _FakePlatform:
         cls.selected_backend = selected_backend
         if selected_backend == AttentionBackendEnum.AITER:
             return "fake.AITERBackend"
+        if selected_backend == AttentionBackendEnum.WAN_HYBRID:
+            return "fake.WanHybridBackend"
         if selected_backend == AttentionBackendEnum.LASER_ATTN:
             return "fake.SparseBackend"
         if selected_backend in (None, AttentionBackendEnum.FA):
@@ -100,6 +112,7 @@ _FAKE_BACKENDS = {
     "fake.FABackend": _FakeFABackend,
     "fake.SparseBackend": _FakeSparseBackend,
     "fake.SDPABackend": _FakeSDPABackend,
+    "fake.WanHybridBackend": _FakeWanHybridBackend,
 }
 
 
@@ -271,6 +284,27 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 is_cross_attention=False,
                 supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
             )
+
+    def test_wan_hybrid_falls_back_for_cross_attention(self):
+        backend = self._resolve(
+            AttentionBackendEnum.WAN_HYBRID,
+            explicit=True,
+            is_cross_attention=True,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        )
+
+        self.assertIs(backend, _FakeFABackend)
+        self.assertIsNone(_FakePlatform.selected_backend)
+
+    def test_wan_hybrid_remains_strict_for_self_attention(self):
+        backend = self._resolve(
+            AttentionBackendEnum.WAN_HYBRID,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.WAN_HYBRID},
+        )
+
+        self.assertIs(backend, _FakeWanHybridBackend)
 
 
 class TestComponentAttentionBackendScope(unittest.TestCase):

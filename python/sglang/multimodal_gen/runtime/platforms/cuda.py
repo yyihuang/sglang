@@ -114,6 +114,38 @@ class _DynamicCudnnSDPAAttentionBackendResolver(_DirectCudaAttentionBackendResol
     backend_cls_str = _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR
 
 
+class _WanHybridAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.WAN_HYBRID
+    required_capabilities = {(10, 0), (10, 3)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        if capability is None or tuple(capability) not in cls.required_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "Wan hybrid attention requires compute capability 10.0 or 10.3; "
+                f"this device reports {found}."
+            )
+        try:
+            from flashinfer import (
+                WanHybridAttentionWorkspace,  # noqa: F401
+                is_wan_hybrid_attention_available,
+                wan_hybrid_attention,  # noqa: F401
+            )
+        except ImportError as error:
+            raise ImportError(
+                "Wan hybrid attention requires a FlashInfer build that exports "
+                "the public wan_hybrid attention API."
+            ) from error
+        if not is_wan_hybrid_attention_available():
+            raise RuntimeError(
+                "Wan hybrid attention requires an installed FlashInfer "
+                "wan_hybrid implementation."
+            )
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid.WanHybridAttentionBackend"
+
+
 class _SparseLinearAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SLA_ATTN
     backend_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
@@ -378,6 +410,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _TorchSDPAAttentionBackendResolver,
         _TorchCudnnSDPAAttentionBackendResolver,
         _DynamicCudnnSDPAAttentionBackendResolver,
+        _WanHybridAttentionBackendResolver,
         _SparseLinearAttentionBackendResolver,
         _SageSparseLinearAttentionBackendResolver,
         _SlidingTileAttentionBackendResolver,
