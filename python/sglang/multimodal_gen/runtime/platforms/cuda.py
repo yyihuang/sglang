@@ -128,12 +128,21 @@ class _CakeNVFP4AttentionBackendResolver(_CudaAttentionBackendResolver):
                 f"this device reports {found}."
             )
         try:
-            from flashinfer import nvfp4_attention  # noqa: F401
+            from flashinfer import (
+                WanHybridAttentionWorkspace,  # noqa: F401
+                is_wan_hybrid_attention_available,
+                wan_hybrid_attention,  # noqa: F401
+            )
         except ImportError as error:
             raise ImportError(
                 "Cake NVFP4 attention requires a FlashInfer build that exports "
-                "flashinfer.nvfp4_attention."
+                "the public wan_hybrid attention API."
             ) from error
+        if not is_wan_hybrid_attention_available():
+            raise RuntimeError(
+                "Cake NVFP4 attention requires an installed FlashInfer "
+                "wan_hybrid implementation."
+            )
         return "sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4.CakeNVFP4AttentionBackend"
 
 

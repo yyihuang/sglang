@@ -765,37 +765,6 @@ class USPAttention(nn.Module):
             USPAttention._usp_a2a_stream = torch.get_device_module().Stream()
         return USPAttention._usp_a2a_stream
 
-    def forward_wan_projections(
-        self,
-        query_projection: torch.Tensor,
-        key_projection: torch.Tensor,
-        value_projection: torch.Tensor,
-        q_weight: torch.Tensor,
-        k_weight: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
-        *,
-        eps: float,
-    ) -> torch.Tensor:
-        """Bypass materialized Q/K norm+RoPE for the Cake Wan specialization."""
-
-        if self.backend != AttentionBackendEnum.CAKE_NVFP4:
-            raise RuntimeError(
-                "forward_wan_projections is available only on CAKE_NVFP4"
-            )
-        if get_sequence_parallel_world_size() != 1:
-            raise NotImplementedError(
-                "Cake fused Wan projection serving requires sequence parallel size 1"
-            )
-        return self.attn_impl.forward_wan_projections(
-            query_projection,
-            key_projection,
-            value_projection,
-            q_weight,
-            k_weight,
-            cos_sin_cache,
-            eps=eps,
-        )
-
     def forward(
         self,
         q: torch.Tensor,

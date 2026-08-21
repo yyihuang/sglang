@@ -129,7 +129,9 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
 
     def test_cake_nvfp4_resolver_accepts_sm100_and_sm103(self):
         flashinfer = types.ModuleType("flashinfer")
-        flashinfer.nvfp4_attention = object()
+        flashinfer.WanHybridAttentionWorkspace = object()
+        flashinfer.wan_hybrid_attention = object()
+        flashinfer.is_wan_hybrid_attention_available = lambda: True
         expected = "sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4.CakeNVFP4AttentionBackend"
         with patch.dict(sys.modules, {"flashinfer": flashinfer}):
             for capability in (DeviceCapability(10, 0), DeviceCapability(10, 3)):
@@ -142,6 +144,18 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                         _CakeNVFP4AttentionBackendResolver.resolve(FakeCudaPlatform),
                         expected,
                     )
+
+    def test_cake_nvfp4_resolver_fails_closed_without_public_impl(self):
+        flashinfer = types.ModuleType("flashinfer")
+        flashinfer.WanHybridAttentionWorkspace = object()
+        flashinfer.wan_hybrid_attention = object()
+        flashinfer.is_wan_hybrid_attention_available = lambda: False
+        with patch.dict(sys.modules, {"flashinfer": flashinfer}), patch.object(
+            FakeCudaPlatform,
+            "get_device_capability",
+            return_value=DeviceCapability(10, 0),
+        ), self.assertRaisesRegex(RuntimeError, "installed FlashInfer"):
+            _CakeNVFP4AttentionBackendResolver.resolve(FakeCudaPlatform)
 
     def test_cake_nvfp4_resolver_rejects_other_architectures(self):
         with patch.object(
