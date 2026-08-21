@@ -1,0 +1,506 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import argparse
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
+
+from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
+    MODEL_QUALIFICATION_THRESHOLDS,
+    _cosine_similarity,
+    _extract_wan_hybrid_hit_count,
+    _extract_generation_time_s,
+    _with_candidate_backend_hit_qualification,
+    build_sampling_kwargs,
+    build_server_kwargs,
+    evaluate_candidate_backend_hit_qualification,
+    evaluate_correctness_qualification,
+    evaluate_dual_order_performance_qualification,
+    evaluate_performance_qualification,
+    summarize_cross_variant_metrics,
+    summarize_run_repeatability,
+    validate_qualification_protocol,
+)
+
+
+def _args(**overrides):
+    defaults = {
+        "model_path": "model",
+        "model_id": None,
+        "backend": "sglang",
+        "num_gpus": 1,
+        "master_port": None,
+        "dit_cpu_offload": False,
+        "dit_layerwise_offload": False,
+        "text_encoder_cpu_offload": False,
+        "vae_cpu_offload": False,
+        "pin_cpu_memory": False,
+        "enable_cfg_parallel": False,
+        "ulysses_degree": 1,
+        "sp_degree": None,
+        "reference_transformer_path": None,
+        "candidate_transformer_path": None,
+        "reference_component_path": [],
+        "candidate_component_path": [],
+        "reference_attention_backend": None,
+        "candidate_attention_backend": None,
+        "reference_attention_backend_config": None,
+        "candidate_attention_backend_config": None,
+        "reference_component_attention_backend": [],
+        "candidate_component_attention_backend": [],
+    }
+    return argparse.Namespace(**(defaults | overrides))
+
+
+def test_build_server_kwargs_forwards_attention_backend_per_variant():
+    args = _args(
+        reference_attention_backend="dynamic_cudnn_sdpa",
+        candidate_attention_backend="wan_hybrid",
+    )
+
+    reference = build_server_kwargs(args, variant="reference")
+    candidate = build_server_kwargs(args, variant="candidate")
+
+    assert reference["attention_backend"] == "dynamic_cudnn_sdpa"
+    assert candidate["attention_backend"] == "wan_hybrid"
+
+
+def test_build_server_kwargs_forwards_master_port():
+    args = _args(master_port=31005)
+
+    assert build_server_kwargs(args, variant="reference")["master_port"] == 31005
+    assert build_server_kwargs(args, variant="candidate")["master_port"] == 31005
+
+
+def test_build_server_kwargs_omits_unspecified_attention_backend():
+    args = _args()
+
+    assert "attention_backend" not in build_server_kwargs(args, variant="reference")
+    assert "attention_backend" not in build_server_kwargs(args, variant="candidate")
+
+
+def test_build_server_kwargs_forwards_component_attention_backends():
+    args = _args(
+        candidate_attention_backend="fa",
+        candidate_component_attention_backend=[
+            "transformer=wan_hybrid",
+            "transformer_2=fa",
+        ],
+    )
+
+    candidate = build_server_kwargs(args, variant="candidate")
+
+    assert candidate["attention_backend"] == "fa"
+    assert candidate["component_attention_backends"] == {
+        "transformer": "wan_hybrid",
+        "transformer_2": "fa",
+    }
+
+
+def test_build_server_kwargs_forwards_attention_backend_config():
+    args = _args(
+        candidate_attention_backend="fa",
+        candidate_attention_backend_config=(
+            '{"wan_hybrid_min_timestep": 975}'
+        ),
+    )
+
+    candidate = build_server_kwargs(args, variant="candidate")
+
+    assert candidate["attention_backend_config"] == (
+        '{"wan_hybrid_min_timestep":975}'
+    )
+
+
+def test_build_server_kwargs_rejects_non_object_attention_backend_config():
+    args = _args(candidate_attention_backend_config="[975]")
+
+    with pytest.raises(ValueError, match="must decode to a JSON object"):
+        build_server_kwargs(args, variant="candidate")
+
+
+def test_extract_generation_time_prefers_populated_public_field():
+    result = SimpleNamespace(
+        generation_time=1.25,
+        metrics={"total_duration_ms": 2500.0},
+    )
+
+    assert _extract_generation_time_s(result) == 1.25
+
+
+def test_extract_generation_time_falls_back_to_scheduler_metrics():
+    result = SimpleNamespace(
+        generation_time=0.0,
+        metrics={"total_duration_ms": 2500.0},
+    )
+
+    assert _extract_generation_time_s(result) == 2.5
+
+
+def test_extract_generation_time_rejects_missing_measurement():
+    result = SimpleNamespace(generation_time=0.0, metrics={})
+
+    with pytest.raises(ValueError, match="neither a positive generation_time"):
+        _extract_generation_time_s(result)
+
+
+def test_extract_wan_hybrid_hit_count_requires_integer_metric():
+    assert (
+        _extract_wan_hybrid_hit_count(
+            SimpleNamespace(metrics={"wan_hybrid_hit_count": 7})
+        )
+        == 7
+    )
+    for metrics in (
+        {},
+        {"wan_hybrid_hit_count": None},
+        {"wan_hybrid_hit_count": True},
+    ):
+        assert _extract_wan_hybrid_hit_count(SimpleNamespace(metrics=metrics)) is None
+
+
+def test_request_metrics_transports_wan_hybrid_hit_count():
+    metrics = RequestMetrics("request")
+
+    assert metrics.to_dict()["wan_hybrid_hit_count"] == 0
+    metrics.wan_hybrid_hit_count = 11
+    assert metrics.to_dict()["wan_hybrid_hit_count"] == 11
+
+
+def _generation_result(latent_offset=0.0, frame_offset=0):
+    return SimpleNamespace(
+        trajectory_latents=torch.tensor(
+            [[[[1.0 + latent_offset, 2.0], [3.0, 4.0]]]]
+        ),
+        trajectory_timesteps=torch.tensor([1.0]),
+        frames=[np.full((2, 2, 3), 10 + frame_offset, dtype=np.uint8)],
+        samples=None,
+        output_file_path=None,
+    )
+
+
+def test_summarize_run_repeatability_reports_same_variant_envelope():
+    repeatability = summarize_run_repeatability(
+        [_generation_result(), _generation_result(0.25, 2)]
+    )
+
+    assert repeatability["available"] is True
+    assert repeatability["num_runs"] == 2
+    assert repeatability["pairing"] == "all-pairs"
+    assert repeatability["num_pairs"] == 1
+    assert repeatability["envelope"]["max_selected_trajectory_mae"] == pytest.approx(
+        0.0625
+    )
+    assert repeatability["envelope"]["max_all_frames_mae"] == pytest.approx(2.0)
+
+
+def test_summarize_run_repeatability_uses_every_pair_and_every_step():
+    run0 = _generation_result()
+    run1 = _generation_result(1.0, 2)
+    run2 = _generation_result(-1.0, -2)
+    run1.trajectory_latents = torch.cat(
+        (run1.trajectory_latents, run0.trajectory_latents), dim=1
+    )
+    run2.trajectory_latents = torch.cat(
+        (run2.trajectory_latents, run0.trajectory_latents), dim=1
+    )
+    run0.trajectory_latents = torch.cat(
+        (run0.trajectory_latents, run0.trajectory_latents), dim=1
+    )
+    for result in (run0, run1, run2):
+        result.trajectory_timesteps = torch.tensor([2.0, 1.0])
+
+    repeatability = summarize_run_repeatability(
+        [run0, run1, run2], step_index=-1
+    )
+
+    assert repeatability["num_pairs"] == 3
+    assert repeatability["envelope"]["max_selected_trajectory_mae"] == 0.0
+    assert repeatability["envelope"][
+        "max_all_steps_trajectory_mae"
+    ] == pytest.approx(0.5)
+    assert repeatability["envelope"]["max_all_frames_mae"] == pytest.approx(4.0)
+
+
+def test_summarize_cross_variant_metrics_uses_cross_product():
+    summary = summarize_cross_variant_metrics(
+        [_generation_result(), _generation_result(0.25, 1)],
+        [
+            _generation_result(0.5, 2),
+            _generation_result(0.75, 3),
+            _generation_result(1.0, 4),
+        ],
+    )
+
+    assert summary["pairing"] == "cross-product"
+    assert summary["num_pairs"] == 6
+    assert summary["envelope"]["max_all_frames_mae"] == pytest.approx(4.0)
+
+
+def test_summarize_run_repeatability_requires_two_runs():
+    repeatability = summarize_run_repeatability([_generation_result()])
+
+    assert repeatability == {
+        "available": False,
+        "num_runs": 1,
+        "reason": "repeatability requires at least two measured runs",
+    }
+
+
+def _correctness_qualification(reference_results, candidate_results):
+    return evaluate_correctness_qualification(
+        summarize_cross_variant_metrics(reference_results, candidate_results),
+        {
+            "reference": summarize_run_repeatability(reference_results),
+            "candidate": summarize_run_repeatability(candidate_results),
+        },
+    )
+
+
+def test_correctness_qualification_passes_all_pairs_and_exact_repeatability():
+    reference_results = [_generation_result(), _generation_result()]
+    candidate_results = [_generation_result(0.08), _generation_result(0.08)]
+
+    qualification = _correctness_qualification(
+        reference_results, candidate_results
+    )
+
+    assert qualification["passed"] is True
+    assert qualification["failures"] == []
+    assert qualification["thresholds"] == MODEL_QUALIFICATION_THRESHOLDS
+
+
+def test_correctness_qualification_fails_closed_on_quality_and_repeatability():
+    reference_results = [_generation_result(), _generation_result()]
+    candidate_results = [_generation_result(0.25), _generation_result(0.5)]
+
+    qualification = _correctness_qualification(
+        reference_results, candidate_results
+    )
+
+    assert qualification["passed"] is False
+    reasons = {failure["reason"] for failure in qualification["failures"]}
+    assert "mae_above_maximum" in reasons
+    assert "repeatability_mismatch" in reasons
+
+
+def test_correctness_qualification_fails_closed_on_non_finite_trajectory():
+    reference_results = [_generation_result(), _generation_result()]
+    candidate_results = [_generation_result(), _generation_result()]
+    candidate_results[0].trajectory_latents[0, 0, 0, 0] = float("nan")
+
+    qualification = _correctness_qualification(
+        reference_results, candidate_results
+    )
+
+    assert qualification["passed"] is False
+    assert any(
+        failure["reason"] == "non_finite_trajectory"
+        for failure in qualification["failures"]
+    )
+
+
+def test_correctness_qualification_requires_same_instance_repeatability():
+    result = _generation_result()
+    qualification = evaluate_correctness_qualification(
+        summarize_cross_variant_metrics([result], [result]),
+        {
+            "reference": summarize_run_repeatability([result]),
+            "candidate": summarize_run_repeatability([result]),
+        },
+    )
+
+    assert qualification["passed"] is False
+    assert {
+        failure["scope"] for failure in qualification["failures"]
+    } == {"reference_repeatability", "candidate_repeatability"}
+
+
+@pytest.mark.parametrize(
+    ("speedup", "passed"),
+    [
+        (1.0, True),
+        (1.01, True),
+        (0.999, False),
+        (float("nan"), False),
+        (None, False),
+        (True, False),
+    ],
+)
+def test_performance_qualification_enforces_finite_speedup_floor(speedup, passed):
+    qualification = evaluate_performance_qualification(
+        {"wall_median_speedup": speedup}
+    )
+
+    assert qualification["passed"] is passed
+
+
+def _performance_order_result(
+    *,
+    speedup=1.0,
+    hit_counts=None,
+    warmup_runs=2,
+    measure_runs=5,
+):
+    if hit_counts is None:
+        hit_counts = [1] * measure_runs
+    generation = {
+        "warmup_runs": warmup_runs,
+        "measure_runs": measure_runs,
+    }
+    return {
+        "reference_generation": dict(generation),
+        "candidate_generation": generation
+        | {"per_run_wan_hybrid_hit_count": hit_counts},
+        "performance": {"wall_median_speedup": speedup},
+    }
+
+
+def test_qualification_protocol_requires_two_five_and_dual_performance_order():
+    validate_qualification_protocol(
+        comparison_mode="performance",
+        run_order="both",
+        warmup_runs=2,
+        measure_runs=5,
+    )
+
+    invalid_protocols = (
+        {"run_order": "both", "warmup_runs": 1, "measure_runs": 5},
+        {"run_order": "both", "warmup_runs": 2, "measure_runs": 4},
+        {
+            "run_order": "reference-first",
+            "warmup_runs": 2,
+            "measure_runs": 5,
+        },
+    )
+    for protocol in invalid_protocols:
+        with pytest.raises(ValueError, match="Invalid qualification protocol"):
+            validate_qualification_protocol(
+                comparison_mode="performance", **protocol
+            )
+
+    validate_qualification_protocol(
+        comparison_mode="correctness",
+        run_order="reference-first",
+        warmup_runs=2,
+        measure_runs=5,
+    )
+    with pytest.raises(ValueError, match="warmup_runs must be >= 2"):
+        validate_qualification_protocol(
+            comparison_mode="correctness",
+            run_order="reference-first",
+            warmup_runs=1,
+            measure_runs=5,
+        )
+
+
+def test_dual_order_performance_qualification_requires_both_passing_orders():
+    qualification = evaluate_dual_order_performance_qualification(
+        {
+            "reference-first": _performance_order_result(speedup=1.01),
+            "candidate-first": _performance_order_result(speedup=1.02),
+        }
+    )
+
+    assert qualification["passed"] is True
+    assert qualification["failures"] == []
+
+
+def test_dual_order_performance_qualification_fails_closed():
+    qualification = evaluate_dual_order_performance_qualification(
+        {
+            "reference-first": _performance_order_result(
+                speedup=0.99, hit_counts=[1, 1, 0, 1]
+            ),
+        }
+    )
+
+    assert qualification["passed"] is False
+    reasons = {failure["reason"] for failure in qualification["failures"]}
+    assert reasons == {
+        "wall_median_speedup_below_minimum",
+        "candidate_hit_count_cardinality_mismatch",
+        "candidate_hit_count_not_positive",
+        "missing_run_order_result",
+    }
+
+
+@pytest.mark.parametrize(
+    ("hit_counts", "passed"),
+    [
+        ([1], True),
+        ([1, 4, 2], True),
+        ([0], False),
+        ([1, 0], False),
+        ([None], False),
+        (None, False),
+    ],
+)
+def test_candidate_backend_hit_qualification_requires_every_run(hit_counts, passed):
+    qualification = evaluate_candidate_backend_hit_qualification(hit_counts)
+
+    assert qualification["passed"] is passed
+
+
+def test_candidate_backend_hit_failure_is_part_of_overall_qualification():
+    qualification = _with_candidate_backend_hit_qualification(
+        {"passed": True, "failures": [], "thresholds": {}}, [0]
+    )
+
+    assert qualification["passed"] is False
+    assert qualification["failures"] == [
+        {
+            "scope": "candidate_backend_hits",
+            "reason": "candidate_hit_count_not_positive",
+            "run_index": 0,
+            "hit_count": 0,
+        }
+    ]
+
+
+def test_cosine_similarity_is_clamped_to_valid_metric_range(monkeypatch):
+    monkeypatch.setattr(
+        torch.nn.functional,
+        "cosine_similarity",
+        lambda *args, **kwargs: torch.tensor(1.0001),
+    )
+
+    assert _cosine_similarity(torch.ones(2), torch.ones(2)) == 1.0
+
+
+def _sampling_args(**overrides):
+    defaults = {
+        "prompt": "prompt",
+        "width": 640,
+        "height": 384,
+        "num_inference_steps": 12,
+        "guidance_scale": 4.0,
+        "seed": 0,
+        "return_trajectory_decoded": False,
+        "num_frames": 17,
+        "guidance_scale_2": 3.0,
+        "comparison_mode": "correctness",
+    }
+    return argparse.Namespace(**(defaults | overrides))
+
+
+def test_build_sampling_kwargs_captures_trajectory_for_correctness():
+    kwargs = build_sampling_kwargs(_sampling_args())
+
+    assert kwargs["return_frames"] is True
+    assert kwargs["return_trajectory_latents"] is True
+
+
+def test_build_sampling_kwargs_disables_trajectory_for_performance():
+    kwargs = build_sampling_kwargs(
+        _sampling_args(
+            comparison_mode="performance", return_trajectory_decoded=True
+        )
+    )
+
+    assert kwargs["return_frames"] is True
+    assert kwargs["return_trajectory_latents"] is False
+    assert kwargs["return_trajectory_decoded"] is False

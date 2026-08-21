@@ -77,6 +77,44 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
+### Wan hybrid attention for Wan
+
+On B200/GB200 (`sm_100`) and B300/GB300 (`sm_103`), a FlashInfer build that
+exports the public `flashinfer.wan_hybrid_attention` API can run the exact Wan
+self-attention shape through the explicit hybrid backend:
+
+```bash
+sglang generate \
+  --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
+  --attention-backend wan_hybrid \
+  --prompt "A curious raccoon walks through a sunlit forest" \
+  --save-output
+```
+
+The backend is intentionally fail-closed: it accepts caller-owned contiguous
+BF16 NHD Q/K/V and output at exactly `B=1, S=4800, H=40, D=128`, with
+noncausal dense self-attention and the default `1 / sqrt(128)` score scale.
+Q/K remain BF16; FlashInfer owns the reusable FP4 V/P workspace and writes
+directly into the caller's BF16 output. Wan cross-attention continues to use
+the normal dense backend because its query and KV sequence lengths differ.
+Packed-varlen, masks, GQA/MQA, and ring attention are not supported.
+
+This integration remains explicit opt-in and the production route stays on FA.
+Complete all-step/all-pair diffusion trajectories and generated frames must be
+qualified against that production route; isolated attention accuracy is not a
+model-level correctness claim. The
+`wan_hybrid_min_timestep` and `wan_hybrid_layer_indices` backend options are
+diagnostic gates. A run is not a valid hybrid qualification unless its reported
+`wan_hybrid_hit_count` is greater than zero.
+
+Use `compare_diffusion_trajectory_similarity` for model-level qualification.
+The tool requires at least two warmup runs and five measured runs. Correctness
+captures every trajectory step and evaluates every same-variant and
+cross-variant run pair. Performance disables trajectory capture, executes both
+reference-first and candidate-first orders, and passes only when both median
+speedups are at least 1.0 and every measured candidate run reports a positive
+backend hit count.
+
 ### Component residency
 
 Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each
