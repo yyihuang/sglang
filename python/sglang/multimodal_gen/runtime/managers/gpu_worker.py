@@ -123,8 +123,17 @@ def _create_wan_hybrid_evidence_collectors(
 def _publish_wan_hybrid_evidence(
     output_metrics: list[Any],
     collectors_by_request_id: dict[str, WanHybridEvidenceCollector],
+    *,
+    require_complete: bool = True,
 ) -> None:
+    observed_request_ids: set[str] = set()
     for metrics in output_metrics:
+        if metrics.request_id in observed_request_ids:
+            raise RuntimeError(
+                "Wan hybrid evidence cannot publish duplicate output request_id "
+                f"{metrics.request_id!r}"
+            )
+        observed_request_ids.add(metrics.request_id)
         collector = collectors_by_request_id.get(metrics.request_id)
         if collector is None:
             raise RuntimeError(
@@ -133,6 +142,13 @@ def _publish_wan_hybrid_evidence(
             )
         metrics.wan_hybrid_hit_count = collector.hit_count()
         metrics.wan_hybrid_coverage = collector.coverage()
+    if require_complete:
+        missing_request_ids = set(collectors_by_request_id) - observed_request_ids
+        if missing_request_ids:
+            raise RuntimeError(
+                "Wan hybrid evidence outputs omitted request_id values: "
+                f"{sorted(missing_request_ids)}"
+            )
 
 
 @dataclass
@@ -552,7 +568,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if return_req and isinstance(result, Req):
                 if result.metrics is not None:
                     _publish_wan_hybrid_evidence(
-                        [result.metrics], collectors_by_request_id
+                        [result.metrics],
+                        collectors_by_request_id,
+                        require_complete=False,
                     )
                 return result
 
