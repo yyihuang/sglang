@@ -10,7 +10,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 )
 from sglang.multimodal_gen.runtime.platforms.cuda import (
     CudaPlatformBase,
-    _CakeNVFP4AttentionBackendResolver,
+    _WanHybridAttentionBackendResolver,
     _SageAttentionBackendResolver,
 )
 from sglang.multimodal_gen.runtime.platforms.interface import (
@@ -127,12 +127,12 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)
 
-    def test_cake_nvfp4_resolver_accepts_sm100_and_sm103(self):
+    def test_wan_hybrid_resolver_accepts_sm100_and_sm103(self):
         flashinfer = types.ModuleType("flashinfer")
         flashinfer.WanHybridAttentionWorkspace = object()
         flashinfer.wan_hybrid_attention = object()
         flashinfer.is_wan_hybrid_attention_available = lambda: True
-        expected = "sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4.CakeNVFP4AttentionBackend"
+        expected = "sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid.WanHybridAttentionBackend"
         with patch.dict(sys.modules, {"flashinfer": flashinfer}):
             for capability in (DeviceCapability(10, 0), DeviceCapability(10, 3)):
                 with self.subTest(capability=capability), patch.object(
@@ -141,11 +141,11 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                     return_value=capability,
                 ):
                     self.assertEqual(
-                        _CakeNVFP4AttentionBackendResolver.resolve(FakeCudaPlatform),
+                        _WanHybridAttentionBackendResolver.resolve(FakeCudaPlatform),
                         expected,
                     )
 
-    def test_cake_nvfp4_resolver_fails_closed_without_public_impl(self):
+    def test_wan_hybrid_resolver_fails_closed_without_public_impl(self):
         flashinfer = types.ModuleType("flashinfer")
         flashinfer.WanHybridAttentionWorkspace = object()
         flashinfer.wan_hybrid_attention = object()
@@ -155,15 +155,15 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             "get_device_capability",
             return_value=DeviceCapability(10, 0),
         ), self.assertRaisesRegex(RuntimeError, "installed FlashInfer"):
-            _CakeNVFP4AttentionBackendResolver.resolve(FakeCudaPlatform)
+            _WanHybridAttentionBackendResolver.resolve(FakeCudaPlatform)
 
-    def test_cake_nvfp4_resolver_rejects_other_architectures(self):
+    def test_wan_hybrid_resolver_rejects_other_architectures(self):
         with patch.object(
             FakeCudaPlatform,
             "get_device_capability",
             return_value=DeviceCapability(12, 0),
         ), self.assertRaisesRegex(ValueError, "10.0 or 10.3"):
-            _CakeNVFP4AttentionBackendResolver.resolve(FakeCudaPlatform)
+            _WanHybridAttentionBackendResolver.resolve(FakeCudaPlatform)
 
     def test_hopper_sage_attention_without_sm90_fix_falls_back(self):
         FakeCudaPlatform.is_hopper_device = True

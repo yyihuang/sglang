@@ -55,10 +55,10 @@ class _FakeAITERBackend:
         return ("packed varlen attention",) if requirements.packed_varlen else ()
 
 
-class _FakeCakeNVFP4Backend:
+class _FakeWanHybridBackend:
     @classmethod
     def get_enum(cls) -> AttentionBackendEnum:
-        return AttentionBackendEnum.CAKE_NVFP4
+        return AttentionBackendEnum.WAN_HYBRID
 
     @classmethod
     def unsupported_requirements(cls, _requirements) -> tuple[str, ...]:
@@ -74,8 +74,8 @@ class _FakePlatform:
         cls.selected_backend = selected_backend
         if selected_backend == AttentionBackendEnum.AITER:
             return "fake.AITERBackend"
-        if selected_backend == AttentionBackendEnum.CAKE_NVFP4:
-            return "fake.CakeNVFP4Backend"
+        if selected_backend == AttentionBackendEnum.WAN_HYBRID:
+            return "fake.WanHybridBackend"
         if selected_backend in (None, AttentionBackendEnum.FA):
             return "fake.FABackend"
         return "fake.SDPABackend"
@@ -83,7 +83,7 @@ class _FakePlatform:
 
 _FAKE_BACKENDS = {
     "fake.AITERBackend": _FakeAITERBackend,
-    "fake.CakeNVFP4Backend": _FakeCakeNVFP4Backend,
+    "fake.WanHybridBackend": _FakeWanHybridBackend,
     "fake.FABackend": _FakeFABackend,
     "fake.SDPABackend": _FakeSDPABackend,
 }
@@ -196,9 +196,9 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
             )
 
-    def test_cake_nvfp4_falls_back_for_cross_attention(self):
+    def test_wan_hybrid_falls_back_for_cross_attention(self):
         backend = self._resolve(
-            AttentionBackendEnum.CAKE_NVFP4,
+            AttentionBackendEnum.WAN_HYBRID,
             explicit=True,
             is_cross_attention=True,
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
@@ -207,15 +207,15 @@ class TestAttentionBackendFallback(unittest.TestCase):
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
-    def test_cake_nvfp4_remains_strict_for_self_attention(self):
+    def test_wan_hybrid_remains_strict_for_self_attention(self):
         backend = self._resolve(
-            AttentionBackendEnum.CAKE_NVFP4,
+            AttentionBackendEnum.WAN_HYBRID,
             explicit=True,
             is_cross_attention=False,
-            supported={AttentionBackendEnum.CAKE_NVFP4},
+            supported={AttentionBackendEnum.WAN_HYBRID},
         )
 
-        self.assertIs(backend, _FakeCakeNVFP4Backend)
+        self.assertIs(backend, _FakeWanHybridBackend)
 
 
 if __name__ == "__main__":

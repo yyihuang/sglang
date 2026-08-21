@@ -5,12 +5,12 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-from sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4 import (
-    CakeNVFP4AttentionBackend,
-    CakeNVFP4AttentionImpl,
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    WanHybridAttentionBackend,
+    WanHybridAttentionImpl,
     _SHARED_SCRATCH,
-    read_cake_nvfp4_hit_count,
-    reset_cake_nvfp4_hit_count,
+    read_wan_hybrid_hit_count,
+    reset_wan_hybrid_hit_count,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
@@ -30,7 +30,7 @@ def _exact_cuda_inputs():
 
 
 def _make_impl():
-    return CakeNVFP4AttentionImpl(
+    return WanHybridAttentionImpl(
         num_heads=40,
         num_kv_heads=40,
         head_size=128,
@@ -39,17 +39,17 @@ def _make_impl():
     )
 
 
-class TestCakeNVFP4AttentionBackend(unittest.TestCase):
+class TestWanHybridAttentionBackend(unittest.TestCase):
     def setUp(self):
-        reset_cake_nvfp4_hit_count()
+        reset_wan_hybrid_hit_count()
 
     def test_backend_contract(self):
         self.assertEqual(
-            CakeNVFP4AttentionBackend.get_enum(), AttentionBackendEnum.CAKE_NVFP4
+            WanHybridAttentionBackend.get_enum(), AttentionBackendEnum.WAN_HYBRID
         )
-        self.assertEqual(CakeNVFP4AttentionBackend.get_supported_head_sizes(), [128])
-        self.assertFalse(CakeNVFP4AttentionBackend.supports_packed_varlen())
-        self.assertFalse(CakeNVFP4AttentionBackend.supports_ring_rotation())
+        self.assertEqual(WanHybridAttentionBackend.get_supported_head_sizes(), [128])
+        self.assertFalse(WanHybridAttentionBackend.supports_packed_varlen())
+        self.assertFalse(WanHybridAttentionBackend.supports_ring_rotation())
 
     def test_constructor_accepts_exact_wan_self_attention(self):
         self.assertEqual(_make_impl().num_heads, 40)
@@ -73,7 +73,7 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
                 self.subTest(overrides=overrides),
                 self.assertRaisesRegex(ValueError, message),
             ):
-                CakeNVFP4AttentionImpl(**(defaults | overrides))
+                WanHybridAttentionImpl(**(defaults | overrides))
 
     def test_forward_uses_only_public_api_and_reuses_buffers(self):
         impl = _make_impl()
@@ -93,12 +93,12 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
             patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
             patch(
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
-                "cake_nvfp4.torch.cuda.current_stream",
+                "wan_hybrid.torch.cuda.current_stream",
                 return_value=SimpleNamespace(cuda_stream=17),
             ),
             patch(
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
-                "cake_nvfp4.torch.empty_like",
+                "wan_hybrid.torch.empty_like",
                 return_value=output,
             ) as empty_like,
         ):
@@ -111,7 +111,7 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         empty_like.assert_called_once_with(query, dtype=torch.bfloat16)
         self.assertEqual(is_available.call_count, 2)
         self.assertEqual(run.call_count, 2)
-        self.assertEqual(read_cake_nvfp4_hit_count(), 2)
+        self.assertEqual(read_wan_hybrid_hit_count(), 2)
         for call in run.call_args_list:
             self.assertEqual(call.args, (query, key, value))
             self.assertIs(call.kwargs["out"], output)
@@ -135,7 +135,7 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
             impl.forward(query, key, value, None)
 
         fake_flashinfer.wan_hybrid_attention.assert_not_called()
-        self.assertEqual(read_cake_nvfp4_hit_count(), 0)
+        self.assertEqual(read_wan_hybrid_hit_count(), 0)
 
     def test_failed_public_forward_does_not_increment_hit_count(self):
         impl = _make_impl()
@@ -157,7 +157,7 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
         ):
             impl.forward(query, key, value, None)
 
-        self.assertEqual(read_cake_nvfp4_hit_count(), 0)
+        self.assertEqual(read_wan_hybrid_hit_count(), 0)
 
     def test_workspace_is_shared_across_layers_on_same_stream(self):
         first = _make_impl()
@@ -172,12 +172,12 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
             patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
             patch(
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
-                "cake_nvfp4.torch.cuda.current_stream",
+                "wan_hybrid.torch.cuda.current_stream",
                 return_value=SimpleNamespace(cuda_stream=23),
             ),
             patch(
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
-                "cake_nvfp4.torch.empty_like",
+                "wan_hybrid.torch.empty_like",
                 side_effect=(object(), object()),
             ),
         ):
@@ -238,7 +238,7 @@ class TestCakeNVFP4AttentionBackend(unittest.TestCase):
 
         self.assertEqual(captured.data_ptr(), output_ptr)
         self.assertTrue(torch.equal(captured, expected))
-        self.assertGreater(read_cake_nvfp4_hit_count(), 0)
+        self.assertGreater(read_wan_hybrid_hit_count(), 0)
 
     def test_forward_rejects_non_exact_sequence(self):
         impl = _make_impl()

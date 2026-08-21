@@ -11,7 +11,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MODEL_QUALIFICATION_THRESHOLDS,
     _cosine_similarity,
-    _extract_cake_nvfp4_hit_count,
+    _extract_wan_hybrid_hit_count,
     _extract_generation_time_s,
     _with_candidate_backend_hit_qualification,
     build_sampling_kwargs,
@@ -56,14 +56,14 @@ def _args(**overrides):
 def test_build_server_kwargs_forwards_attention_backend_per_variant():
     args = _args(
         reference_attention_backend="dynamic_cudnn_sdpa",
-        candidate_attention_backend="cake_nvfp4",
+        candidate_attention_backend="wan_hybrid",
     )
 
     reference = build_server_kwargs(args, variant="reference")
     candidate = build_server_kwargs(args, variant="candidate")
 
     assert reference["attention_backend"] == "dynamic_cudnn_sdpa"
-    assert candidate["attention_backend"] == "cake_nvfp4"
+    assert candidate["attention_backend"] == "wan_hybrid"
 
 
 def test_build_server_kwargs_forwards_master_port():
@@ -84,7 +84,7 @@ def test_build_server_kwargs_forwards_component_attention_backends():
     args = _args(
         candidate_attention_backend="fa",
         candidate_component_attention_backend=[
-            "transformer=cake_nvfp4",
+            "transformer=wan_hybrid",
             "transformer_2=fa",
         ],
     )
@@ -93,7 +93,7 @@ def test_build_server_kwargs_forwards_component_attention_backends():
 
     assert candidate["attention_backend"] == "fa"
     assert candidate["component_attention_backends"] == {
-        "transformer": "cake_nvfp4",
+        "transformer": "wan_hybrid",
         "transformer_2": "fa",
     }
 
@@ -102,14 +102,14 @@ def test_build_server_kwargs_forwards_attention_backend_config():
     args = _args(
         candidate_attention_backend="fa",
         candidate_attention_backend_config=(
-            '{"cake_nvfp4_min_timestep": 975}'
+            '{"wan_hybrid_min_timestep": 975}'
         ),
     )
 
     candidate = build_server_kwargs(args, variant="candidate")
 
     assert candidate["attention_backend_config"] == (
-        '{"cake_nvfp4_min_timestep":975}'
+        '{"wan_hybrid_min_timestep":975}'
     )
 
 
@@ -145,27 +145,27 @@ def test_extract_generation_time_rejects_missing_measurement():
         _extract_generation_time_s(result)
 
 
-def test_extract_cake_nvfp4_hit_count_requires_integer_metric():
+def test_extract_wan_hybrid_hit_count_requires_integer_metric():
     assert (
-        _extract_cake_nvfp4_hit_count(
-            SimpleNamespace(metrics={"cake_nvfp4_hit_count": 7})
+        _extract_wan_hybrid_hit_count(
+            SimpleNamespace(metrics={"wan_hybrid_hit_count": 7})
         )
         == 7
     )
     for metrics in (
         {},
-        {"cake_nvfp4_hit_count": None},
-        {"cake_nvfp4_hit_count": True},
+        {"wan_hybrid_hit_count": None},
+        {"wan_hybrid_hit_count": True},
     ):
-        assert _extract_cake_nvfp4_hit_count(SimpleNamespace(metrics=metrics)) is None
+        assert _extract_wan_hybrid_hit_count(SimpleNamespace(metrics=metrics)) is None
 
 
-def test_request_metrics_transports_cake_nvfp4_hit_count():
+def test_request_metrics_transports_wan_hybrid_hit_count():
     metrics = RequestMetrics("request")
 
-    assert metrics.to_dict()["cake_nvfp4_hit_count"] == 0
-    metrics.cake_nvfp4_hit_count = 11
-    assert metrics.to_dict()["cake_nvfp4_hit_count"] == 11
+    assert metrics.to_dict()["wan_hybrid_hit_count"] == 0
+    metrics.wan_hybrid_hit_count = 11
+    assert metrics.to_dict()["wan_hybrid_hit_count"] == 11
 
 
 def _generation_result(latent_offset=0.0, frame_offset=0):

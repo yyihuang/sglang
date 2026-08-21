@@ -77,48 +77,35 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
-### Cake NVFP4 attention for Wan
+### Wan hybrid attention for Wan
 
 On B200/GB200 (`sm_100`) and B300/GB300 (`sm_103`), a FlashInfer build that
-exports `flashinfer.nvfp4_attention` can run the dense self-attention layers of
-Wan's ModelOpt NVFP4 checkpoint through the Cake backend:
+exports the public `flashinfer.wan_hybrid_attention` API can run the exact Wan
+self-attention shape through the explicit hybrid backend:
 
 ```bash
 sglang generate \
   --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
-  --attention-backend cake_nvfp4 \
+  --attention-backend wan_hybrid \
   --prompt "A curious raccoon walks through a sunlit forest" \
   --save-output
 ```
 
-This backend is intentionally fail-closed: it accepts BF16, noncausal dense
-self-attention with equal Q/K/V shapes and head dimension 128. Wan
-cross-attention continues to use the normal dense backend because its query and
-KV sequence lengths differ. Packed-varlen, masks, GQA/MQA, and ring attention
-are not supported. Ulysses-only sequence parallelism is supported when each
-rank retains a valid local head count.
+The backend is intentionally fail-closed: it accepts caller-owned contiguous
+BF16 NHD Q/K/V and output at exactly `B=1, S=4800, H=40, D=128`, with
+noncausal dense self-attention and the default `1 / sqrt(128)` score scale.
+Q/K remain BF16; FlashInfer owns the reusable FP4 V/P workspace and writes
+directly into the caller's BF16 output. Wan cross-attention continues to use
+the normal dense backend because its query and KV sequence lengths differ.
+Packed-varlen, masks, GQA/MQA, and ring attention are not supported.
 
-This integration is experimental and is not a production quality claim. The
-Wan path fuses RMSNorm, RoPE, Q-centering, and FP4 packing, reuses its packed
-workspace and caller-owned output, and supplies the matching FP32 QK-logit
-correction to FlashInfer. Complete diffusion trajectories and generated frames
-must still be qualified against the dense backend: isolated attention accuracy
-is insufficient for this model.
-
-The current B200 qualification uses the exact ModelOpt checkpoint above at
-640x384, 17 frames, 12 steps, seed 0, TP1/SP1, two warmups, and five measured
-requests. BF16 FlashAttention averages 2.718266 seconds and all-layer corrected
-Cake averages 2.739915 seconds (0.9921x). The final denoising-trajectory cosine
-is 0.6591; all-frame cosine is 0.7338 and PSNR is 11.87 dB. Even restricting
-Cake to one transformer block in the final denoising step leaves final-frame
-PSNR near 12.15 dB. The error amplification is therefore a full-model
-sensitivity to FP4 attention, not an unaccounted wrapper allocation or missing
-QK correction.
-
-Cake remains an explicit opt-in and the production route stays on FA. The
-`cake_nvfp4_min_timestep` and `cake_nvfp4_layer_indices` backend options are
-diagnostic gates; a configuration that produces zero Cake calls is not a
-successful Cake serving integration.
+This integration remains explicit opt-in and the production route stays on FA.
+Complete all-step/all-pair diffusion trajectories and generated frames must be
+qualified against that production route; isolated attention accuracy is not a
+model-level correctness claim. The
+`wan_hybrid_min_timestep` and `wan_hybrid_layer_indices` backend options are
+diagnostic gates. A run is not a valid hybrid qualification unless its reported
+`wan_hybrid_hit_count` is greater than zero.
 
 ### Component residency
 

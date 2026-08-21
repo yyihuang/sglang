@@ -15,37 +15,37 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 @dataclass
-class _CakeNVFP4SharedScratch:
+class _WanHybridSharedScratch:
     workspace: object
 
 
 _SHARED_SCRATCH_LOCK = threading.Lock()
-_SHARED_SCRATCH: weakref.WeakValueDictionary[tuple, _CakeNVFP4SharedScratch] = (
+_SHARED_SCRATCH: weakref.WeakValueDictionary[tuple, _WanHybridSharedScratch] = (
     weakref.WeakValueDictionary()
 )
 _HIT_COUNT_LOCK = threading.Lock()
 _SUCCESSFUL_FORWARD_HIT_COUNT = 0
 
 
-def reset_cake_nvfp4_hit_count() -> None:
+def reset_wan_hybrid_hit_count() -> None:
     global _SUCCESSFUL_FORWARD_HIT_COUNT
     with _HIT_COUNT_LOCK:
         _SUCCESSFUL_FORWARD_HIT_COUNT = 0
 
 
-def read_cake_nvfp4_hit_count() -> int:
+def read_wan_hybrid_hit_count() -> int:
     with _HIT_COUNT_LOCK:
         return _SUCCESSFUL_FORWARD_HIT_COUNT
 
 
-def _record_successful_cake_nvfp4_forward(result: torch.Tensor) -> torch.Tensor:
+def _record_successful_wan_hybrid_forward(result: torch.Tensor) -> torch.Tensor:
     global _SUCCESSFUL_FORWARD_HIT_COUNT
     with _HIT_COUNT_LOCK:
         _SUCCESSFUL_FORWARD_HIT_COUNT += 1
     return result
 
 
-class CakeNVFP4AttentionBackend(AttentionBackend):
+class WanHybridAttentionBackend(AttentionBackend):
     """Exact-shape Wan self-attention through FlashInfer's public API."""
 
     @staticmethod
@@ -54,11 +54,11 @@ class CakeNVFP4AttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
-        return AttentionBackendEnum.CAKE_NVFP4
+        return AttentionBackendEnum.WAN_HYBRID
 
     @staticmethod
-    def get_impl_cls() -> type["CakeNVFP4AttentionImpl"]:
-        return CakeNVFP4AttentionImpl
+    def get_impl_cls() -> type["WanHybridAttentionImpl"]:
+        return WanHybridAttentionImpl
 
     @staticmethod
     def get_metadata_cls() -> type[AttentionMetadata]:
@@ -69,7 +69,7 @@ class CakeNVFP4AttentionBackend(AttentionBackend):
         raise NotImplementedError
 
 
-class CakeNVFP4AttentionImpl(AttentionImpl):
+class WanHybridAttentionImpl(AttentionImpl):
     def __init__(
         self,
         num_heads: int,
@@ -83,20 +83,20 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
         del prefix, extra_impl_args
         if head_size != 128:
             raise ValueError(
-                f"Cake NVFP4 attention requires head_size=128, got {head_size}"
+                f"Wan hybrid attention requires head_size=128, got {head_size}"
             )
         if causal:
-            raise ValueError("Cake NVFP4 serving supports noncausal attention only")
+            raise ValueError("Wan hybrid serving supports noncausal attention only")
         if num_kv_heads is None:
             num_kv_heads = num_heads
         if num_kv_heads != num_heads:
             raise ValueError(
-                "Cake NVFP4 attention requires equal query and KV head counts, "
+                "Wan hybrid attention requires equal query and KV head counts, "
                 f"got {num_heads} and {num_kv_heads}"
             )
         if num_heads != 40:
             raise ValueError(
-                f"Cake NVFP4 Wan serving requires num_heads=40, got {num_heads}"
+                f"Wan hybrid Wan serving requires num_heads=40, got {num_heads}"
             )
         self.num_heads = num_heads
         self.head_size = head_size
@@ -110,7 +110,7 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             from flashinfer import WanHybridAttentionWorkspace
         except ImportError as error:
             raise ImportError(
-                "Cake NVFP4 attention requires a FlashInfer build that exports "
+                "Wan hybrid attention requires a FlashInfer build that exports "
                 "WanHybridAttentionWorkspace."
             ) from error
 
@@ -125,7 +125,7 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             with _SHARED_SCRATCH_LOCK:
                 shared_scratch = _SHARED_SCRATCH.get(key)
                 if shared_scratch is None:
-                    shared_scratch = _CakeNVFP4SharedScratch(
+                    shared_scratch = _WanHybridSharedScratch(
                         workspace=WanHybridAttentionWorkspace(query.device)
                     )
                     _SHARED_SCRATCH[key] = shared_scratch
@@ -144,7 +144,7 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
         del attn_metadata
         if query.shape != key.shape or query.shape != value.shape:
             raise ValueError(
-                "Cake NVFP4 attention supports dense self-attention only; "
+                "Wan hybrid attention supports dense self-attention only; "
                 f"got q={tuple(query.shape)}, k={tuple(key.shape)}, "
                 f"v={tuple(value.shape)}"
             )
@@ -153,34 +153,34 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             self.head_size,
         ):
             raise ValueError(
-                "Cake NVFP4 attention expects [batch, seq_len, heads, 128], "
+                "Wan hybrid attention expects [batch, seq_len, heads, 128], "
                 f"got {tuple(query.shape)}"
             )
         if query.shape[0] != 1:
             raise ValueError(
-                "Cake NVFP4 Wan serving is qualified only for batch=1, "
+                "Wan hybrid Wan serving is qualified only for batch=1, "
                 f"got batch={query.shape[0]}"
             )
         if query.shape[1] != 4800:
             raise ValueError(
-                "Cake NVFP4 Wan serving is qualified only for sequence length "
+                "Wan hybrid Wan serving is qualified only for sequence length "
                 f"4800, got {query.shape[1]}"
             )
         if query.device.type != "cuda":
-            raise ValueError("Cake NVFP4 attention requires CUDA tensors")
+            raise ValueError("Wan hybrid attention requires CUDA tensors")
         if query.dtype != torch.bfloat16:
             raise ValueError(
-                "Cake NVFP4 serving requires BF16 Q/K/V because its output is BF16, "
+                "Wan hybrid serving requires BF16 Q/K/V because its output is BF16, "
                 f"got {query.dtype}"
             )
         if key.dtype != query.dtype or value.dtype != query.dtype:
-            raise ValueError("Cake NVFP4 attention requires matching Q/K/V dtypes")
+            raise ValueError("Wan hybrid attention requires matching Q/K/V dtypes")
         if (
             not query.is_contiguous()
             or not key.is_contiguous()
             or not value.is_contiguous()
         ):
-            raise ValueError("Cake NVFP4 attention requires contiguous NHD Q/K/V")
+            raise ValueError("Wan hybrid attention requires contiguous NHD Q/K/V")
 
         try:
             from flashinfer import (
@@ -189,7 +189,7 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             )
         except ImportError as error:
             raise ImportError(
-                "Cake NVFP4 attention requires a FlashInfer build that exports "
+                "Wan hybrid attention requires a FlashInfer build that exports "
                 "the public wan_hybrid attention API."
             ) from error
 
@@ -199,7 +199,7 @@ class CakeNVFP4AttentionImpl(AttentionImpl):
             )
 
         workspace, output = self._get_workspace_and_output(query)
-        return _record_successful_cake_nvfp4_forward(
+        return _record_successful_wan_hybrid_forward(
             wan_hybrid_attention(
                 query,
                 key,

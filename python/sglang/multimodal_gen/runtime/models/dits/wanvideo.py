@@ -79,42 +79,42 @@ logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
 
-def _validate_cake_nvfp4_min_timestep(value: Any) -> float | None:
+def _validate_wan_hybrid_min_timestep(value: Any) -> float | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("cake_nvfp4_min_timestep must be a finite number")
+        raise ValueError("wan_hybrid_min_timestep must be a finite number")
     value = float(value)
     if not math.isfinite(value) or not 0.0 <= value <= 1000.0:
-        raise ValueError("cake_nvfp4_min_timestep must be within [0, 1000]")
+        raise ValueError("wan_hybrid_min_timestep must be within [0, 1000]")
     return value
 
 
-def _validate_cake_nvfp4_layer_indices(
+def _validate_wan_hybrid_layer_indices(
     value: Any, num_layers: int
 ) -> frozenset[int] | None:
     if value is None:
         return None
     if not isinstance(value, (list, tuple)):
-        raise ValueError("cake_nvfp4_layer_indices must be a list of layer indices")
+        raise ValueError("wan_hybrid_layer_indices must be a list of layer indices")
     indices: list[int] = []
     for index in value:
         if isinstance(index, bool) or not isinstance(index, int):
             raise ValueError(
-                "cake_nvfp4_layer_indices must contain only integer layer indices"
+                "wan_hybrid_layer_indices must contain only integer layer indices"
             )
         if not 0 <= index < num_layers:
             raise ValueError(
-                "cake_nvfp4_layer_indices entries must be within "
+                "wan_hybrid_layer_indices entries must be within "
                 f"[0, {num_layers - 1}]"
             )
         indices.append(index)
     if len(indices) != len(set(indices)):
-        raise ValueError("cake_nvfp4_layer_indices must not contain duplicates")
+        raise ValueError("wan_hybrid_layer_indices must not contain duplicates")
     return frozenset(indices)
 
 
-def _use_cake_nvfp4_for_timestep(
+def _use_wan_hybrid_for_timestep(
     timestep: torch.Tensor, min_timestep: float | None
 ) -> bool:
     if min_timestep is None:
@@ -131,10 +131,10 @@ def _wan_cross_attention_backends(
     dense_backends = {
         backend
         for backend in backends
-        if not backend.is_sparse and backend != AttentionBackendEnum.CAKE_NVFP4
+        if not backend.is_sparse and backend != AttentionBackendEnum.WAN_HYBRID
     }
-    # CAKE_NVFP4 is qualified only for dense self-attention.  Keep Wan's
-    # cross-attention on FA so selecting Cake changes exactly one role instead
+    # WAN_HYBRID is qualified only for dense self-attention. Keep Wan's
+    # cross-attention on FA so selecting it changes exactly one role instead
     # of silently switching cross-attention to the platform-default cuDNN path.
     selected_backend = get_global_forced_attn_backend()
     if selected_backend is None:
@@ -144,7 +144,7 @@ def _wan_cross_attention_backends(
         if selected_backend_name is not None:
             selected_backend = AttentionBackendEnum[selected_backend_name.upper()]
     if (
-        selected_backend == AttentionBackendEnum.CAKE_NVFP4
+        selected_backend == AttentionBackendEnum.WAN_HYBRID
         and AttentionBackendEnum.FA in dense_backends
     ):
         return {AttentionBackendEnum.FA}
@@ -550,7 +550,7 @@ class WanTransformerBlock(nn.Module):
                 is_cross_attention=False,
             )
         self.attn1_fallback = None
-        if self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4:
+        if self.attn1.backend == AttentionBackendEnum.WAN_HYBRID:
             self.attn1_fallback = USPAttention(
                 num_heads=self.local_num_heads,
                 head_size=dim // num_heads,
@@ -637,7 +637,7 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
-        use_cake_nvfp4: bool = True,
+        use_wan_hybrid: bool = True,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -675,13 +675,13 @@ class WanTransformerBlock(nn.Module):
         cos, sin = freqs_cis
 
         use_wan_hybrid = (
-            self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4
-            and use_cake_nvfp4
+            self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
+            and use_wan_hybrid
         )
         if use_wan_hybrid:
             if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
                 raise NotImplementedError(
-                    "Cake NVFP4 Wan serving requires unsharded across-head RMSNorm"
+                    "Wan hybrid Wan serving requires unsharded across-head RMSNorm"
                 )
 
         if self.norm_q is not None:
@@ -740,7 +740,7 @@ class WanTransformerBlock(nn.Module):
             self.attn1
             if use_wan_hybrid
             else self.attn1_fallback
-            if self.attn1.backend == AttentionBackendEnum.CAKE_NVFP4
+            if self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
             else self.attn1
         )
         assert attention is not None
@@ -1037,7 +1037,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
     _supported_attention_backends = CachableDiT._supported_attention_backends | {
-        AttentionBackendEnum.CAKE_NVFP4
+        AttentionBackendEnum.WAN_HYBRID
     }
 
     def __init__(
@@ -1059,11 +1059,11 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         attention_backend_config = (
             get_global_server_args().attention_backend_config or {}
         )
-        self.cake_nvfp4_min_timestep = _validate_cake_nvfp4_min_timestep(
-            attention_backend_config.get("cake_nvfp4_min_timestep")
+        self.wan_hybrid_min_timestep = _validate_wan_hybrid_min_timestep(
+            attention_backend_config.get("wan_hybrid_min_timestep")
         )
-        self.cake_nvfp4_layer_indices = _validate_cake_nvfp4_layer_indices(
-            attention_backend_config.get("cake_nvfp4_layer_indices"),
+        self.wan_hybrid_layer_indices = _validate_wan_hybrid_layer_indices(
+            attention_backend_config.get("wan_hybrid_layer_indices"),
             config.num_layers,
         )
 
@@ -1110,27 +1110,27 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 for i in range(config.num_layers)
             ]
         )
-        uses_cake_nvfp4 = any(
+        uses_wan_hybrid = any(
             getattr(getattr(block, "attn1", None), "backend", None)
-            == AttentionBackendEnum.CAKE_NVFP4
+            == AttentionBackendEnum.WAN_HYBRID
             for block in self.blocks
         )
-        if not uses_cake_nvfp4:
-            # Component-scoped FA models share the server config with the Cake
+        if not uses_wan_hybrid:
+            # Component-scoped FA models share the server configuration with the
             # component. Avoid a needless timestep device synchronization.
-            self.cake_nvfp4_min_timestep = None
-            self.cake_nvfp4_layer_indices = None
+            self.wan_hybrid_min_timestep = None
+            self.wan_hybrid_layer_indices = None
         else:
             route_parts = []
-            if self.cake_nvfp4_min_timestep is not None:
-                route_parts.append(f"at timestep >= {self.cake_nvfp4_min_timestep:g}")
-            if self.cake_nvfp4_layer_indices is not None:
+            if self.wan_hybrid_min_timestep is not None:
+                route_parts.append(f"at timestep >= {self.wan_hybrid_min_timestep:g}")
+            if self.wan_hybrid_layer_indices is not None:
                 route_parts.append(
-                    f"for transformer blocks {sorted(self.cake_nvfp4_layer_indices)}"
+                    f"for transformer blocks {sorted(self.wan_hybrid_layer_indices)}"
                 )
             if route_parts:
                 logger.info_once(
-                    "Wan Cake NVFP4 self-attention is enabled "
+                    "Wan hybrid self-attention is enabled "
                     + " ".join(route_parts)
                     + " and falls back to FA elsewhere"
                 )
@@ -1223,8 +1223,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         orig_dtype = hidden_states.dtype
-        use_cake_nvfp4 = _use_cake_nvfp4_for_timestep(
-            timestep, self.cake_nvfp4_min_timestep
+        use_wan_hybrid = _use_wan_hybrid_for_timestep(
+            timestep, self.wan_hybrid_min_timestep
         )
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -1384,9 +1384,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             for block_index, block in enumerate(self.blocks):
                 block_kwargs = {"rope_cos_sin_cache": rope_cos_sin_cache}
                 if isinstance(block, WanTransformerBlock):
-                    block_kwargs["use_cake_nvfp4"] = use_cake_nvfp4 and (
-                        self.cake_nvfp4_layer_indices is None
-                        or block_index in self.cake_nvfp4_layer_indices
+                    block_kwargs["use_wan_hybrid"] = use_wan_hybrid and (
+                        self.wan_hybrid_layer_indices is None
+                        or block_index in self.wan_hybrid_layer_indices
                     )
                 hidden_states = block(
                     hidden_states,

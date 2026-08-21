@@ -762,11 +762,11 @@ def _extract_total_duration_ms(result: Any) -> float | None:
     return float(total_duration_ms)
 
 
-def _extract_cake_nvfp4_hit_count(result: Any) -> int | None:
+def _extract_wan_hybrid_hit_count(result: Any) -> int | None:
     metrics = getattr(result, "metrics", None)
     if not isinstance(metrics, dict):
         return None
-    hit_count = metrics.get("cake_nvfp4_hit_count")
+    hit_count = metrics.get("wan_hybrid_hit_count")
     if isinstance(hit_count, bool) or not isinstance(hit_count, int):
         return None
     return hit_count
@@ -852,12 +852,12 @@ def run_variant(
         )
         if duration is not None
     ]
-    cake_nvfp4_hit_counts = [
-        _extract_cake_nvfp4_hit_count(result) for result in measured_results
+    wan_hybrid_hit_counts = [
+        _extract_wan_hybrid_hit_count(result) for result in measured_results
     ]
-    valid_cake_nvfp4_hit_counts = [
+    valid_wan_hybrid_hit_counts = [
         hit_count
-        for hit_count in cake_nvfp4_hit_counts
+        for hit_count in wan_hybrid_hit_counts
         if hit_count is not None
     ]
 
@@ -884,12 +884,12 @@ def run_variant(
             statistics.median(total_duration_ms) if total_duration_ms else None
         ),
         "per_run_total_duration_ms": total_duration_ms,
-        "cake_nvfp4_hit_count": (
-            sum(valid_cake_nvfp4_hit_counts)
-            if len(valid_cake_nvfp4_hit_counts) == len(cake_nvfp4_hit_counts)
+        "wan_hybrid_hit_count": (
+            sum(valid_wan_hybrid_hit_counts)
+            if len(valid_wan_hybrid_hit_counts) == len(wan_hybrid_hit_counts)
             else None
         ),
-        "per_run_cake_nvfp4_hit_count": cake_nvfp4_hit_counts,
+        "per_run_wan_hybrid_hit_count": wan_hybrid_hit_counts,
     }
 
 
@@ -1181,7 +1181,7 @@ def main() -> None:
         )
     result["qualification"] = _with_candidate_backend_hit_qualification(
         result["qualification"],
-        result["candidate_generation"]["per_run_cake_nvfp4_hit_count"],
+        result["candidate_generation"]["per_run_wan_hybrid_hit_count"],
     )
 
     output_json.write_text(
@@ -1198,11 +1198,11 @@ def main() -> None:
         "candidate_median_generation_time_s": result["candidate_generation"][
             "median_generation_time_s"
         ],
-        "candidate_cake_nvfp4_hit_count": result["candidate_generation"][
-            "cake_nvfp4_hit_count"
+        "candidate_wan_hybrid_hit_count": result["candidate_generation"][
+            "wan_hybrid_hit_count"
         ],
-        "candidate_per_run_cake_nvfp4_hit_count": result["candidate_generation"][
-            "per_run_cake_nvfp4_hit_count"
+        "candidate_per_run_wan_hybrid_hit_count": result["candidate_generation"][
+            "per_run_wan_hybrid_hit_count"
         ],
         **result["performance"],
         "qualification_passed": result["qualification"]["passed"],

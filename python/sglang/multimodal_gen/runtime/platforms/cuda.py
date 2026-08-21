@@ -114,8 +114,8 @@ class _DynamicCudnnSDPAAttentionBackendResolver(_DirectCudaAttentionBackendResol
     backend_cls_str = _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR
 
 
-class _CakeNVFP4AttentionBackendResolver(_CudaAttentionBackendResolver):
-    backend = AttentionBackendEnum.CAKE_NVFP4
+class _WanHybridAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.WAN_HYBRID
     required_capabilities = {(10, 0), (10, 3)}
 
     @classmethod
@@ -124,7 +124,7 @@ class _CakeNVFP4AttentionBackendResolver(_CudaAttentionBackendResolver):
         if capability is None or tuple(capability) not in cls.required_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "Cake NVFP4 attention requires compute capability 10.0 or 10.3; "
+                "Wan hybrid attention requires compute capability 10.0 or 10.3; "
                 f"this device reports {found}."
             )
         try:
@@ -135,15 +135,15 @@ class _CakeNVFP4AttentionBackendResolver(_CudaAttentionBackendResolver):
             )
         except ImportError as error:
             raise ImportError(
-                "Cake NVFP4 attention requires a FlashInfer build that exports "
+                "Wan hybrid attention requires a FlashInfer build that exports "
                 "the public wan_hybrid attention API."
             ) from error
         if not is_wan_hybrid_attention_available():
             raise RuntimeError(
-                "Cake NVFP4 attention requires an installed FlashInfer "
+                "Wan hybrid attention requires an installed FlashInfer "
                 "wan_hybrid implementation."
             )
-        return "sglang.multimodal_gen.runtime.layers.attention.backends.cake_nvfp4.CakeNVFP4AttentionBackend"
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid.WanHybridAttentionBackend"
 
 
 class _SparseLinearAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
@@ -396,7 +396,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _TorchSDPAAttentionBackendResolver,
         _TorchCudnnSDPAAttentionBackendResolver,
         _DynamicCudnnSDPAAttentionBackendResolver,
-        _CakeNVFP4AttentionBackendResolver,
+        _WanHybridAttentionBackendResolver,
         _SparseLinearAttentionBackendResolver,
         _SageSparseLinearAttentionBackendResolver,
         _SlidingTileAttentionBackendResolver,
