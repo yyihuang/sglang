@@ -115,6 +115,56 @@ reference-first and candidate-first orders, and passes only when both median
 speedups are at least 1.0 and every measured candidate run reports a positive
 backend hit count.
 
+The qualification runner builds the fixed single-block, full-transformer, and
+generation matrices without depending on a particular cluster layout. Pass the
+staged public revisions explicitly so the resulting manifest records exactly
+what was measured:
+
+```bash
+python -m sglang.multimodal_gen.tools.run_wan_hybrid_qualification \
+  --model-path /models/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
+  --model-id nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
+  --output-dir /results/wan-hybrid \
+  --sglang-revision "$SGLANG_REVISION" \
+  --flashinfer-revision "$FLASHINFER_REVISION" \
+  --staging-label "$STAGING_LABEL" \
+  --scenario generation \
+  --mode correctness
+```
+
+A correctness invocation always runs both execution orders as separate
+generation-trajectory reports. A performance invocation runs one comparison
+command with `--run-order both`; that command disables trajectory capture and
+contains both orders in the same report. Repeat `--scenario` or `--mode` to
+request more than one matrix entry. `single-block` selects block zero through
+`wan_hybrid_layer_indices`, `full-transformer` selects the primary Wan
+transformer component, and `generation` enables the backend for every eligible
+Wan self-attention layer.
+
+The runner's `full-transformer` scenario is still an end-to-end generation
+trajectory with the primary transformer component routed to `wan_hybrid`. It is
+not an independent transformer single-forward result. For that separate check,
+use
+`run_wan_transformer_forward_qualification`. The caller supplies already-loaded
+reference and candidate models plus forward callables that replay the same
+captured real Wan input. Run it in both explicit execution orders, write each
+report with `write_wan_transformer_forward_report`, and pass the two paths to a
+`full-transformer` runner invocation:
+
+```bash
+  --full-transformer-forward-report /results/reference-first-forward.json \
+  --full-transformer-forward-report /results/candidate-first-forward.json
+```
+
+The runner validates these reports as independent evidence before starting its
+generation matrix. The harness reuses the trajectory evaluator over
+forward-hook snapshots from every entry in `model.blocks`, computes the complete
+5-by-5 cross-variant product and all ten same-instance run pairs, and separately
+checks the final transformer output. The real model loader and captured forward
+call belong in the remote evaluation environment; the public harness does not
+guess checkpoint-specific inputs. Hook capture is a correctness path and must
+not be used for performance timing.
+
 ### Component residency
 
 Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each
