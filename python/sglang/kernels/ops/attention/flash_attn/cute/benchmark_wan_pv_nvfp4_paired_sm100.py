@@ -199,6 +199,8 @@ def _candidate_attention(
     v: torch.Tensor,
     out: torch.Tensor,
     workspace: CandidateWorkspace,
+    *,
+    pv_nvfp4_residual: bool = True,
 ) -> None:
     """Run only attention against an already prepared V2 workspace."""
 
@@ -210,6 +212,7 @@ def _candidate_attention(
         _arch=100,
         pack_gqa=False,
         pv_nvfp4=True,
+        pv_nvfp4_residual=pv_nvfp4_residual,
         v_base=workspace.v_base,
         v_residual=workspace.v_residual,
         sfv_base=workspace.sfv_base,
