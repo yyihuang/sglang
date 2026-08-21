@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import torch
@@ -38,6 +39,22 @@ _sm_major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() e
 _supports_flashinfer_linear_gdn = _sm_major == 9 or (
     _sm_major == 10 and _cuda_major >= 13
 )
+
+
+def _install_t39_padded_state_pool(fixture) -> None:
+    """Give the traced fixture the exact four-slot production envelope stride."""
+
+    pool = fixture.runner.req_to_token_pool.mamba_pool
+    temporal = pool.mamba_cache.temporal
+    assert tuple(temporal.shape) == (1, 4, 8, 128, 128)
+    padded = torch.empty_strided(
+        temporal.shape,
+        (4 * 131185, 131185, 16384, 128, 1),
+        dtype=temporal.dtype,
+        device=temporal.device,
+    )
+    padded.copy_(temporal)
+    pool.mamba_cache = replace(pool.mamba_cache, temporal=padded)
 
 
 @unittest.skipIf(
@@ -643,8 +660,9 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             head_k_dim=self.HEAD_DIM,
             head_v_dim=self.HEAD_DIM,
             max_context_len=64,
-            runner_batch_size=4,
+            runner_batch_size=3,
         )
+        _install_t39_padded_state_pool(fixture)
         initial_ssm_states = _ssm_states(fixture).clone()
         with (
             mock.patch.object(
@@ -728,8 +746,17 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             atol=1e-2,
             rtol=1e-2,
         )
+        prepared = cake_gdn_cp_prefill._public_prepared
+        self.assertIsNotNone(prepared)
+        self.assertTrue(prepared._uses_fused_bf16_indexed_t39)
+        self.assertIsNone(prepared._gather)
+        self.assertIsNone(prepared._scatter)
+        self.assertIsNone(prepared._checkpoint)
+        self.assertIsNotNone(prepared._fused_state_carrier)
+        self.assertEqual(prepared.plan.seq_lens, (39,))
+        self.assertIn(prepared.plan.arch, ("sm_100a", "sm_103a"))
 
-    def test_traced_b1_t39_cp_prefill_state_buffers_are_capture_stable(self):
+    def test_traced_b1_t39_cp_prefill_fused_bindings_are_capture_stable(self):
         self._cake_cp_api_or_skip()
         fixture = build_gdn_attention_fixture(
             self,
@@ -737,8 +764,9 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             head_k_dim=self.HEAD_DIM,
             head_v_dim=self.HEAD_DIM,
             max_context_len=64,
-            runner_batch_size=4,
+            runner_batch_size=3,
         )
+        _install_t39_padded_state_pool(fixture)
         dispatcher = fixture.backend.linear_attn_backend.kernel_dispatcher
         kernel = dispatcher.extend_kernel
         original_prefill = kernel._prefill_fn
@@ -757,6 +785,8 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                         None if capturing else initial_state.detach().clone()
                     ),
                     "output_state": output_state,
+                    "output": kwargs["output"],
+                    "state_indices": kwargs["state_indices"],
                     "checkpoints": checkpoints,
                 }
             )
@@ -813,14 +843,24 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         self.assertIs(captured["initial_state"], warm_1["initial_state"])
         self.assertIs(warm_2["output_state"], warm_1["output_state"])
         self.assertIs(captured["output_state"], warm_1["output_state"])
+        self.assertIs(warm_1["output_state"], warm_1["initial_state"])
+        self.assertIs(warm_2["output"], warm_1["output"])
+        self.assertIs(captured["output"], warm_1["output"])
+        self.assertIs(warm_2["state_indices"], warm_1["state_indices"])
+        self.assertIs(captured["state_indices"], warm_1["state_indices"])
+        self.assertEqual(warm_1["state_indices"].dtype, torch.int32)
+        self.assertEqual(tuple(warm_1["state_indices"].shape), (1,))
         self.assertIs(warm_2["checkpoints"], warm_1["checkpoints"])
         self.assertIs(captured["checkpoints"], warm_1["checkpoints"])
         self.assertIsNone(warm_1["checkpoints"])
         torch.testing.assert_close(
-            warm_2["initial_snapshot"], refreshed_state, atol=0, rtol=0
+            warm_2["initial_snapshot"][cache_indices],
+            refreshed_state,
+            atol=0,
+            rtol=0,
         )
 
-    def test_traced_b1_t39_cp_prefill_state_buffers_require_warmup(self):
+    def test_traced_b1_t39_cp_prefill_fused_indices_require_warmup(self):
         self._cake_cp_api_or_skip()
         fixture = build_gdn_attention_fixture(
             self,
@@ -828,8 +868,9 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             head_k_dim=self.HEAD_DIM,
             head_v_dim=self.HEAD_DIM,
             max_context_len=64,
-            runner_batch_size=4,
+            runner_batch_size=3,
         )
+        _install_t39_padded_state_pool(fixture)
         kernel = fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel
         capture_stream = torch.cuda.Stream()
         capture_stream.wait_stream(torch.cuda.current_stream())
@@ -847,9 +888,9 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             )
         capture_stream.synchronize()
 
-        kernel._flashinfer_gdn_prefill_state_buffers = {}
+        kernel._flashinfer_gdn_t39_state_indices = {}
         with (
-            self.assertRaisesRegex(RuntimeError, "state buffers must be warmed"),
+            self.assertRaisesRegex(RuntimeError, "state indices must be warmed"),
             torch.no_grad(),
             torch.cuda.stream(capture_stream),
             forward_context(ForwardContext(attn_backend=fixture.backend)),

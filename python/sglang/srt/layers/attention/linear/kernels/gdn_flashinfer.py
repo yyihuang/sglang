@@ -40,6 +40,9 @@ _flashinfer_gated_delta_rule_mtp_bf16 = None
 _cake_gdn_decode_api = None
 _cake_gdn_decode_api_checked = False
 
+_FUSED_T39_STATE_SHAPE = (4, 8, 128, 128)
+_FUSED_T39_STATE_STRIDE = (131185, 16384, 128, 1)
+
 
 def maybe_build_flashinfer_checkpoint_plan(
     forward_metadata: ForwardMetadata,
@@ -239,6 +242,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._cake_gdn_dt_bias_fp32 = {}
         self._flashinfer_gdn_prefill_metadata = {}
         self._flashinfer_gdn_prefill_state_buffers = {}
+        self._flashinfer_gdn_t39_state_indices = {}
+        self._flashinfer_gdn_t39_state_pools = {}
         self._cake_gdn_logged_routes = set()
         self._flashinfer_gdn_should_use_cp_host = None
         self._flashinfer_gdn_num_sms = None
@@ -462,6 +467,139 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
         return ssm_cache_indices, cu_seqlens
 
+    def _flashinfer_fused_t39_state_indices(
+        self,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return graph-stable, nonnegative int32 indices for fused T39 state IO."""
+
+        stream_handle = int(torch.cuda.current_stream(cache_indices.device).cuda_stream)
+        key = (cache_indices.device.index, stream_handle)
+        cached = self._flashinfer_gdn_t39_state_indices.get(key)
+        indices_version = int(cache_indices._version)
+        source_matches = (
+            cached is not None
+            and cached[0] is cache_indices
+            and cached[1] == indices_version
+            and tuple(cached[2].shape) == tuple(cache_indices.shape)
+        )
+        if source_matches:
+            return cached[2]
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlashInfer GDN fused T39 state indices must be warmed with the "
+                "same unchanged tensor before CUDA Graph capture"
+            )
+        if cached is None or tuple(cached[2].shape) != tuple(cache_indices.shape):
+            state_indices = torch.empty_like(cache_indices, dtype=torch.int32)
+        else:
+            state_indices = cached[2]
+        state_indices.copy_(cache_indices)
+        state_indices.clamp_min_(0)
+        self._flashinfer_gdn_t39_state_indices[key] = (
+            cache_indices,
+            indices_version,
+            state_indices,
+        )
+        return state_indices
+
+    def _flashinfer_fused_t39_state_pool(
+        self,
+        state: torch.Tensor,
+        *,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Retain the full pool view whose object identity is part of the FI plan."""
+
+        key = (state.device.index, layer_id)
+        cached = self._flashinfer_gdn_t39_state_pools.get(key)
+        binding_matches = bool(
+            cached is not None
+            and cached.data_ptr() == state.data_ptr()
+            and cached.storage_offset() == state.storage_offset()
+            and tuple(cached.shape) == tuple(state.shape)
+            and tuple(cached.stride()) == tuple(state.stride())
+            and cached.dtype == state.dtype
+        )
+        if binding_matches:
+            return cached
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlashInfer GDN fused T39 state pool must be warmed with the same "
+                "storage binding before CUDA Graph capture"
+            )
+        self._flashinfer_gdn_t39_state_pools[key] = state
+        return state
+
+    def _flashinfer_auto_cp_eligible(
+        self,
+        *,
+        num_seqs: int,
+        num_v_heads: int,
+    ) -> bool:
+        return bool(
+            self._flashinfer_gdn_should_use_cp_host is not None
+            and self._flashinfer_gdn_should_use_cp_host(
+                num_seqs * num_v_heads,
+                self._flashinfer_gdn_num_sms,
+                self._flashinfer_gdn_device_name,
+                device_capability=self._flashinfer_gdn_device_capability,
+            )
+        )
+
+    def _is_flashinfer_fused_t39_prefill(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        state_checkpoint_cu_starts: Optional[torch.Tensor],
+        cake_state_checkpoint_cu_starts: Optional[torch.Tensor],
+        seq_lens_cpu: Optional[list[int]],
+        layer_id: Optional[int],
+        num_state_checkpoints: int,
+        state_checkpoint_every_n_tokens: int,
+        auto_cp_eligible: bool,
+    ) -> bool:
+        """Match only the frozen public fused B1/T39 padded-state contract."""
+
+        tensors = (q, k, v, alpha, beta, state, state_indices, cu_seqlens)
+        return bool(
+            self.use_state_pool
+            and not self._prefill_needs_fp32_state
+            and auto_cp_eligible
+            and layer_id is not None
+            and tuple(seq_lens_cpu or ()) == (39,)
+            and num_state_checkpoints == 0
+            and state_checkpoint_every_n_tokens == 0
+            and state_checkpoint_cu_starts is None
+            and cake_state_checkpoint_cu_starts is None
+            and tuple(q.shape) == (39, 4, 128)
+            and tuple(k.shape) == (39, 4, 128)
+            and tuple(v.shape) == (39, 8, 128)
+            and tuple(alpha.shape) == (39, 8)
+            and tuple(beta.shape) == (39, 8)
+            and tuple(state.shape) == _FUSED_T39_STATE_SHAPE
+            and tuple(state.stride()) == _FUSED_T39_STATE_STRIDE
+            and tuple(state_indices.shape) == (1,)
+            and tuple(cu_seqlens.shape) == (2,)
+            and all(tensor.device == q.device for tensor in tensors)
+            and all(tensor.dtype == torch.bfloat16 for tensor in (q, k, v, state))
+            and alpha.dtype == torch.float32
+            and beta.dtype == torch.float32
+            and state_indices.dtype == torch.int32
+            and cu_seqlens.dtype == torch.int32
+            and all(
+                tensor.is_contiguous()
+                for tensor in (q, k, v, alpha, beta, state_indices, cu_seqlens)
+            )
+        )
+
     def _flashinfer_prefill_state_buffer_views(
         self,
         ssm_states: torch.Tensor,
@@ -662,6 +800,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         layer_id: Optional[int],
         num_state_checkpoints: int,
         state_checkpoint_every_n_tokens: int,
+        auto_cp_eligible: Optional[bool] = None,
     ) -> Optional[torch.Tensor]:
         """Launch one exact Cake non-CP prefill route or fail closed."""
 
@@ -730,11 +869,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             or cake_state_checkpoint_cu_starts is not None
         ):
             return None
-        if not enable_checkpoints and self._flashinfer_gdn_should_use_cp_host(
-            num_seqs * num_v_heads,
-            self._flashinfer_gdn_num_sms,
-            self._flashinfer_gdn_device_name,
-            device_capability=self._flashinfer_gdn_device_capability,
+        if not enable_checkpoints and (
+            auto_cp_eligible
+            if auto_cp_eligible is not None
+            else self._flashinfer_auto_cp_eligible(
+                num_seqs=num_seqs,
+                num_v_heads=num_v_heads,
+            )
         ):
             # The frozen public API defaults to use_cp="auto". Preserve that
             # independent route instead of intercepting the call with Cake's
@@ -1130,6 +1271,34 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
+        seq_lens_cpu = kwargs.get("seq_lens_cpu")
+        layer_id = kwargs.get("layer_id")
+        fused_t39_shape_candidate = self._is_flashinfer_fused_t39_prefill(
+            q=q_fi,
+            k=k_fi,
+            v=v_fi,
+            alpha=alpha_fi,
+            beta=beta_fi,
+            state=ssm_states,
+            state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            state_checkpoint_cu_starts=state_checkpoint_cu_starts,
+            cake_state_checkpoint_cu_starts=cake_state_checkpoint_cu_starts,
+            seq_lens_cpu=seq_lens_cpu,
+            layer_id=layer_id,
+            num_state_checkpoints=num_state_checkpoints,
+            state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            auto_cp_eligible=True,
+        )
+        auto_cp_eligible = (
+            self._flashinfer_auto_cp_eligible(
+                num_seqs=cache_indices.numel(),
+                num_v_heads=num_v_heads,
+            )
+            if fused_t39_shape_candidate
+            else None
+        )
+
         output_cake = self._try_cake_prefill(
             q=q_fi,
             k=k_fi,
@@ -1140,10 +1309,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             state_indices=cache_indices,
             cu_seqlens=query_start_loc,
             cake_state_checkpoint_cu_starts=cake_state_checkpoint_cu_starts,
-            seq_lens_cpu=kwargs.get("seq_lens_cpu"),
-            layer_id=kwargs.get("layer_id"),
+            seq_lens_cpu=seq_lens_cpu,
+            layer_id=layer_id,
             num_state_checkpoints=num_state_checkpoints,
             state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            auto_cp_eligible=auto_cp_eligible,
         )
         if output_cake is not None:
             core_attn_out, h = output_cake
@@ -1151,17 +1321,36 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         output_state_fi = None
         state_checkpoints = None
+        fused_t39_prefill = bool(fused_t39_shape_candidate and auto_cp_eligible)
+        output_buffer_fi = None
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
-            ssm_cache_indices, cu_seqlens = self._flashinfer_prefill_metadata(
-                query_start_loc,
-                cache_indices,
-            )
+            if fused_t39_prefill:
+                ssm_cache_indices = self._flashinfer_fused_t39_state_indices(
+                    cache_indices
+                )
+                cu_seqlens = query_start_loc
+                initial_state_fi = self._flashinfer_fused_t39_state_pool(
+                    ssm_states,
+                    layer_id=layer_id,
+                )
+                output_state_fi = initial_state_fi
+                output_buffer_fi = self._cake_prefill_output_buffer(
+                    q_fi,
+                    layer_id=layer_id,
+                    total_tokens=total_seq_len,
+                    num_v_heads=num_v_heads,
+                )
+            else:
+                ssm_cache_indices, cu_seqlens = self._flashinfer_prefill_metadata(
+                    query_start_loc,
+                    cache_indices,
+                )
             if self._prefill_needs_fp32_state:
                 initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
-            else:
+            elif not fused_t39_prefill:
                 (
                     initial_state_fi,
                     output_state_fi,
@@ -1208,14 +1397,20 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            **(
+                {"output": output_buffer_fi, "state_indices": ssm_cache_indices}
+                if fused_t39_prefill
+                else {}
+            ),
         )
 
         # Write back state to pool
-        ssm_states.index_copy_(
-            0,
-            ssm_cache_indices,
-            output_state_fi.to(ssm_states.dtype),
-        )
+        if not fused_t39_prefill:
+            ssm_states.index_copy_(
+                0,
+                ssm_cache_indices,
+                output_state_fi.to(ssm_states.dtype),
+            )
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)

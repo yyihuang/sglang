@@ -33,14 +33,18 @@ def _kernel_and_inputs():
     api = _CakeAPI()
     entry = MagicMock()
     kernel = object.__new__(FlashInferGDNKernel)
+    kernel.use_state_pool = True
     kernel._prefill_needs_fp32_state = False
     kernel._cake_gdn_api = api
     kernel._cake_gdn_arch = "sm_100a"
     kernel._cake_gdn_entries = {"prefill_bf16_indexed": entry}
     kernel._cake_gdn_logged_routes = set()
     kernel._cake_gdn_prefill_checkpoints = {}
+    kernel._cake_gdn_prefill_outputs = {}
     kernel._flashinfer_gdn_prefill_metadata = {}
     kernel._flashinfer_gdn_prefill_state_buffers = {}
+    kernel._flashinfer_gdn_t39_state_indices = {}
+    kernel._flashinfer_gdn_t39_state_pools = {}
     kernel._flashinfer_gdn_should_use_cp_host = MagicMock(return_value=False)
     kernel._flashinfer_gdn_num_sms = 148
     kernel._flashinfer_gdn_device_name = "NVIDIA B200"
@@ -84,6 +88,118 @@ def _kernel_and_inputs():
 
 
 class TestCakeGDNPrefillDispatch(unittest.TestCase):
+    def test_exact_public_t39_uses_full_padded_pool_and_caller_output(self):
+        kernel, api, _, _, _, _, _, _ = _kernel_and_inputs()
+        kernel._flashinfer_gdn_should_use_cp_host.return_value = True
+        state = torch.empty_strided(
+            (4, 8, 128, 128),
+            (131185, 16384, 128, 1),
+            dtype=torch.bfloat16,
+        )
+        output = torch.empty(39, 8, 128, dtype=torch.bfloat16)
+        kernel._cake_prefill_output_buffer = MagicMock(return_value=output)
+        kernel._flashinfer_prefill_state_buffer_views = MagicMock(
+            wraps=kernel._flashinfer_prefill_state_buffer_views
+        )
+        kernel._flashinfer_prefill_metadata = MagicMock(
+            wraps=kernel._flashinfer_prefill_metadata
+        )
+
+        def flashinfer_prefill(**kwargs):
+            self.assertIs(kwargs["initial_state"], state)
+            self.assertIs(kwargs["output_state"], state)
+            self.assertIs(kwargs["output"], output)
+            self.assertEqual(kwargs["state_indices"].dtype, torch.int32)
+            self.assertEqual(kwargs["state_indices"].tolist(), [0])
+            self.assertIsNone(kwargs["state_checkpoints"])
+            kwargs["output"].zero_()
+            return kwargs["output"], kwargs["output_state"]
+
+        kernel._prefill_fn = MagicMock(side_effect=flashinfer_prefill)
+        cache_indices = torch.tensor([-1], dtype=torch.int32)
+        with (
+            patch(
+                "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
+                side_effect=lambda value: value.contiguous(),
+            ),
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                return_value=SimpleNamespace(cuda_stream=17),
+            ),
+            patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ),
+        ):
+            core_attn_out, _, checkpoints = kernel.extend(
+                q=torch.empty(1, 39, 4, 128, dtype=torch.bfloat16),
+                k=torch.empty(1, 39, 4, 128, dtype=torch.bfloat16),
+                v=torch.empty(1, 39, 8, 128, dtype=torch.bfloat16),
+                g=torch.empty(1, 39, 8, dtype=torch.float32),
+                beta=torch.empty(1, 39, 8, dtype=torch.float32),
+                ssm_states=state,
+                cache_indices=cache_indices,
+                query_start_loc=torch.tensor([0, 39], dtype=torch.int32),
+                seq_lens_cpu=[39],
+                layer_id=7,
+            )
+
+        self.assertEqual(tuple(core_attn_out.shape), (1, 39, 8, 128))
+        self.assertIsNone(checkpoints)
+        api.select_cake_gdn_prefill_variant.assert_not_called()
+        kernel._flashinfer_gdn_should_use_cp_host.assert_called_once()
+        kernel._cake_prefill_output_buffer.assert_called_once()
+        kernel._flashinfer_prefill_metadata.assert_not_called()
+        kernel._flashinfer_prefill_state_buffer_views.assert_not_called()
+
+    def test_public_t39_fusion_predicate_fails_closed_on_near_misses(self):
+        kernel, _, _, _, _, _, _, _ = _kernel_and_inputs()
+        q = torch.empty(39, 4, 128, dtype=torch.bfloat16)
+        k = torch.empty_like(q)
+        v = torch.empty(39, 8, 128, dtype=torch.bfloat16)
+        alpha = torch.empty(39, 8, dtype=torch.float32)
+        beta = torch.empty_like(alpha)
+        padded_state = torch.empty_strided(
+            (4, 8, 128, 128),
+            (131185, 16384, 128, 1),
+            dtype=torch.bfloat16,
+        )
+        state_indices = torch.tensor([2], dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 39], dtype=torch.int32)
+        inputs = dict(
+            q=q,
+            k=k,
+            v=v,
+            alpha=alpha,
+            beta=beta,
+            state=padded_state,
+            state_indices=state_indices,
+            cu_seqlens=cu_seqlens,
+            state_checkpoint_cu_starts=None,
+            cake_state_checkpoint_cu_starts=None,
+            seq_lens_cpu=[39],
+            layer_id=7,
+            num_state_checkpoints=0,
+            state_checkpoint_every_n_tokens=0,
+            auto_cp_eligible=True,
+        )
+        near_misses = (
+            {"state": torch.empty(4, 8, 128, 128, dtype=torch.bfloat16)},
+            {"seq_lens_cpu": [38]},
+            {"layer_id": None},
+            {"auto_cp_eligible": False},
+            {"num_state_checkpoints": 1},
+            {"state_checkpoint_every_n_tokens": 64},
+            {"state_checkpoint_cu_starts": torch.tensor([0, 1])},
+            {"state_indices": state_indices.to(torch.int64)},
+            {"cu_seqlens": cu_seqlens.to(torch.int64)},
+        )
+        for override in near_misses:
+            with self.subTest(override=override):
+                case = dict(inputs)
+                case.update(override)
+                self.assertFalse(kernel._is_flashinfer_fused_t39_prefill(**case))
+
     def test_exact_bf16_indexed_row_uses_in_place_state_and_frozen_grid(self):
         kernel, api, entry, inputs, output, workspace, empty_state, empty_i32 = (
             _kernel_and_inputs()
