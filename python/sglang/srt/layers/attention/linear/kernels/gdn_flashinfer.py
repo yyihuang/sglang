@@ -1044,11 +1044,23 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             return None
 
         cache_intermediate_states = intermediate_state is not None
-        if state.dtype == torch.float32 and (
-            seq_len != 1
-            or disable_state_update
-            or cache_intermediate_states
-            or cache_steps != 0
+        fp32_t1_decode = (
+            seq_len == 1
+            and not disable_state_update
+            and not cache_intermediate_states
+            and cache_steps == 0
+        )
+        fp32_t2_verify = (
+            batch_size == 1
+            and seq_len == 2
+            and num_q_heads == 16
+            and num_v_heads == 32
+            and disable_state_update
+            and cache_intermediate_states
+            and cache_steps == 2
+        )
+        if state.dtype == torch.float32 and not (
+            fp32_t1_decode or fp32_t2_verify
         ):
             return None
         if cache_intermediate_states:
@@ -1067,6 +1079,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             ):
                 return None
 
+        strided_inputs = not all(
+            tensor.is_contiguous() for tensor in (q, k, v, a, b)
+        )
         try:
             route = self._cake_gdn_api.select_cake_gdn_decode_variant(
                 arch=self._cake_gdn_arch,
@@ -1083,7 +1098,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 scale=128**-0.5,
                 seq_len=seq_len,
                 use_qk_l2norm=True,
-                strided_inputs=True,
+                strided_inputs=strided_inputs,
                 disable_state_update=disable_state_update,
                 cache_intermediate_states=cache_intermediate_states,
                 cache_steps=cache_steps,
@@ -1112,11 +1127,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             num_v_heads=num_v_heads,
         )
         state_heads = batch_size * num_v_heads
-        tile_v = (
-            16
-            if route.route_id.endswith(".tile16_fullwarp")
-            else 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
-        )
+        if route.route_id.endswith(".tile16_fullwarp"):
+            tile_v = 16
+        elif route.route_id == (
+            "cake.gdn_decode.indexed_fp32_mtp_t2.inline_tile8_verify_cache"
+        ):
+            tile_v = 8
+        else:
+            tile_v = (
+                128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
+            )
         if route.route_id == "cake.gdn_decode.indexed_fp32_t1_splitv8":
             grid_x = batch_size * num_v_heads * 8
             entry(
@@ -1130,6 +1150,26 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 b,
                 output,
                 state_indices,
+                state_indices,
+                grid_x,
+                1,
+                1,
+            )
+        elif route.route_id == (
+            "cake.gdn_decode.indexed_fp32_mtp_t2.inline_tile8_verify_cache"
+        ):
+            grid_x = batch_size * num_v_heads * (128 // tile_v)
+            entry(
+                q,
+                k,
+                v,
+                state,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                output,
+                intermediate_state,
                 state_indices,
                 grid_x,
                 1,

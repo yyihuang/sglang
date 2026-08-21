@@ -5,6 +5,9 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import is_flashinfer_available
@@ -491,6 +494,188 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         except ImportError:
             self.skipTest("public FlashInfer Cake GDN CP loader is unavailable")
         return cake_gdn_cp_prefill
+
+    @staticmethod
+    def _cake_decode_test_kernel(cake_api, output):
+        kernel = object.__new__(FlashInferGDNKernel)
+        kernel._cake_gdn_api = cake_api
+        kernel._cake_gdn_arch = cake_api.arch_for_compute_capability(
+            *torch.cuda.get_device_capability()
+        )
+        kernel._cake_gdn_entries = {}
+        kernel._cake_gdn_logged_routes = set()
+        kernel._cake_fp32_dt_bias = lambda dt_bias, *, layer_id: dt_bias.float()
+        kernel._cake_output_buffer = lambda *args, **kwargs: output
+        return kernel
+
+    def test_cake_bf16_t2_compact_inputs_select_padded_cache_route(self):
+        cake_api = self._cake_api_or_skip()
+        batch_size, seq_len, num_q_heads, num_v_heads = 4, 2, 16, 32
+        q = torch.randn(
+            batch_size,
+            seq_len,
+            num_q_heads,
+            128,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        k = torch.randn_like(q)
+        v = torch.randn(
+            batch_size,
+            seq_len,
+            num_v_heads,
+            128,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        a = torch.randn(
+            batch_size,
+            seq_len,
+            num_v_heads,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        b = torch.randn_like(a)
+        state = torch.empty_strided(
+            (6, num_v_heads, 128, 128),
+            (num_v_heads * 128 * 128 + 113, 128 * 128, 128, 1),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        state_indices = torch.tensor([1, 4, 2, 5], dtype=torch.int32, device="cuda")
+        intermediate = torch.empty(
+            batch_size,
+            4,
+            num_v_heads,
+            128,
+            128,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        output = torch.empty_like(v)
+        entry = mock.Mock()
+        with (
+            mock.patch.object(
+                cake_api,
+                "select_cake_gdn_decode_variant",
+                wraps=cake_api.select_cake_gdn_decode_variant,
+            ) as selector,
+            mock.patch.object(
+                cake_api,
+                "load_cake_gdn_kernel",
+                return_value=entry,
+            ),
+        ):
+            kernel = self._cake_decode_test_kernel(cake_api, output)
+            actual = kernel._try_cake_decode(
+                q=q,
+                k=k,
+                v=v,
+                state=state,
+                state_indices=state_indices,
+                A_log=torch.zeros(num_v_heads, dtype=torch.float32, device="cuda"),
+                a=a,
+                dt_bias=torch.zeros(
+                    num_v_heads, dtype=torch.float32, device="cuda"
+                ),
+                b=b,
+                layer_id=0,
+                disable_state_update=True,
+                intermediate_state=intermediate,
+                cache_steps=4,
+            )
+
+        self.assertIsNotNone(actual)
+        self.assertFalse(selector.call_args.kwargs["strided_inputs"])
+        self.assertEqual(
+            entry.call_args.args[-3:],
+            (batch_size * num_v_heads * 4, 1, 1),
+        )
+
+    def test_cake_fp32_t2_strided_inputs_use_inline_tile8_abi(self):
+        cake_api = self._cake_api_or_skip()
+        batch_size, seq_len, num_q_heads, num_v_heads = 1, 2, 16, 32
+
+        def padded(shape, inner_strides):
+            stride0 = shape[1] * inner_strides[0] + 17
+            tensor = torch.empty_strided(
+                shape,
+                (stride0, *inner_strides),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            return tensor.normal_()
+
+        q = padded((batch_size, seq_len, num_q_heads, 128), (2048, 128, 1))
+        k = padded((batch_size, seq_len, num_q_heads, 128), (2048, 128, 1))
+        v = padded((batch_size, seq_len, num_v_heads, 128), (4096, 128, 1))
+        a = padded((batch_size, seq_len, num_v_heads), (32, 1))
+        b = padded((batch_size, seq_len, num_v_heads), (32, 1))
+        state = torch.randn(
+            3,
+            num_v_heads,
+            128,
+            128,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        state_indices = torch.tensor([2], dtype=torch.int32, device="cuda")
+        intermediate = torch.empty(
+            batch_size,
+            seq_len,
+            num_v_heads,
+            128,
+            128,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        output = torch.empty(
+            batch_size,
+            seq_len,
+            num_v_heads,
+            128,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        entry = mock.Mock()
+        with (
+            mock.patch.object(
+                cake_api,
+                "select_cake_gdn_decode_variant",
+                wraps=cake_api.select_cake_gdn_decode_variant,
+            ) as selector,
+            mock.patch.object(
+                cake_api,
+                "load_cake_gdn_kernel",
+                return_value=entry,
+            ),
+        ):
+            kernel = self._cake_decode_test_kernel(cake_api, output)
+            actual = kernel._try_cake_decode(
+                q=q,
+                k=k,
+                v=v,
+                state=state,
+                state_indices=state_indices,
+                A_log=torch.zeros(num_v_heads, dtype=torch.float32, device="cuda"),
+                a=a,
+                dt_bias=torch.zeros(
+                    num_v_heads, dtype=torch.float32, device="cuda"
+                ),
+                b=b,
+                layer_id=0,
+                disable_state_update=True,
+                intermediate_state=intermediate,
+                cache_steps=2,
+            )
+
+        self.assertIsNotNone(actual)
+        self.assertTrue(selector.call_args.kwargs["strided_inputs"])
+        self.assertEqual(len(entry.call_args.args), 14)
+        self.assertEqual(
+            entry.call_args.args[-3:],
+            (batch_size * num_v_heads * 16, 1, 1),
+        )
 
     def test_cake_exact_decode_eager_and_cuda_graph(self):
         cake_api = self._cake_api_or_skip()
