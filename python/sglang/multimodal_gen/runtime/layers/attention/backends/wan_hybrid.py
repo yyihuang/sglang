@@ -57,9 +57,17 @@ class WanHybridEvidenceCollector:
         )
 
 
-_STANDALONE_EVIDENCE: ContextVar[WanHybridEvidenceCollector] = ContextVar(
-    "wan_hybrid_standalone_evidence", default=WanHybridEvidenceCollector()
+_STANDALONE_EVIDENCE: ContextVar[WanHybridEvidenceCollector | None] = ContextVar(
+    "wan_hybrid_standalone_evidence", default=None
 )
+
+
+def _standalone_evidence() -> WanHybridEvidenceCollector:
+    collector = _STANDALONE_EVIDENCE.get()
+    if collector is None:
+        collector = WanHybridEvidenceCollector()
+        _STANDALONE_EVIDENCE.set(collector)
+    return collector
 
 
 def reset_wan_hybrid_hit_count() -> None:
@@ -69,7 +77,7 @@ def reset_wan_hybrid_hit_count() -> None:
 
 
 def read_wan_hybrid_hit_count() -> int:
-    return _STANDALONE_EVIDENCE.get().hit_count()
+    return _standalone_evidence().hit_count()
 
 
 def _current_evidence_coordinates(
@@ -151,7 +159,7 @@ def _record_successful_wan_hybrid_forward(
         else None
     )
     if evidence is None:
-        _STANDALONE_EVIDENCE.get().record_success(None)
+        _standalone_evidence().record_success(None)
     else:
         collector, coordinates = evidence
         collector.record_success(coordinates)
@@ -161,7 +169,7 @@ def _record_successful_wan_hybrid_forward(
 def read_wan_hybrid_coverage() -> dict[str, Any]:
     """Return context-local standalone evidence outside serving requests."""
 
-    return _STANDALONE_EVIDENCE.get().coverage()
+    return _standalone_evidence().coverage()
 
 
 def _build_wan_hybrid_coverage(

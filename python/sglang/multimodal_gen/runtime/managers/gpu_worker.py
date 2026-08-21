@@ -104,6 +104,37 @@ OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
 )
 
 
+def _create_wan_hybrid_evidence_collectors(
+    request_ids: list[str],
+) -> dict[str, WanHybridEvidenceCollector]:
+    collectors: dict[str, WanHybridEvidenceCollector] = {}
+    for request_id in request_ids:
+        if not isinstance(request_id, str) or not request_id:
+            raise RuntimeError("Wan hybrid evidence requires a nonempty request_id")
+        if request_id in collectors:
+            raise RuntimeError(
+                "Wan hybrid evidence cannot attribute duplicate request_id "
+                f"{request_id!r}"
+            )
+        collectors[request_id] = WanHybridEvidenceCollector(request_id=request_id)
+    return collectors
+
+
+def _publish_wan_hybrid_evidence(
+    output_metrics: list[Any],
+    collectors_by_request_id: dict[str, WanHybridEvidenceCollector],
+) -> None:
+    for metrics in output_metrics:
+        collector = collectors_by_request_id.get(metrics.request_id)
+        if collector is None:
+            raise RuntimeError(
+                "Wan hybrid evidence could not map output request_id "
+                f"{metrics.request_id!r}"
+            )
+        metrics.wan_hybrid_hit_count = collector.hit_count()
+        metrics.wan_hybrid_coverage = collector.coverage()
+
+
 @dataclass
 class _ExpandedOutputParts:
     tensor_outputs: list[torch.Tensor] = field(default_factory=list)
@@ -499,21 +530,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
             for item in log_reqs:
                 item.log(server_args=self.server_args)
-            collectors_by_request_id: dict[str, WanHybridEvidenceCollector] = {}
+            collectors_by_request_id = _create_wan_hybrid_evidence_collectors(
+                [item.request_id for item in log_reqs]
+            )
             for item in log_reqs:
-                request_id = item.request_id
-                if not isinstance(request_id, str) or not request_id:
-                    raise RuntimeError(
-                        "Wan hybrid evidence requires a nonempty request_id"
-                    )
-                if request_id in collectors_by_request_id:
-                    raise RuntimeError(
-                        "Wan hybrid evidence cannot attribute duplicate request_id "
-                        f"{request_id!r}"
-                    )
-                collector = WanHybridEvidenceCollector(request_id=request_id)
+                collector = collectors_by_request_id[item.request_id]
                 item._wan_hybrid_evidence_collector = collector
-                collectors_by_request_id[request_id] = collector
             with ExitStack() as stack:
                 for item in log_reqs:
                     stack.enter_context(
@@ -529,15 +551,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # before converting it to OutputBatch
             if return_req and isinstance(result, Req):
                 if result.metrics is not None:
-                    result_request_id = result.metrics.request_id
-                    collector = collectors_by_request_id.get(result_request_id)
-                    if collector is None:
-                        raise RuntimeError(
-                            "Wan hybrid evidence could not map returned request_id "
-                            f"{result_request_id!r}"
-                        )
-                    result.metrics.wan_hybrid_hit_count = collector.hit_count()
-                    result.metrics.wan_hybrid_coverage = collector.coverage()
+                    _publish_wan_hybrid_evidence(
+                        [result.metrics], collectors_by_request_id
+                    )
                 return result
 
             output_batch = self._to_output_batch(result)
@@ -551,14 +567,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             duration_ms = (time.monotonic() - start_time) * 1000
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
-                collector = collectors_by_request_id.get(metrics.request_id)
-                if collector is None:
-                    raise RuntimeError(
-                        "Wan hybrid evidence could not map output request_id "
-                        f"{metrics.request_id!r}"
-                    )
-                metrics.wan_hybrid_hit_count = collector.hit_count()
-                metrics.wan_hybrid_coverage = collector.coverage()
+            _publish_wan_hybrid_evidence(
+                output_metrics, collectors_by_request_id
+            )
 
             self._materialize_output_transport(output_batch, req, save_output_paths)
             self._record_output_peak_memory(output_batch)
