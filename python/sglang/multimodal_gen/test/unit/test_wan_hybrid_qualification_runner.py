@@ -347,6 +347,27 @@ def _full_transformer_forward_report(
     }
     component_path = model_root / component_name
     config_path = component_path / "config.json"
+    capture_request_id = f"capture-{component_name}"
+    capture_coordinates = {
+        "step_index": 3,
+        "actual_timestep": 500,
+        "cfg_branch_index": 0,
+    }
+    capture_sampling = {
+        "prompt_sha256": hashlib.sha256(b"qualification prompt").hexdigest(),
+        "parameters": {
+            "seed": 4254,
+            "width": 640,
+            "height": 384,
+            "num_frames": 17,
+            "num_inference_steps": 12,
+        },
+    }
+    capture_sampling_sha256 = hashlib.sha256(
+        json.dumps(
+            capture_sampling, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
     binding = {
         "schema_version": 1,
         "component_name": component_name,
@@ -363,10 +384,82 @@ def _full_transformer_forward_report(
         ).hexdigest(),
         "reference_model": identity,
         "candidate_model": identity,
+        "capture_request_id": capture_request_id,
+        "capture_coordinates": capture_coordinates,
+        "capture_sampling_sha256": capture_sampling_sha256,
     }
+    capture_manifest_binding = {
+        "schema_version": 1,
+        "request_id": capture_request_id,
+        "component_name": component_name,
+        "capture_coordinates": capture_coordinates,
+        "sampling_sha256": capture_sampling_sha256,
+        "input_sha256": binding["fixed_input_sha256"],
+    }
+    binding["capture_manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            capture_manifest_binding, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
     binding["binding_sha256"] = hashlib.sha256(
         json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    request_ids = {
+        variant: [
+            f"{component_name}-{run_order}-{variant}-{run_index}"
+            for run_index in range(measure_runs)
+        ]
+        for variant in ("reference", "candidate")
+    }
+
+    def direct_coverage(variant: str, request_id: str) -> dict:
+        candidate = variant == "candidate"
+        layers = list(range(40))
+        hits = 40 if candidate else 0
+        return {
+            "schema_version": 2,
+            "request_id": request_id,
+            "expected_hit_count": hits,
+            "actual_hit_count": hits,
+            "attributed_actual_hit_count": hits,
+            "unattributed_actual_hit_count": 0,
+            "eligible_hybrid_miss_count": 0,
+            "num_route_events": 40,
+            "num_success_events": hits,
+            "steps": [
+                {
+                    "step_index": capture_coordinates["step_index"],
+                    "actual_timestep": capture_coordinates["actual_timestep"],
+                    "active_component": component_name,
+                    "executed_cfg_branch_indices": [
+                        capture_coordinates["cfg_branch_index"]
+                    ],
+                    "branches": [
+                        {
+                            "cfg_branch_index": capture_coordinates[
+                                "cfg_branch_index"
+                            ],
+                            "num_layers": 40,
+                            "layer_indices": layers,
+                            "eligible_layer_indices": layers if candidate else [],
+                            "planned_hybrid_layer_indices": (
+                                layers if candidate else []
+                            ),
+                            "successful_hybrid_layer_indices": (
+                                layers if candidate else []
+                            ),
+                            "eligible_hybrid_miss_layer_indices": [],
+                            "unexpected_successful_hybrid_layer_indices": [],
+                            "configured_fallback_layer_indices": [],
+                            "control_layer_indices": [] if candidate else layers,
+                            "expected_hit_count": hits,
+                            "actual_hit_count": hits,
+                        }
+                    ],
+                }
+            ],
+        }
+
     return {
         "comparison_mode": "correctness",
         "run_order": run_order,
@@ -378,6 +471,16 @@ def _full_transformer_forward_report(
         "num_blocks": 40,
         "candidate_per_run_wan_hybrid_hit_count": [40] * measure_runs,
         "candidate_per_run_wan_hybrid_expected_hit_count": [40] * measure_runs,
+        "reference_per_run_request_id": request_ids["reference"],
+        "candidate_per_run_request_id": request_ids["candidate"],
+        "reference_per_run_wan_hybrid_coverage": [
+            direct_coverage("reference", request_id)
+            for request_id in request_ids["reference"]
+        ],
+        "candidate_per_run_wan_hybrid_coverage": [
+            direct_coverage("candidate", request_id)
+            for request_id in request_ids["candidate"]
+        ],
         "cross_variant_metrics": {
             "pairing": "cross-product",
             "comparisons": [
@@ -409,6 +512,10 @@ def _full_transformer_forward_report(
                 },
                 "expected_hit_counts": [40] * measure_runs,
                 "actual_hit_counts": [40] * measure_runs,
+            },
+            "request_local_backend_coverage": {
+                "passed": True,
+                "failures": [],
             },
         },
     }
