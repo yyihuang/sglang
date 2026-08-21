@@ -1192,25 +1192,34 @@ def gemm_blockscaled(
     **kwargs,
 ) -> None:
     """Blockscaled GEMM using cute.gemm with per-kblock SFA/SFB TMEM addresses."""
-    def issue_kblock(kblock: int) -> None:
-        sf_kblock_coord = (None, None, kblock)
-        tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
-        tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or kblock != 0)
-        cute.gemm(
-            tiled_mma,
-            acc,
-            tCrA[None, None, kblock],
-            tCrB[None, None, kblock],
-            acc,
-        )
-
     if const_expr(kblock_idx is None):
         num_kblocks = cute.size(tCrA.shape[2])
         for kblock in cutlass.range(num_kblocks, unroll_full=True):
-            issue_kblock(kblock)
+            sf_kblock_coord = (None, None, kblock)
+            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
+            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or kblock != 0)
+            cute.gemm(
+                tiled_mma,
+                acc,
+                tCrA[None, None, kblock],
+                tCrB[None, None, kblock],
+                acc,
+            )
     else:
-        issue_kblock(kblock_idx)
+        sf_kblock_coord = (None, None, kblock_idx)
+        tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
+        tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
+        tiled_mma.set(
+            tcgen05.Field.ACCUMULATE, not zero_init or kblock_idx != 0
+        )
+        cute.gemm(
+            tiled_mma,
+            acc,
+            tCrA[None, None, kblock_idx],
+            tCrB[None, None, kblock_idx],
+            acc,
+        )
 
 
 @cute.jit
