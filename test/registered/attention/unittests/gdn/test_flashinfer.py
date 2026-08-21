@@ -606,11 +606,11 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             )
             return tensor.normal_()
 
-        q = padded((batch_size, seq_len, num_q_heads, 128), (2048, 128, 1))
-        k = padded((batch_size, seq_len, num_q_heads, 128), (2048, 128, 1))
-        v = padded((batch_size, seq_len, num_v_heads, 128), (4096, 128, 1))
-        a = padded((batch_size, seq_len, num_v_heads), (32, 1))
-        b = padded((batch_size, seq_len, num_v_heads), (32, 1))
+        q = padded((batch_size, seq_len, num_q_heads, 128), (2065, 128, 1))
+        k = padded((batch_size, seq_len, num_q_heads, 128), (2065, 128, 1))
+        v = padded((batch_size, seq_len, num_v_heads, 128), (4113, 128, 1))
+        a = padded((batch_size, seq_len, num_v_heads), (49, 1))
+        b = padded((batch_size, seq_len, num_v_heads), (49, 1))
         state = torch.randn(
             3,
             num_v_heads,
