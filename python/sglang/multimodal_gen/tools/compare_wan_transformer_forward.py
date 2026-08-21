@@ -1,9 +1,9 @@
 """Qualify one full Wan transformer forward with per-block coverage.
 
 The public entry point accepts already-loaded reference and candidate model
-instances plus zero-argument forward callables.  It records every module in
-``model.blocks`` using forward hooks, so callers can replay a real captured Wan
-input without coupling this evaluator to a particular checkpoint loader.
+instances plus one fixed mapping of model-forward keyword arguments. It invokes
+both models itself and records every module in ``model.blocks`` using forward
+hooks, so caller-owned closures cannot substitute an unreported input.
 
 The same model instance is reused for every measured run.  Reference/candidate
 quality uses the trajectory evaluator's fixed tolerances over every run pair
@@ -14,8 +14,10 @@ measurement.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -48,6 +50,151 @@ class WanTransformerForwardTrace:
     @property
     def trajectory_timesteps(self) -> torch.Tensor:
         return torch.arange(len(self.block_outputs), dtype=torch.float32)
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _summarize_fixed_input(value: Any, *, location: str = "input") -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.layout != torch.strided:
+            raise TypeError(f"{location} must use strided tensor storage")
+        raw = value.detach().contiguous().reshape(-1).view(torch.uint8).cpu()
+        return {
+            "kind": "tensor",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "sha256": hashlib.sha256(raw.numpy().tobytes()).hexdigest(),
+        }
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError(f"{location} mapping keys must be strings")
+        return {
+            key: _summarize_fixed_input(item, location=f"{location}.{key}")
+            for key, item in sorted(value.items())
+        }
+    if isinstance(value, (tuple, list)):
+        return [
+            _summarize_fixed_input(item, location=f"{location}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(
+        f"{location} has unsupported provenance type {type(value).__name__}"
+    )
+
+
+def _model_identity(model: Any) -> dict[str, Any]:
+    blocks = tuple(getattr(model, "blocks", ()))
+    config_values = {}
+    for attribute in ("config", "hf_config"):
+        value = getattr(model, attribute, None)
+        if value is None:
+            continue
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+        elif not isinstance(value, Mapping) and hasattr(value, "__dict__"):
+            value = vars(value)
+        config_values[attribute] = _stable_config_value(value)
+
+    parameter_manifest = [
+        {
+            "name": name,
+            "shape": list(parameter.shape),
+            "dtype": str(parameter.dtype),
+            "numel": parameter.numel(),
+        }
+        for name, parameter in model.named_parameters()
+    ]
+    buffer_manifest = [
+        {
+            "name": name,
+            "shape": list(buffer.shape),
+            "dtype": str(buffer.dtype),
+            "numel": buffer.numel(),
+        }
+        for name, buffer in model.named_buffers()
+    ]
+    identity = {
+        "class": f"{type(model).__module__}.{type(model).__qualname__}",
+        "num_blocks": len(blocks),
+        "config_sha256": _sha256_json(config_values),
+        "parameter_manifest_sha256": _sha256_json(parameter_manifest),
+        "buffer_manifest_sha256": _sha256_json(buffer_manifest),
+        "parameter_count": sum(item["numel"] for item in parameter_manifest),
+        "buffer_count": sum(item["numel"] for item in buffer_manifest),
+    }
+    return identity | {"identity_sha256": _sha256_json(identity)}
+
+
+def _stable_config_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_config_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [_stable_config_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (Path, torch.dtype, torch.device)):
+        return str(value)
+    return {"type": f"{type(value).__module__}.{type(value).__qualname__}"}
+
+
+def build_wan_transformer_evidence_binding(
+    *,
+    component_name: str,
+    component_model_path: str | Path,
+    fixed_input: Any,
+    reference_model: Any,
+    candidate_model: Any,
+) -> dict[str, Any]:
+    """Bind a report to the loaded component path, model objects, and inputs."""
+
+    if component_name not in ("transformer", "transformer_2"):
+        raise ValueError("component_name must be transformer or transformer_2")
+    component_path = Path(component_model_path).expanduser().resolve()
+    config_path = component_path / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"component config is required for provenance: {config_path}"
+        )
+    config_files = [
+        {"path": "config.json", "sha256": _sha256_file(config_path)}
+    ]
+    index_path = component_path / "diffusion_pytorch_model.safetensors.index.json"
+    if index_path.is_file():
+        config_files.append(
+            {"path": index_path.name, "sha256": _sha256_file(index_path)}
+        )
+    input_summary = _summarize_fixed_input(fixed_input)
+    binding = {
+        "schema_version": 1,
+        "component_name": component_name,
+        "resolved_component_path": str(component_path),
+        "component_config_files": config_files,
+        "fixed_input": input_summary,
+        "fixed_input_sha256": _sha256_json(input_summary),
+        "reference_model": _model_identity(reference_model),
+        "candidate_model": _model_identity(candidate_model),
+    }
+    return binding | {"binding_sha256": _sha256_json(binding)}
 
 
 def _extract_tensor(value: Any, *, location: str) -> torch.Tensor:
@@ -345,11 +492,11 @@ def run_wan_transformer_forward_qualification(
     *,
     reference_model: Any,
     candidate_model: Any,
-    reference_forward: Callable[[], Any],
-    candidate_forward: Callable[[], Any],
     reset_candidate_hit_count: Callable[[], None],
     read_candidate_hit_count: Callable[[], int],
     component_name: str,
+    component_model_path: str | Path,
+    fixed_input: Mapping[str, Any],
     run_order: str = "reference-first",
     warmup_runs: int = MIN_QUALIFICATION_WARMUP_RUNS,
     measure_runs: int = MIN_QUALIFICATION_MEASURE_RUNS,
@@ -364,16 +511,25 @@ def run_wan_transformer_forward_qualification(
     )
     if component_name not in ("transformer", "transformer_2"):
         raise ValueError("component_name must be transformer or transformer_2")
+    if any(not isinstance(key, str) for key in fixed_input):
+        raise TypeError("fixed_input keys must be model-forward keyword names")
+    evidence_binding = build_wan_transformer_evidence_binding(
+        component_name=component_name,
+        component_model_path=component_model_path,
+        fixed_input=fixed_input,
+        reference_model=reference_model,
+        candidate_model=candidate_model,
+    )
     variant_calls = {
         "reference": lambda: _run_variant(
             reference_model,
-            reference_forward,
+            lambda: reference_model(**fixed_input),
             warmup_runs=warmup_runs,
             measure_runs=measure_runs,
         ),
         "candidate": lambda: _run_variant(
             candidate_model,
-            candidate_forward,
+            lambda: candidate_model(**fixed_input),
             warmup_runs=warmup_runs,
             measure_runs=measure_runs,
             reset_hit_count=reset_candidate_hit_count,
@@ -388,6 +544,9 @@ def run_wan_transformer_forward_qualification(
     traces: dict[str, list[WanTransformerForwardTrace]] = {}
     for variant in execution_order:
         traces[variant] = variant_calls[variant]()
+    invocation_input_sha256 = _sha256_json(_summarize_fixed_input(fixed_input))
+    if evidence_binding["fixed_input_sha256"] != invocation_input_sha256:
+        raise RuntimeError("full-transformer forward mutated the fixed input")
 
     result = evaluate_transformer_forward_correctness(
         traces["reference"], traces["candidate"]
@@ -398,6 +557,8 @@ def run_wan_transformer_forward_qualification(
         "warmup_runs": warmup_runs,
         "measure_runs": measure_runs,
         "component_name": component_name,
+        "evidence_binding": evidence_binding,
+        "invocation_input_sha256": invocation_input_sha256,
         "num_blocks": len(traces["reference"][0].block_outputs),
         "candidate_per_run_wan_hybrid_expected_hit_count": [
             len(trace.block_outputs) for trace in traces["candidate"]
@@ -414,6 +575,7 @@ def validate_wan_transformer_forward_report(
     *,
     expected_warmup_runs: int = MIN_QUALIFICATION_WARMUP_RUNS,
     expected_measure_runs: int = MIN_QUALIFICATION_MEASURE_RUNS,
+    expected_model_path: str | Path | None = None,
 ) -> list[str]:
     """Validate a serialized real-input full-transformer report."""
 
@@ -430,6 +592,89 @@ def validate_wan_transformer_forward_report(
         errors.append("measured run count does not match the protocol")
     if report.get("component_name") not in ("transformer", "transformer_2"):
         errors.append("component_name must identify transformer or transformer_2")
+    binding = report.get("evidence_binding")
+    if not isinstance(binding, dict):
+        errors.append("evidence binding is missing")
+    else:
+        binding_payload = {
+            key: value for key, value in binding.items() if key != "binding_sha256"
+        }
+        if binding.get("binding_sha256") != _sha256_json(binding_payload):
+            errors.append("evidence binding SHA256 is inconsistent")
+        if binding.get("schema_version") != 1:
+            errors.append("evidence binding schema is unsupported")
+        if binding.get("component_name") != report.get("component_name"):
+            errors.append("evidence binding component does not match report")
+        fixed_input = binding.get("fixed_input")
+        if (
+            fixed_input is None
+            or binding.get("fixed_input_sha256") != _sha256_json(fixed_input)
+        ):
+            errors.append("fixed-input provenance is incomplete")
+        if report.get("invocation_input_sha256") != binding.get(
+            "fixed_input_sha256"
+        ):
+            errors.append("invoked input does not match fixed-input provenance")
+        for variant in ("reference_model", "candidate_model"):
+            identity = binding.get(variant)
+            if not isinstance(identity, dict):
+                errors.append(f"{variant} identity is missing")
+                continue
+            identity_payload = {
+                key: value
+                for key, value in identity.items()
+                if key != "identity_sha256"
+            }
+            if identity.get("identity_sha256") != _sha256_json(identity_payload):
+                errors.append(f"{variant} identity SHA256 is inconsistent")
+            if identity.get("num_blocks") != 40:
+                errors.append(f"{variant} identity does not contain 40 blocks")
+        config_files = binding.get("component_config_files")
+        if (
+            not isinstance(config_files, list)
+            or not any(
+                isinstance(item, dict)
+                and item.get("path") == "config.json"
+                and isinstance(item.get("sha256"), str)
+                and len(item["sha256"]) == 64
+                for item in config_files
+            )
+        ):
+            errors.append("component config provenance is incomplete")
+        if expected_model_path is not None and report.get("component_name") in (
+            "transformer",
+            "transformer_2",
+        ):
+            expected_component_path = (
+                Path(expected_model_path)
+                .expanduser()
+                .joinpath(report["component_name"])
+                .resolve()
+            )
+            if binding.get("resolved_component_path") != str(
+                expected_component_path
+            ):
+                errors.append(
+                    "resolved component path does not match model/component"
+                )
+            expected_config_path = expected_component_path / "config.json"
+            reported_config = next(
+                (
+                    item
+                    for item in config_files
+                    if isinstance(item, dict) and item.get("path") == "config.json"
+                ),
+                None,
+            )
+            if (
+                not expected_config_path.is_file()
+                or reported_config is None
+                or reported_config.get("sha256")
+                != _sha256_file(expected_config_path)
+            ):
+                errors.append(
+                    "component config provenance does not match resolved model"
+                )
     num_blocks = report.get("num_blocks")
     if (
         isinstance(num_blocks, bool)

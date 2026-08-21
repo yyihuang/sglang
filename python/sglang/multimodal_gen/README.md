@@ -146,23 +146,31 @@ trajectory with the primary transformer component routed to `wan_hybrid`. It is
 not an independent transformer single-forward result. For that separate check,
 use
 `run_wan_transformer_forward_qualification`. The caller supplies already-loaded
-reference and candidate models plus forward callables that replay the same
-captured real Wan input. Run it in both explicit execution orders, write each
-report with `write_wan_transformer_forward_report`, and pass the two paths to a
-`full-transformer` runner invocation:
+reference and candidate models, the resolved component directory, and the
+actual fixed mapping of model-forward keyword arguments. The harness invokes
+both models directly with that same mapping; caller-owned forward closures are
+not accepted. Run both
+`transformer` and `transformer_2` in both explicit execution orders, write each
+report with `write_wan_transformer_forward_report`, and pass all four paths to
+a `full-transformer` runner invocation:
 
 ```bash
-  --full-transformer-forward-report /results/reference-first-forward.json \
-  --full-transformer-forward-report /results/candidate-first-forward.json
+  --full-transformer-forward-report /results/transformer-reference-first.json \
+  --full-transformer-forward-report /results/transformer-candidate-first.json \
+  --full-transformer-forward-report /results/transformer-2-reference-first.json \
+  --full-transformer-forward-report /results/transformer-2-candidate-first.json
 ```
 
 The runner validates these reports as independent evidence before starting its
 generation matrix. The harness reuses the trajectory evaluator over
 forward-hook snapshots from every entry in `model.blocks`, computes the complete
 5-by-5 cross-variant product and all ten same-instance run pairs, and separately
-checks the final transformer output. The real model loader and captured forward
-call belong in the remote evaluation environment; the public harness does not
-guess checkpoint-specific inputs. Hook capture is a correctness path and must
+checks the final transformer output. Each report is cryptographically bound to
+its component name, resolved component configuration, loaded model manifests,
+and fixed tensor inputs, so relabelling one component's report is rejected. The
+real model loader and captured forward inputs belong in the remote evaluation
+environment; the public harness does not guess checkpoint-specific inputs. Hook
+capture is a correctness path and must
 not be used for performance timing.
 
 ### Component residency

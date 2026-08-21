@@ -224,6 +224,7 @@ def validate_full_transformer_forward_evidence(
     *,
     expected_warmup_runs: int = MIN_QUALIFICATION_WARMUP_RUNS,
     expected_measure_runs: int = MIN_QUALIFICATION_MEASURE_RUNS,
+    expected_model_path: str | Path | None = None,
 ) -> list[str]:
     """Require valid forwards for both 40-block components in both orders."""
 
@@ -242,6 +243,7 @@ def validate_full_transformer_forward_evidence(
             report,
             expected_warmup_runs=expected_warmup_runs,
             expected_measure_runs=expected_measure_runs,
+            expected_model_path=expected_model_path,
         )
         errors.extend(f"{location}: {error}" for error in report_errors)
         if isinstance(report, dict):
@@ -255,6 +257,30 @@ def validate_full_transformer_forward_evidence(
             "independent full-transformer evidence must cover transformer and "
             "transformer_2 in both execution orders"
         )
+    bindings_by_component: dict[str, list[Any]] = {
+        component: [] for component in WAN_TRANSFORMER_COMPONENTS
+    }
+    for report in reports:
+        if (
+            isinstance(report, dict)
+            and report.get("component_name") in bindings_by_component
+        ):
+            bindings_by_component[report["component_name"]].append(
+                report.get("evidence_binding")
+            )
+    for component, bindings in bindings_by_component.items():
+        if len(bindings) == 2 and bindings[0] != bindings[1]:
+            errors.append(
+                f"{component} evidence binding differs between execution orders"
+            )
+    resolved_paths = {
+        binding.get("resolved_component_path")
+        for bindings in bindings_by_component.values()
+        for binding in bindings[:1]
+        if isinstance(binding, dict)
+    }
+    if len(resolved_paths) != len(WAN_TRANSFORMER_COMPONENTS):
+        errors.append("transformer component evidence paths are not distinct")
     return errors
 
 
@@ -305,6 +331,7 @@ def _full_transformer_forward_evidence(
                 reports,
                 expected_warmup_runs=config.warmup_runs,
                 expected_measure_runs=config.measure_runs,
+                expected_model_path=config.model_path,
             )
         )
     elif len(config.full_transformer_forward_reports) != len(
@@ -390,13 +417,18 @@ def _validate_generation_summary(
             if dtypes != ["uint8"] * expected_num_frames:
                 errors.append(f"{output_location}: unexpected frame dtypes")
     if require_hits:
+        request_ids = generation.get("per_run_request_id")
         hit_counts = generation.get("per_run_wan_hybrid_hit_count")
         expected_hit_counts = generation.get(
             "per_run_wan_hybrid_expected_hit_count"
         )
         coverages = generation.get("per_run_wan_hybrid_coverage")
         if (
-            not isinstance(hit_counts, list)
+            not isinstance(request_ids, list)
+            or len(request_ids) != expected_measure_runs
+            or any(not isinstance(item, str) or not item for item in request_ids)
+            or len(set(request_ids)) != expected_measure_runs
+            or not isinstance(hit_counts, list)
             or len(hit_counts) != expected_measure_runs
             or not isinstance(expected_hit_counts, list)
             or len(expected_hit_counts) != expected_measure_runs
@@ -407,8 +439,13 @@ def _validate_generation_summary(
                 f"{location}: missing exact per-run wan_hybrid hit evidence"
             )
         else:
-            for run_index, (hit_count, expected_hit_count, coverage) in enumerate(
-                zip(hit_counts, expected_hit_counts, coverages)
+            for run_index, (
+                request_id,
+                hit_count,
+                expected_hit_count,
+                coverage,
+            ) in enumerate(
+                zip(request_ids, hit_counts, expected_hit_counts, coverages)
             ):
                 coverage_location = (
                     f"{location}.per_run_wan_hybrid_coverage[{run_index}]"
@@ -421,6 +458,13 @@ def _validate_generation_summary(
                         location=coverage_location,
                     )
                 )
+                if (
+                    not isinstance(coverage, dict)
+                    or coverage.get("request_id") != request_id
+                ):
+                    errors.append(
+                        f"{coverage_location}: request identity does not match result"
+                    )
                 if not isinstance(coverage, dict):
                     continue
                 if (
@@ -603,10 +647,13 @@ def _validate_report_provenance(
     if not isinstance(fixed_input, dict):
         errors.append("provenance.fixed_input is missing")
     else:
+        expected_model_path = str(Path(config.model_path).expanduser().resolve())
         expected_fixed_fields = {
+            "model_path": expected_model_path,
             "model_id": config.model_id,
             "prompt": config.prompt,
             "seed": config.seed,
+            "sampling_kwargs": report.get("sampling_kwargs"),
         }
         for field_name, expected_value in expected_fixed_fields.items():
             if fixed_input.get(field_name) != expected_value:
@@ -623,6 +670,8 @@ def _validate_report_provenance(
         not isinstance(model, dict)
         or not isinstance(model.get("resolved_path"), str)
         or not model.get("resolved_path")
+        or model.get("resolved_path")
+        != str(Path(config.model_path).expanduser().resolve())
         or model.get("model_id") != config.model_id
         or not isinstance(model.get("config_files"), list)
         or not model.get("config_files")
@@ -646,6 +695,7 @@ def _validate_report_provenance(
     if (
         not isinstance(runtime, dict)
         or runtime.get("sglang_revision") != config.sglang_revision
+        or runtime.get("flashinfer_revision") != config.flashinfer_revision
         or not isinstance(runtime.get("gpu"), dict)
         or not runtime.get("gpu", {}).get("name")
     ):
@@ -1085,8 +1135,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=[],
         help=(
-            "Independent single-forward correctness report; pass one for each "
-            "execution order when selecting the full-transformer scenario."
+            "Independent single-forward correctness report; pass exactly four "
+            "covering transformer and transformer_2 in both execution orders "
+            "when selecting the full-transformer scenario."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")

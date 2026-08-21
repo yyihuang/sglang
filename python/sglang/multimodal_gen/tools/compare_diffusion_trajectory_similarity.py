@@ -31,6 +31,7 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -869,6 +870,48 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _module_git_revision(module: Any) -> str | None:
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        return None
+    module_dir = Path(module_file).resolve().parent
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", str(module_dir), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        repository_root = Path(root_result.stdout.strip()).resolve()
+        relative_module = Path(module_file).resolve().relative_to(repository_root)
+        if any(
+            part in {".venv", "site-packages", "dist-packages"}
+            for part in relative_module.parts
+        ):
+            return None
+        completed = subprocess.run(
+            ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (
+        OSError,
+        ValueError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
+        return None
+    revision = completed.stdout.strip()
+    if len(revision) != 40 or any(
+        character not in "0123456789abcdef" for character in revision.lower()
+    ):
+        return None
+    return revision.lower()
+
+
 def build_qualification_provenance(
     args: argparse.Namespace,
     *,
@@ -914,6 +957,7 @@ def build_qualification_provenance(
     try:
         import flashinfer
 
+        flashinfer_revision = _module_git_revision(flashinfer)
         flashinfer_public_api = {
             "WanHybridAttentionWorkspace": hasattr(
                 flashinfer, "WanHybridAttentionWorkspace"
@@ -924,6 +968,7 @@ def build_qualification_provenance(
             "wan_hybrid_attention": hasattr(flashinfer, "wan_hybrid_attention"),
         }
     except ImportError:
+        flashinfer_revision = None
         flashinfer_public_api = {
             "WanHybridAttentionWorkspace": False,
             "is_wan_hybrid_attention_available": False,
@@ -951,6 +996,7 @@ def build_qualification_provenance(
         },
         "runtime": {
             "sglang_revision": get_git_commit_hash(),
+            "flashinfer_revision": flashinfer_revision,
             "flashinfer_version": flashinfer_version,
             "flashinfer_public_api": flashinfer_public_api,
             "gpu": gpu,
@@ -1112,6 +1158,16 @@ def _extract_wan_hybrid_coverage(result: Any) -> dict[str, Any] | None:
     return coverage
 
 
+def _extract_request_id(result: Any) -> str | None:
+    metrics = getattr(result, "metrics", None)
+    if not isinstance(metrics, dict):
+        return None
+    request_id = metrics.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    return request_id
+
+
 def _extract_generation_time_s(result: Any) -> float:
     """Return a populated end-to-end generation duration.
 
@@ -1198,6 +1254,7 @@ def run_variant(
     wan_hybrid_coverages = [
         _extract_wan_hybrid_coverage(result) for result in measured_results
     ]
+    request_ids = [_extract_request_id(result) for result in measured_results]
     wan_hybrid_expected_hit_counts = [
         coverage.get("expected_hit_count") if coverage is not None else None
         for coverage in wan_hybrid_coverages
@@ -1243,6 +1300,7 @@ def run_variant(
         "per_run_wan_hybrid_hit_count": wan_hybrid_hit_counts,
         "per_run_wan_hybrid_expected_hit_count": wan_hybrid_expected_hit_counts,
         "per_run_wan_hybrid_coverage": wan_hybrid_coverages,
+        "per_run_request_id": request_ids,
         "per_run_output_summaries": output_summaries,
     }
 

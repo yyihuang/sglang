@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import itertools
 import hashlib
+import itertools
 import json
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MODEL_QUALIFICATION_THRESHOLDS,
     QUALIFICATION_RUN_ORDERS,
+    _module_git_revision,
 )
 from sglang.multimodal_gen.tools.run_wan_hybrid_qualification import (
     WanQualificationConfig,
+    _parse_args,
     build_qualification_plan,
     run_qualification_plan,
     validate_full_transformer_forward_evidence,
@@ -40,7 +46,9 @@ def _output_summary() -> dict:
     }
 
 
-def _coverage(scenario: str, num_steps: int = 12) -> dict:
+def _coverage(
+    scenario: str, num_steps: int = 12, request_id: str = "qualification-request"
+) -> dict:
     expected_layers = list(range(40))
     steps = []
     expected_hits = 0
@@ -92,7 +100,7 @@ def _coverage(scenario: str, num_steps: int = 12) -> dict:
         )
     return {
         "schema_version": 2,
-        "request_id": "qualification-request",
+        "request_id": request_id,
         "expected_hit_count": expected_hits,
         "actual_hit_count": expected_hits,
         "attributed_actual_hit_count": expected_hits,
@@ -105,6 +113,7 @@ def _coverage(scenario: str, num_steps: int = 12) -> dict:
 
 
 def _generation(measure_runs: int, *, include_hits: bool, scenario="generation") -> dict:
+    request_ids = [f"request-{index}" for index in range(measure_runs)]
     result = {
         "warmup_runs": 2,
         "measure_runs": measure_runs,
@@ -112,9 +121,13 @@ def _generation(measure_runs: int, *, include_hits: bool, scenario="generation")
         "per_run_total_duration_ms": [900.0] * measure_runs,
         "timer_scope": "complete DiffGenerator.generate call including output materialization",
         "per_run_output_summaries": [_output_summary() for _ in range(measure_runs)],
+        "per_run_request_id": request_ids,
     }
     if include_hits:
-        coverages = [_coverage(scenario) for _ in range(measure_runs)]
+        coverages = [
+            _coverage(scenario, request_id=request_id)
+            for request_id in request_ids
+        ]
         expected = [coverage["expected_hit_count"] for coverage in coverages]
         result["per_run_wan_hybrid_hit_count"] = expected
         result["per_run_wan_hybrid_expected_hit_count"] = expected
@@ -165,6 +178,7 @@ def _provenance(server_kwargs: dict) -> dict:
         },
         "runtime": {
             "sglang_revision": "sglang-revision",
+            "flashinfer_revision": "flashinfer-revision",
             "flashinfer_version": "test",
             "flashinfer_public_api": {
                 "WanHybridAttentionWorkspace": True,
@@ -304,16 +318,63 @@ def _performance_report(measure_runs: int = 5) -> dict:
 
 
 def _full_transformer_forward_report(
-    component_name: str, run_order: str, measure_runs: int = 5
+    component_name: str,
+    run_order: str,
+    model_root: Path,
+    measure_runs: int = 5,
 ) -> dict:
     cross_pairs = itertools.product(range(measure_runs), range(measure_runs))
     repeat_pairs = list(itertools.combinations(range(measure_runs), 2))
+    identity = {
+        "class": "test.TinyWanTransformer",
+        "num_blocks": 40,
+        "config_sha256": "c" * 64,
+        "parameter_manifest_sha256": "d" * 64,
+        "buffer_manifest_sha256": "e" * 64,
+        "parameter_count": 1,
+        "buffer_count": 0,
+    }
+    identity["identity_sha256"] = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    fixed_input = {
+        "hidden_states": {
+            "kind": "tensor",
+            "shape": [1, 2],
+            "dtype": "torch.float32",
+            "sha256": "f" * 64,
+        }
+    }
+    component_path = model_root / component_name
+    config_path = component_path / "config.json"
+    binding = {
+        "schema_version": 1,
+        "component_name": component_name,
+        "resolved_component_path": str(component_path.resolve()),
+        "component_config_files": [
+            {
+                "path": "config.json",
+                "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            }
+        ],
+        "fixed_input": fixed_input,
+        "fixed_input_sha256": hashlib.sha256(
+            json.dumps(fixed_input, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "reference_model": identity,
+        "candidate_model": identity,
+    }
+    binding["binding_sha256"] = hashlib.sha256(
+        json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return {
         "comparison_mode": "correctness",
         "run_order": run_order,
         "warmup_runs": 2,
         "measure_runs": measure_runs,
         "component_name": component_name,
+        "evidence_binding": binding,
+        "invocation_input_sha256": binding["fixed_input_sha256"],
         "num_blocks": 40,
         "candidate_per_run_wan_hybrid_hit_count": [40] * measure_runs,
         "candidate_per_run_wan_hybrid_expected_hit_count": [40] * measure_runs,
@@ -415,18 +476,55 @@ def test_dry_run_records_neutral_staging_revisions(tmp_path):
     assert not output_dir.exists()
 
 
-def test_independent_full_transformer_evidence_requires_both_orders():
+def _write_component_configs(model_root: Path) -> None:
+    for component_name in ("transformer", "transformer_2"):
+        component_path = model_root / component_name
+        component_path.mkdir(parents=True)
+        (component_path / "config.json").write_text(
+            json.dumps({"component": component_name, "num_layers": 40}),
+            encoding="utf-8",
+        )
+
+
+def test_independent_full_transformer_evidence_requires_both_orders(tmp_path):
+    model_root = tmp_path / "wan-model"
+    _write_component_configs(model_root)
     reports = [
-        _full_transformer_forward_report(component_name, run_order)
+        _full_transformer_forward_report(component_name, run_order, model_root)
         for component_name in ("transformer", "transformer_2")
         for run_order in ("reference-first", "candidate-first")
     ]
 
-    assert validate_full_transformer_forward_evidence(reports) == []
+    assert (
+        validate_full_transformer_forward_evidence(
+            reports, expected_model_path=model_root
+        )
+        == []
+    )
 
     reports[1]["run_order"] = "reference-first"
-    errors = validate_full_transformer_forward_evidence(reports)
+    errors = validate_full_transformer_forward_evidence(
+        reports, expected_model_path=model_root
+    )
 
+    assert any("both execution orders" in error for error in errors)
+
+
+def test_independent_full_transformer_evidence_rejects_relabelled_report(tmp_path):
+    model_root = tmp_path / "wan-model"
+    _write_component_configs(model_root)
+    reports = [
+        _full_transformer_forward_report(component_name, run_order, model_root)
+        for component_name in ("transformer", "transformer_2")
+        for run_order in ("reference-first", "candidate-first")
+    ]
+    reports[0]["component_name"] = "transformer_2"
+
+    errors = validate_full_transformer_forward_evidence(
+        reports, expected_model_path=model_root
+    )
+
+    assert any("binding component does not match" in error for error in errors)
     assert any("both execution orders" in error for error in errors)
 
 
@@ -484,6 +582,80 @@ def test_correctness_gate_requires_new_hit_field_and_complete_pair_step_coverage
 
     assert any("wan_hybrid hit evidence" in error for error in errors)
     assert any("all-step coverage" in error for error in errors)
+
+
+def test_report_provenance_binds_revision_model_and_sampling(tmp_path):
+    config = _config(
+        tmp_path,
+        scenarios=("generation",),
+        modes=("correctness",),
+    )
+    invocation = build_qualification_plan(config)[0]
+    report = _correctness_report(invocation.run_order)
+    assert validate_qualification_report(report, invocation, config) == []
+
+    report["provenance"]["runtime"]["flashinfer_revision"] = "wrong-revision"
+    report["provenance"]["model"]["resolved_path"] = "/models/other"
+    report["provenance"]["fixed_input"]["model_path"] = "/models/other"
+    report["provenance"]["fixed_input"]["sampling_kwargs"]["width"] = 123
+    errors = validate_qualification_report(report, invocation, config)
+
+    assert "runtime provenance is incomplete or inconsistent" in errors
+    assert "model provenance is incomplete" in errors
+    assert "provenance.fixed_input.model_path is inconsistent" in errors
+    assert any("sampling_kwargs" in error for error in errors)
+
+
+def test_runtime_revision_is_read_from_module_git_checkout(tmp_path):
+    repository = tmp_path / "flashinfer-source"
+    module_dir = repository / "flashinfer"
+    module_dir.mkdir(parents=True)
+    module_file = module_dir / "__init__.py"
+    module_file.write_text("__version__ = 'test'\n", encoding="utf-8")
+    subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test User"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "flashinfer/__init__.py"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+    )
+    expected_revision = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert _module_git_revision(SimpleNamespace(__file__=str(module_file))) == (
+        expected_revision
+    )
+
+
+def test_cli_and_readme_require_four_component_order_reports(capsys):
+    with pytest.raises(SystemExit):
+        _parse_args(["--help"])
+    assert "pass exactly four" in capsys.readouterr().out
+
+    readme = Path(__file__).resolve().parents[2] / "README.md"
+    documentation = readme.read_text(encoding="utf-8")
+    for report_name in (
+        "transformer-reference-first.json",
+        "transformer-candidate-first.json",
+        "transformer-2-reference-first.json",
+        "transformer-2-candidate-first.json",
+    ):
+        assert report_name in documentation
 
 
 def test_performance_gate_requires_both_orders_without_trajectory(tmp_path):
