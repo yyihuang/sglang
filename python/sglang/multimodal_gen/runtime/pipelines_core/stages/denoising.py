@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -96,7 +97,10 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
     WanHybridEvidenceCollector,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -108,6 +112,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
+    WanTransformerInputCapture,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
@@ -354,6 +361,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             for transformer in (self.transformer, self.transformer_2)
             if transformer is not None
             for module in transformer.modules()
+        )
+        self._wan_transformer_input_capture = (
+            WanTransformerInputCapture.from_environment()
         )
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
@@ -2382,6 +2392,34 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             **guidance_kwargs,
             **kwargs,
         )
+        capture = self._wan_transformer_input_capture
+        if capture is not None:
+            if current_model is self.transformer:
+                default_component_name = "transformer"
+            elif current_model is self.transformer_2:
+                default_component_name = "transformer_2"
+            else:
+                raise RuntimeError(
+                    "Wan transformer capture received a model outside this stage"
+                )
+            component_name = self._component_name_for_stage_module(
+                current_model, default_component_name
+            )
+            pipeline = self.pipeline() if self.pipeline else None
+            if pipeline is None:
+                raise RuntimeError("Wan transformer capture requires a pipeline")
+            component_model_path = self.server_args.component_paths.get(
+                component_name,
+                str(Path(pipeline.model_path) / component_name),
+            )
+            capture.capture(
+                current_model=current_model,
+                call_kwargs=call_kwargs,
+                component_name=component_name,
+                component_model_path=component_model_path,
+                model_root=pipeline.model_path,
+                forward_context=get_forward_context(),
+            )
         runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
             model_output = self._bcg_run(runner, call_kwargs, current_model)
