@@ -1762,6 +1762,7 @@ class FlashAttentionForwardSm100:
         use_sf_mbar = 1 if const_expr(self.qk_blockscaled and self.q_stage == 2) else 0
         use_vq_mbar = 1 if const_expr(self.v_dequant) else 0
         use_sfq_mbar = 1 if const_expr(self.use_cpasync_to_load_sfq) else 0
+        use_tmem_lifecycle_mbar = 1 if const_expr(self.pv_nvfp4) else 0
 
         @cute.struct
         class SharedStorage:
@@ -1772,6 +1773,9 @@ class FlashAttentionForwardSm100:
             mbar_P_full_lastsplit: cute.struct.MemRange[Int64, self.q_stage * 2]
             mbar_O_full: cute.struct.MemRange[Int64, self.q_stage * 2]
             mbar_softmax_stats: cute.struct.MemRange[Int64, self.q_stage * 2]
+            mbar_tmem_lifecycle: cute.struct.MemRange[
+                Int64, 2 * use_tmem_lifecycle_mbar
+            ]
             # mbar_softmax_stats: cute.struct.MemRange[Int64, self.q_stage * 4 * 2]
             mbar_O_epi: cute.struct.MemRange[Int64, self.q_stage * 2]
             mbar_s0_s1_sequence: cute.struct.MemRange[Int64, 2 * 2]
@@ -2194,6 +2198,29 @@ class FlashAttentionForwardSm100:
         softmax_correction_threads = ThreadCooperativeGroup(
             cute.arch.WARP_SIZE * len(self.softmax0_warp_ids + self.correction_warp_ids)
         )
+        pipeline_tmem_lifecycle = None
+        if const_expr(self.pv_nvfp4):
+            # The exact hybrid path uses a CTA subgroup for TMEM allocation and
+            # retirement.  A phase mbarrier preserves that 416-thread contract
+            # without relying on divergent named-barrier execution.
+            tmem_participant_threads = ThreadCooperativeGroup(
+                cute.arch.WARP_SIZE
+                * len(
+                    (
+                        self.mma_warp_id,
+                        *self.softmax0_warp_ids,
+                        *self.softmax1_warp_ids,
+                        *self.correction_warp_ids,
+                    )
+                )
+            )
+            pipeline_tmem_lifecycle = pipeline_custom.PipelineAsync.create(
+                barrier_storage=storage.mbar_tmem_lifecycle.data_ptr(),
+                num_stages=1,
+                producer_group=tmem_participant_threads,
+                consumer_group=tmem_participant_threads,
+                defer_sync=True,
+            )
         epilogue_threads = ThreadCooperativeGroup(
             cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         )
@@ -2675,7 +2702,11 @@ class FlashAttentionForwardSm100:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem.wait_for_alloc()
+            if const_expr(self.pv_nvfp4):
+                pipeline_tmem_lifecycle.producer_commit_w_index(0)
+                pipeline_tmem_lifecycle.consumer_wait_w_index_phase(0, Int32(0))
+            else:
+                tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -2715,7 +2746,11 @@ class FlashAttentionForwardSm100:
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
-            tmem_alloc_barrier.arrive_and_wait()
+            if const_expr(self.pv_nvfp4):
+                pipeline_tmem_lifecycle.producer_commit_w_index(0)
+                pipeline_tmem_lifecycle.consumer_wait_w_index_phase(0, Int32(1))
+            else:
+                tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -2750,7 +2785,11 @@ class FlashAttentionForwardSm100:
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            if const_expr(self.pv_nvfp4):
+                pipeline_tmem_lifecycle.producer_commit_w_index(0)
+                pipeline_tmem_lifecycle.consumer_wait_w_index_phase(0, Int32(0))
+            else:
+                tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -2802,7 +2841,11 @@ class FlashAttentionForwardSm100:
                 ):
                     softmax_loop(stage=1, tStS=tStS)
 
-            tmem_alloc_barrier.arrive()
+            if const_expr(self.pv_nvfp4):
+                pipeline_tmem_lifecycle.producer_commit_w_index(0)
+                pipeline_tmem_lifecycle.consumer_wait_w_index_phase(0, Int32(1))
+            else:
+                tmem_alloc_barrier.arrive()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
@@ -2810,7 +2853,11 @@ class FlashAttentionForwardSm100:
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            if const_expr(self.pv_nvfp4):
+                pipeline_tmem_lifecycle.producer_commit_w_index(0)
+                pipeline_tmem_lifecycle.consumer_wait_w_index_phase(0, Int32(0))
+            else:
+                tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_qk,
@@ -2842,7 +2889,11 @@ class FlashAttentionForwardSm100:
                 pipeline_vq=pipeline_vq,
                 pipeline_v_mma=pipeline_v_mma,
             )
-            tmem_alloc_barrier.arrive()
+            if const_expr(self.pv_nvfp4):
+                pipeline_tmem_lifecycle.producer_commit_w_index(0)
+                pipeline_tmem_lifecycle.consumer_wait_w_index_phase(0, Int32(1))
+            else:
+                tmem_alloc_barrier.arrive()
 
         return
 
