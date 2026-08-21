@@ -8,6 +8,7 @@ this module owns the model-level execution matrix and report validation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import math
@@ -30,13 +31,14 @@ from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
 
 QUALIFICATION_SCENARIOS = ("single-block", "full-transformer", "generation")
 QUALIFICATION_MODES = ("correctness", "performance")
+WAN_TRANSFORMER_COMPONENTS = ("transformer", "transformer_2")
 SCENARIO_EVIDENCE_SCOPES = {
     "single-block": "generation-trajectory-selected-transformer-block",
     "full-transformer": "generation-trajectory-primary-transformer-component",
     "generation": "generation-trajectory-all-eligible-transformer-components",
 }
 FULL_TRANSFORMER_FORWARD_EVIDENCE_SCOPE = (
-    "independent-single-forward-all-transformer-blocks"
+    "independent-single-forward-all-blocks-for-both-transformers"
 )
 
 
@@ -223,14 +225,17 @@ def validate_full_transformer_forward_evidence(
     expected_warmup_runs: int = MIN_QUALIFICATION_WARMUP_RUNS,
     expected_measure_runs: int = MIN_QUALIFICATION_MEASURE_RUNS,
 ) -> list[str]:
-    """Require one valid independent forward report for each execution order."""
+    """Require valid forwards for both 40-block components in both orders."""
 
     errors = []
-    if len(reports) != len(QUALIFICATION_RUN_ORDERS):
+    expected_evidence = set(
+        itertools.product(WAN_TRANSFORMER_COMPONENTS, QUALIFICATION_RUN_ORDERS)
+    )
+    if len(reports) != len(expected_evidence):
         errors.append(
-            "independent full-transformer evidence requires exactly two reports"
+            "independent full-transformer evidence requires exactly four reports"
         )
-    run_orders = []
+    observed_evidence = []
     for report_index, report in enumerate(reports):
         location = f"full_transformer_forward_reports[{report_index}]"
         report_errors = validate_wan_transformer_forward_report(
@@ -240,12 +245,15 @@ def validate_full_transformer_forward_evidence(
         )
         errors.extend(f"{location}: {error}" for error in report_errors)
         if isinstance(report, dict):
-            run_orders.append(report.get("run_order"))
-    if set(run_orders) != set(QUALIFICATION_RUN_ORDERS) or len(run_orders) != len(
-        QUALIFICATION_RUN_ORDERS
-    ):
+            observed_evidence.append(
+                (report.get("component_name"), report.get("run_order"))
+            )
+    if set(observed_evidence) != expected_evidence or len(
+        observed_evidence
+    ) != len(expected_evidence):
         errors.append(
-            "independent full-transformer evidence must cover both execution orders"
+            "independent full-transformer evidence must cover transformer and "
+            "transformer_2 in both execution orders"
         )
     return errors
 
@@ -258,6 +266,7 @@ def _full_transformer_forward_evidence(
         "required": required,
         "scope": FULL_TRANSFORMER_FORWARD_EVIDENCE_SCOPE,
         "expected_run_orders": list(QUALIFICATION_RUN_ORDERS),
+        "expected_components": list(WAN_TRANSFORMER_COMPONENTS),
         "report_paths": [
             str(path) for path in config.full_transformer_forward_reports
         ],
@@ -281,8 +290,13 @@ def _full_transformer_forward_evidence(
                 f"full_transformer_forward_reports[{report_index}] is unreadable: "
                 f"{exc}"
             )
-    evidence["observed_run_orders"] = [
-        report.get("run_order") if isinstance(report, dict) else None
+    evidence["observed_component_run_orders"] = [
+        {
+            "component_name": report.get("component_name"),
+            "run_order": report.get("run_order"),
+        }
+        if isinstance(report, dict)
+        else None
         for report in reports
     ]
     if not errors:
@@ -294,10 +308,10 @@ def _full_transformer_forward_evidence(
             )
         )
     elif len(config.full_transformer_forward_reports) != len(
-        QUALIFICATION_RUN_ORDERS
-    ):
+        WAN_TRANSFORMER_COMPONENTS
+    ) * len(QUALIFICATION_RUN_ORDERS):
         errors.append(
-            "independent full-transformer evidence requires exactly two reports"
+            "independent full-transformer evidence requires exactly four reports"
         )
     evidence["validation_status"] = "passed" if not errors else "failed"
     evidence["validation_errors"] = errors
@@ -311,6 +325,10 @@ def _validate_generation_summary(
     expected_measure_runs: int,
     require_hits: bool,
     location: str,
+    scenario: str,
+    expected_num_steps: int,
+    expected_num_frames: int,
+    expected_frame_shape: tuple[int, int, int],
 ) -> list[str]:
     if not isinstance(generation, dict):
         return [f"{location}: missing generation summary"]
@@ -319,24 +337,221 @@ def _validate_generation_summary(
         errors.append(f"{location}: unexpected warmup run count")
     if generation.get("measure_runs") != expected_measure_runs:
         errors.append(f"{location}: unexpected measured run count")
-    durations = generation.get("per_run_generation_time_s")
-    if not isinstance(durations, list) or len(durations) != expected_measure_runs:
-        errors.append(f"{location}: missing measured generation durations")
-    if require_hits:
-        hit_counts = generation.get("per_run_wan_hybrid_hit_count")
+    for field_name in (
+        "per_run_generation_time_s",
+        "per_run_total_duration_ms",
+    ):
+        durations = generation.get(field_name)
         if (
-            not isinstance(hit_counts, list)
-            or len(hit_counts) != expected_measure_runs
+            not isinstance(durations, list)
+            or len(durations) != expected_measure_runs
             or any(
-                isinstance(hit_count, bool)
-                or not isinstance(hit_count, int)
-                or hit_count <= 0
-                for hit_count in hit_counts
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(duration)
+                or duration <= 0
+                for duration in durations
             )
         ):
             errors.append(
-                f"{location}: every measured wan_hybrid hit count must be positive"
+                f"{location}: {field_name} must contain one finite positive "
+                "duration per measured run"
             )
+    if generation.get("timer_scope") != (
+        "complete DiffGenerator.generate call including output materialization"
+    ):
+        errors.append(f"{location}: timer_scope does not include complete generation")
+    output_summaries = generation.get("per_run_output_summaries")
+    if not isinstance(output_summaries, list) or len(
+        output_summaries
+    ) != expected_measure_runs:
+        errors.append(f"{location}: missing per-run output summaries")
+    else:
+        for run_index, output in enumerate(output_summaries):
+            output_location = f"{location}.per_run_output_summaries[{run_index}]"
+            if not isinstance(output, dict):
+                errors.append(f"{output_location}: invalid output summary")
+                continue
+            digest = output.get("sha256")
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                errors.append(f"{output_location}: invalid SHA256 digest")
+            if output.get("finite") is not True:
+                errors.append(f"{output_location}: output is not finite")
+            if output.get("num_frames") != expected_num_frames:
+                errors.append(f"{output_location}: unexpected frame count")
+            shapes = output.get("frame_shapes")
+            dtypes = output.get("frame_dtypes")
+            if shapes != [list(expected_frame_shape)] * expected_num_frames:
+                errors.append(f"{output_location}: unexpected frame shapes")
+            if dtypes != ["uint8"] * expected_num_frames:
+                errors.append(f"{output_location}: unexpected frame dtypes")
+    if require_hits:
+        hit_counts = generation.get("per_run_wan_hybrid_hit_count")
+        expected_hit_counts = generation.get(
+            "per_run_wan_hybrid_expected_hit_count"
+        )
+        coverages = generation.get("per_run_wan_hybrid_coverage")
+        if (
+            not isinstance(hit_counts, list)
+            or len(hit_counts) != expected_measure_runs
+            or not isinstance(expected_hit_counts, list)
+            or len(expected_hit_counts) != expected_measure_runs
+            or not isinstance(coverages, list)
+            or len(coverages) != expected_measure_runs
+        ):
+            errors.append(
+                f"{location}: missing exact per-run wan_hybrid hit evidence"
+            )
+        else:
+            for run_index, (hit_count, expected_hit_count, coverage) in enumerate(
+                zip(hit_counts, expected_hit_counts, coverages)
+            ):
+                coverage_location = (
+                    f"{location}.per_run_wan_hybrid_coverage[{run_index}]"
+                )
+                errors.extend(
+                    _validate_wan_hybrid_coverage(
+                        coverage,
+                        scenario=scenario,
+                        expected_num_steps=expected_num_steps,
+                        location=coverage_location,
+                    )
+                )
+                if not isinstance(coverage, dict):
+                    continue
+                if (
+                    isinstance(hit_count, bool)
+                    or not isinstance(hit_count, int)
+                    or isinstance(expected_hit_count, bool)
+                    or not isinstance(expected_hit_count, int)
+                    or expected_hit_count <= 0
+                    or hit_count != expected_hit_count
+                    or hit_count != coverage.get("actual_hit_count")
+                    or expected_hit_count != coverage.get("expected_hit_count")
+                ):
+                    errors.append(
+                        f"{coverage_location}: actual hit count does not equal "
+                        "the route-derived expected hit count"
+                    )
+    return errors
+
+
+def _validate_wan_hybrid_coverage(
+    coverage: Any,
+    *,
+    scenario: str,
+    expected_num_steps: int,
+    location: str,
+) -> list[str]:
+    if not isinstance(coverage, dict):
+        return [f"{location}: missing coverage object"]
+    errors = []
+    if coverage.get("schema_version") != 1:
+        errors.append(f"{location}: unsupported coverage schema")
+    steps = coverage.get("steps")
+    if not isinstance(steps, list) or len(steps) != expected_num_steps:
+        return errors + [f"{location}: denoising-step coverage is incomplete"]
+    if {step.get("step_index") for step in steps if isinstance(step, dict)} != set(
+        range(expected_num_steps)
+    ):
+        errors.append(f"{location}: step indices are incomplete")
+
+    expected_layers = list(range(40))
+    expected_hit_count = 0
+    actual_hit_count = 0
+    route_event_count = 0
+    observed_components = set()
+    for step_position, step in enumerate(steps):
+        step_location = f"{location}.steps[{step_position}]"
+        if not isinstance(step, dict):
+            errors.append(f"{step_location}: invalid step")
+            continue
+        component = step.get("active_component")
+        if component not in WAN_TRANSFORMER_COMPONENTS:
+            errors.append(f"{step_location}: invalid active component")
+            continue
+        observed_components.add(component)
+        actual_timestep = step.get("actual_timestep")
+        if isinstance(actual_timestep, bool) or not isinstance(actual_timestep, int):
+            errors.append(f"{step_location}: actual timestep is missing")
+        branches = step.get("branches")
+        if not isinstance(branches, list) or not branches:
+            errors.append(f"{step_location}: no executed CFG branches")
+            continue
+        branch_indices = [
+            branch.get("cfg_branch_index")
+            for branch in branches
+            if isinstance(branch, dict)
+        ]
+        if (
+            branch_indices != list(range(len(branches)))
+            or step.get("executed_cfg_branch_indices") != branch_indices
+        ):
+            errors.append(f"{step_location}: CFG branch evidence is inconsistent")
+        for branch_position, branch in enumerate(branches):
+            branch_location = f"{step_location}.branches[{branch_position}]"
+            if not isinstance(branch, dict):
+                errors.append(f"{branch_location}: invalid branch")
+                continue
+            if (
+                branch.get("num_layers") != 40
+                or branch.get("layer_indices") != expected_layers
+            ):
+                errors.append(f"{branch_location}: 40-layer coverage is incomplete")
+            if scenario == "generation" or (
+                scenario == "full-transformer" and component == "transformer"
+            ):
+                expected_eligible = expected_layers
+                expected_fallback = []
+                expected_control = []
+            elif scenario == "single-block":
+                expected_eligible = [0]
+                expected_fallback = expected_layers[1:]
+                expected_control = []
+            else:
+                expected_eligible = []
+                expected_fallback = []
+                expected_control = expected_layers
+            if (
+                branch.get("eligible_layer_indices") != expected_eligible
+                or branch.get("hybrid_layer_indices") != expected_eligible
+                or branch.get("successful_hybrid_layer_indices")
+                != expected_eligible
+                or branch.get("fallback_layer_indices") != expected_fallback
+                or branch.get("control_layer_indices") != expected_control
+            ):
+                errors.append(
+                    f"{branch_location}: hybrid/fallback/control routing is invalid"
+                )
+            branch_expected = len(expected_eligible)
+            if (
+                branch.get("expected_hit_count") != branch_expected
+                or branch.get("actual_hit_count") != branch_expected
+            ):
+                errors.append(f"{branch_location}: exact hit count mismatch")
+            expected_hit_count += branch_expected
+            branch_actual = branch.get("actual_hit_count")
+            if isinstance(branch_actual, bool) or not isinstance(branch_actual, int):
+                branch_actual = 0
+            actual_hit_count += branch_actual
+            route_event_count += 40
+
+    if observed_components != set(WAN_TRANSFORMER_COMPONENTS):
+        errors.append(f"{location}: both Wan transformer components were not exercised")
+    if (
+        coverage.get("expected_hit_count") != expected_hit_count
+        or coverage.get("actual_hit_count") != actual_hit_count
+        or coverage.get("attributed_actual_hit_count") != actual_hit_count
+        or coverage.get("unattributed_actual_hit_count") != 0
+        or coverage.get("eligible_self_fallback_count") != 0
+        or coverage.get("num_route_events") != route_event_count
+        or coverage.get("num_success_events") != actual_hit_count
+    ):
+        errors.append(f"{location}: aggregate route/hit evidence is inconsistent")
     return errors
 
 
@@ -371,8 +586,80 @@ def _validate_all_step_comparisons(
     return errors
 
 
+def _validate_report_provenance(
+    report: dict[str, Any], config: WanQualificationConfig
+) -> list[str]:
+    provenance = report.get("provenance")
+    if not isinstance(provenance, dict):
+        return ["missing qualification provenance"]
+    errors = []
+    fixed_input = provenance.get("fixed_input")
+    digest = provenance.get("input_sha256")
+    if not isinstance(fixed_input, dict):
+        errors.append("provenance.fixed_input is missing")
+    else:
+        expected_fixed_fields = {
+            "model_id": config.model_id,
+            "prompt": config.prompt,
+            "seed": config.seed,
+        }
+        for field_name, expected_value in expected_fixed_fields.items():
+            if fixed_input.get(field_name) != expected_value:
+                errors.append(f"provenance.fixed_input.{field_name} is inconsistent")
+        calculated_digest = hashlib.sha256(
+            json.dumps(
+                fixed_input, sort_keys=True, separators=(",", ":"), default=str
+            ).encode("utf-8")
+        ).hexdigest()
+        if digest != calculated_digest:
+            errors.append("provenance input SHA256 is inconsistent")
+    model = provenance.get("model")
+    if (
+        not isinstance(model, dict)
+        or not isinstance(model.get("resolved_path"), str)
+        or not model.get("resolved_path")
+        or model.get("model_id") != config.model_id
+        or not isinstance(model.get("config_files"), list)
+        or not model.get("config_files")
+    ):
+        errors.append("model provenance is incomplete")
+    else:
+        for config_file in model["config_files"]:
+            if (
+                not isinstance(config_file, dict)
+                or not isinstance(config_file.get("path"), str)
+                or not isinstance(config_file.get("sha256"), str)
+                or len(config_file["sha256"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in config_file["sha256"]
+                )
+            ):
+                errors.append("model config-file provenance is incomplete")
+                break
+    runtime = provenance.get("runtime")
+    if (
+        not isinstance(runtime, dict)
+        or runtime.get("sglang_revision") != config.sglang_revision
+        or not isinstance(runtime.get("gpu"), dict)
+        or not runtime.get("gpu", {}).get("name")
+    ):
+        errors.append("runtime provenance is incomplete or inconsistent")
+    else:
+        public_api = runtime.get("flashinfer_public_api")
+        if not isinstance(public_api, dict) or set(public_api.values()) != {True}:
+            errors.append("FlashInfer public wan_hybrid capability is incomplete")
+    if provenance.get("normalized_backend_request") != report.get("server_kwargs"):
+        errors.append("normalized backend provenance does not match server_kwargs")
+    return errors
+
+
 def _validate_candidate_hit_qualification(
-    qualification: dict[str, Any], *, location: str
+    qualification: dict[str, Any],
+    *,
+    actual_hit_counts: Any,
+    expected_hit_counts: Any,
+    location: str,
 ) -> list[str]:
     hit_qualification = qualification.get("candidate_backend_hits")
     if (
@@ -380,7 +667,12 @@ def _validate_candidate_hit_qualification(
         or hit_qualification.get("passed") is not True
         or hit_qualification.get("failures") != []
         or hit_qualification.get("thresholds")
-        != {"candidate_hit_count_min_exclusive": 0}
+        != {
+            "candidate_hit_count_equals_expected": True,
+            "expected_hit_count_min_exclusive": 0,
+        }
+        or hit_qualification.get("actual_hit_counts") != actual_hit_counts
+        or hit_qualification.get("expected_hit_counts") != expected_hit_counts
     ):
         return [f"{location}: candidate backend-hit qualification is incomplete"]
     return []
@@ -394,6 +686,11 @@ def validate_qualification_report(
     if not isinstance(report, dict):
         return ["report is not a JSON object"]
     errors = []
+    errors.extend(_validate_report_provenance(report, config))
+    if report.get("model_id") != config.model_id:
+        errors.append("model_id does not match the qualification config")
+    if report.get("prompt") != config.prompt or report.get("seed") != config.seed:
+        errors.append("prompt or seed does not match the qualification config")
     if report.get("comparison_mode") != invocation.comparison_mode:
         errors.append("comparison_mode does not match the invocation")
     if report.get("run_order") != invocation.run_order:
@@ -436,19 +733,44 @@ def validate_qualification_report(
     sampling_kwargs = report.get("sampling_kwargs")
     if not isinstance(sampling_kwargs, dict):
         errors.append("missing sampling_kwargs")
-    elif invocation.comparison_mode == "correctness":
-        if sampling_kwargs.get("return_trajectory_latents") is not True:
-            errors.append("correctness did not capture trajectory latents")
-    elif sampling_kwargs.get("return_trajectory_latents") is not False:
-        errors.append("performance unexpectedly captured trajectory latents")
+    else:
+        expected_sampling = {
+            "width": config.width,
+            "height": config.height,
+            "num_frames": config.num_frames,
+            "num_inference_steps": config.num_inference_steps,
+            "guidance_scale": config.guidance_scale,
+            "guidance_scale_2": config.guidance_scale_2,
+        }
+        for field_name, expected_value in expected_sampling.items():
+            if sampling_kwargs.get(field_name) != expected_value:
+                errors.append(f"sampling_kwargs.{field_name} is inconsistent")
+        if invocation.comparison_mode == "correctness":
+            if sampling_kwargs.get("return_trajectory_latents") is not True:
+                errors.append("correctness did not capture trajectory latents")
+        else:
+            if sampling_kwargs.get("return_trajectory_latents") is not False:
+                errors.append("performance unexpectedly captured trajectory latents")
+            if sampling_kwargs.get("return_trajectory_decoded") is not False:
+                errors.append("performance unexpectedly captured decoded trajectory")
 
     if invocation.comparison_mode == "correctness":
         if isinstance(qualification, dict):
             if qualification.get("thresholds") != MODEL_QUALIFICATION_THRESHOLDS:
                 errors.append("correctness thresholds do not match the protocol")
+            candidate_generation = report.get("candidate_generation")
+            if not isinstance(candidate_generation, dict):
+                candidate_generation = {}
             errors.extend(
                 _validate_candidate_hit_qualification(
-                    qualification, location="qualification"
+                    qualification,
+                    actual_hit_counts=candidate_generation.get(
+                        "per_run_wan_hybrid_hit_count"
+                    ),
+                    expected_hit_counts=candidate_generation.get(
+                        "per_run_wan_hybrid_expected_hit_count"
+                    ),
+                    location="qualification",
                 )
             )
         errors.extend(
@@ -458,6 +780,10 @@ def validate_qualification_report(
                 expected_measure_runs=config.measure_runs,
                 require_hits=False,
                 location="reference_generation",
+                scenario=invocation.scenario,
+                expected_num_steps=config.num_inference_steps,
+                expected_num_frames=config.num_frames,
+                expected_frame_shape=(config.height, config.width, 3),
             )
         )
         errors.extend(
@@ -467,6 +793,10 @@ def validate_qualification_report(
                 expected_measure_runs=config.measure_runs,
                 require_hits=True,
                 location="candidate_generation",
+                scenario=invocation.scenario,
+                expected_num_steps=config.num_inference_steps,
+                expected_num_frames=config.num_frames,
+                expected_frame_shape=(config.height, config.width, 3),
             )
         )
         cross = report.get("cross_variant_metrics")
@@ -528,6 +858,10 @@ def validate_qualification_report(
                         expected_measure_runs=config.measure_runs,
                         require_hits=False,
                         location=f"order_results.{run_order}.reference_generation",
+                        scenario=invocation.scenario,
+                        expected_num_steps=config.num_inference_steps,
+                        expected_num_frames=config.num_frames,
+                        expected_frame_shape=(config.height, config.width, 3),
                     )
                 )
                 errors.extend(
@@ -537,6 +871,10 @@ def validate_qualification_report(
                         expected_measure_runs=config.measure_runs,
                         require_hits=True,
                         location=f"order_results.{run_order}.candidate_generation",
+                        scenario=invocation.scenario,
+                        expected_num_steps=config.num_inference_steps,
+                        expected_num_frames=config.num_frames,
+                        expected_frame_shape=(config.height, config.width, 3),
                     )
                 )
                 speedup = order_result.get("performance", {}).get(
@@ -555,7 +893,8 @@ def validate_qualification_report(
                 "warmup_runs_min": MIN_QUALIFICATION_WARMUP_RUNS,
                 "measure_runs_min": MIN_QUALIFICATION_MEASURE_RUNS,
                 "speedup_min": MODEL_QUALIFICATION_THRESHOLDS["speedup_min"],
-                "candidate_hit_count_min_exclusive": 0,
+                "candidate_hit_count_equals_expected": True,
+                "expected_hit_count_min_exclusive": 0,
             }
             if qualification.get("thresholds") != expected_thresholds:
                 errors.append("performance thresholds do not match the protocol")
