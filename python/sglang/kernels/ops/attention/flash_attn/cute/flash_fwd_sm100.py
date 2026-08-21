@@ -336,11 +336,9 @@ class FlashAttentionForwardSm100:
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
         if self.pv_nvfp4:
-            # Native FP4 PV has two K=64 MMA blocks. Publish the first half of
-            # packed P so its base and residual MMAs can overlap the remaining
-            # TMEM stores, then use the existing last-split barrier for K1.
-            self.split_P_arrive = n_block_size // 2
-            assert self.split_P_arrive % 64 == 0
+            # The first native-P prototype publishes all eight per-16 groups,
+            # including SFA, before either base or residual PV MMA starts.
+            self.split_P_arrive = 0
         else:
             self.split_P_arrive = n_block_size // 4 * 3
             self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
@@ -4152,19 +4150,6 @@ class FlashAttentionForwardSm100:
                 )
                 for stage in range(self.q_stage)
             ]
-            gemm_Pi_split = [
-                partial(
-                    sm100_utils.gemm_blockscaled_split_k2,
-                    tiled_mma_pv,
-                    tOtO[None, None, None, stage],
-                    tOrP[None, None, None, stage],
-                    tCtSFA=pv_sf_copies[stage].tCtSFA,
-                    tCtSFB_base=pv_sf_copies[stage].tCtSFBBase,
-                    tCtSFB_residual=pv_sf_copies[stage].tCtSFBResidual,
-                    use_residual=self.pv_nvfp4_residual,
-                )
-                for stage in range(self.q_stage)
-            ]
         else:
             gemm_Pi = [
                 partial(
@@ -4355,29 +4340,25 @@ class FlashAttentionForwardSm100:
                                     ],
                                     pv_sf_copies[stage].tCtSFBResidual_s2t,
                                 )
-                        if const_expr(self.pv_nvfp4 and self.split_P_arrive > 0):
-                            gemm_Pi_split[stage](
-                                tCrB_base=tOrVi,
-                                tCrB_residual=tOrViResidual,
-                                lastsplit_mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(
-                                    stage
-                                ),
-                                lastsplit_phase=P_full_O_rescaled_phase,
-                                zero_init=not O_should_accumulate,
+                        gemm_Pi[stage](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            # smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sV_cur.iterator),
+                            zero_init=not O_should_accumulate,
+                            mbar_ptr=(
+                                pipeline_p_lastsplit.sync_object_full.get_barrier(stage)
+                                if self.split_P_arrive > 0
+                                else None
+                            ),
+                            mbar_phase=P_full_O_rescaled_phase,
+                        )
+                        if const_expr(
+                            self.pv_nvfp4 and self.pv_nvfp4_residual
+                        ):
+                            gemm_Pi_residual[stage](
+                                tCrB=tOrViResidual,
+                                sB=sVResidual[None, None, None, Vi_index],
                             )
-                        else:
-                            gemm_Pi[stage](
-                                tCrB=tOrVi,
-                                sB=sV_cur,
-                                zero_init=not O_should_accumulate,
-                            )
-                            if const_expr(
-                                self.pv_nvfp4 and self.pv_nvfp4_residual
-                            ):
-                                gemm_Pi_residual[stage](
-                                    tCrB=tOrViResidual,
-                                    sB=sVResidual[None, None, None, Vi_index],
-                                )
                         # Don't need to signal O_full to the correction warps since the
                         # correction warps wait for the softmax warps anyway. By the time the softmax
                         # warps finished, S_i for the next iteration must have been done, so O_i-1
@@ -4510,27 +4491,23 @@ class FlashAttentionForwardSm100:
                                 ],
                                 pv_sf_copies[stage].tCtSFBResidual_s2t,
                             )
-                    if const_expr(self.pv_nvfp4 and self.split_P_arrive > 0):
-                        gemm_Pi_split[stage](
-                            tCrB_base=tOrVi,
-                            tCrB_residual=tOrViResidual,
-                            lastsplit_mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(
-                                stage
-                            ),
-                            lastsplit_phase=P_full_O_rescaled_phase,
-                            zero_init=not O_should_accumulate,
+                    gemm_Pi[stage](
+                        tCrB=tOrVi,
+                        sB=sV_cur,
+                        # smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sV_cur.iterator),
+                        zero_init=not O_should_accumulate,
+                        mbar_ptr=(
+                            pipeline_p_lastsplit.sync_object_full.get_barrier(stage)
+                            if self.split_P_arrive > 0
+                            else None
+                        ),
+                        mbar_phase=P_full_O_rescaled_phase,
+                    )
+                    if const_expr(self.pv_nvfp4 and self.pv_nvfp4_residual):
+                        gemm_Pi_residual[stage](
+                            tCrB=tOrViResidual,
+                            sB=sVResidual[None, None, None, Vi_index],
                         )
-                    else:
-                        gemm_Pi[stage](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
-                            zero_init=not O_should_accumulate,
-                        )
-                        if const_expr(self.pv_nvfp4 and self.pv_nvfp4_residual):
-                            gemm_Pi_residual[stage](
-                                tCrB=tOrViResidual,
-                                sB=sVResidual[None, None, None, Vi_index],
-                            )
                     # 4. release accumulated O0_partial
                     # We do need O_full here since for the last tile, by the time the softmax warp
                     # has signaled to the correction warps, the softmax warp has just finished

@@ -1207,69 +1207,6 @@ def gemm_blockscaled(
 
 
 @cute.jit
-def gemm_blockscaled_split_k2(
-    tiled_mma: cute.TiledMma,
-    acc: cute.Tensor,
-    tCrA: cute.Tensor,
-    tCrB_base: cute.Tensor,
-    tCrB_residual: cute.Tensor,
-    tCtSFA: cute.Tensor,
-    tCtSFB_base: cute.Tensor,
-    tCtSFB_residual: cute.Tensor,
-    lastsplit_mbar_ptr: cutlass.Pointer,
-    lastsplit_phase: Int32,
-    zero_init: bool | Boolean = True,
-    use_residual: cutlass.Constexpr[bool] = True,
-) -> None:
-    """Issue both K=64 blocks around a split-P barrier with local MMA state."""
-    mma_atom = cute.make_mma_atom(tiled_mma.op)
-    sf_kblock_0 = (None, None, 0)
-    mma_atom.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_0].iterator)
-    mma_atom.set(tcgen05.Field.SFB, tCtSFB_base[sf_kblock_0].iterator)
-    mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init)
-    cute.gemm(
-        mma_atom,
-        acc,
-        tCrA[None, None, 0],
-        tCrB_base[None, None, 0],
-        acc,
-    )
-    if const_expr(use_residual):
-        mma_atom.set(tcgen05.Field.SFB, tCtSFB_residual[sf_kblock_0].iterator)
-        mma_atom.set(tcgen05.Field.ACCUMULATE, True)
-        cute.gemm(
-            mma_atom,
-            acc,
-            tCrA[None, None, 0],
-            tCrB_residual[None, None, 0],
-            acc,
-        )
-
-    cute.arch.mbarrier_wait(lastsplit_mbar_ptr, phase=lastsplit_phase)
-
-    sf_kblock_1 = (None, None, 1)
-    mma_atom.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_1].iterator)
-    mma_atom.set(tcgen05.Field.SFB, tCtSFB_base[sf_kblock_1].iterator)
-    mma_atom.set(tcgen05.Field.ACCUMULATE, True)
-    cute.gemm(
-        mma_atom,
-        acc,
-        tCrA[None, None, 1],
-        tCrB_base[None, None, 1],
-        acc,
-    )
-    if const_expr(use_residual):
-        mma_atom.set(tcgen05.Field.SFB, tCtSFB_residual[sf_kblock_1].iterator)
-        cute.gemm(
-            mma_atom,
-            acc,
-            tCrA[None, None, 1],
-            tCrB_residual[None, None, 1],
-            acc,
-        )
-
-
-@cute.jit
 def gemm_blockscaled_w_idx(
     tiled_mma: cute.TiledMma,
     acc: cute.Tensor,
