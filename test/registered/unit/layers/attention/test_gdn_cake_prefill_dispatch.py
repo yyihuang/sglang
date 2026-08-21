@@ -81,6 +81,36 @@ def _kernel_and_inputs():
 
 
 class TestCakeGDNPrefillDispatch(unittest.TestCase):
+    def test_exact_capacity_prefill_output_keeps_tensor_identity(self):
+        kernel, *_ = _kernel_and_inputs()
+        kernel._cake_gdn_prefill_outputs = {}
+        q = torch.empty(39, 4, 128, dtype=torch.bfloat16)
+
+        with (
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                return_value=SimpleNamespace(cuda_stream=17),
+            ),
+            patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ),
+        ):
+            warm_1 = kernel._cake_prefill_output_buffer(
+                q,
+                layer_id=7,
+                total_tokens=39,
+                num_v_heads=8,
+            )
+            warm_2 = kernel._cake_prefill_output_buffer(
+                q,
+                layer_id=7,
+                total_tokens=39,
+                num_v_heads=8,
+            )
+
+        self.assertIs(warm_2, warm_1)
+
     def test_exact_bf16_indexed_row_uses_in_place_state_and_frozen_grid(self):
         kernel, api, entry, inputs, output, workspace, empty_state, empty_i32 = (
             _kernel_and_inputs()
