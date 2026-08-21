@@ -1,8 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import torch
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    _record_successful_wan_hybrid_forward,
+    record_wan_attention_route,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    ForwardContext,
+    get_forward_context,
+)
+from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
+    WanTransformerInputCapture,
+)
 from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
     build_wan_transformer_evidence_binding,
     capture_wan_transformer_forward,
@@ -12,12 +25,24 @@ from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
 
 
 class _AddBlock(nn.Module):
-    def __init__(self, value: float):
+    def __init__(self, value: float, layer_index: int, hybrid: bool):
         super().__init__()
         self.value = value
+        self.layer_index = layer_index
+        self.hybrid = hybrid
 
     def forward(self, hidden_states):
-        return hidden_states + self.value
+        record_wan_attention_route(
+            layer_index=self.layer_index,
+            hybrid_configured=self.hybrid,
+            eligible_for_hybrid=self.hybrid,
+        )
+        output = hidden_states + self.value
+        if self.hybrid:
+            output = _record_successful_wan_hybrid_forward(
+                output, layer_index=self.layer_index
+            )
+        return output
 
 
 class _TinyWanTransformer(nn.Module):
@@ -26,24 +51,28 @@ class _TinyWanTransformer(nn.Module):
         *,
         output_offset: float = 0.0,
         skip_last: bool = False,
-        hit_counter: dict[str, int] | None = None,
+        hybrid: bool = False,
     ):
         super().__init__()
-        self.blocks = nn.ModuleList([_AddBlock(0.01) for _ in range(40)])
+        self.blocks = nn.ModuleList(
+            [_AddBlock(0.01, index, hybrid) for index in range(40)]
+        )
         self.output_offset = output_offset
         self.skip_last = skip_last
-        self.hit_counter = hit_counter
+        self.hybrid = hybrid
+        self.config = {"num_layers": 40}
+        self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
         self.input_ids = []
         self.timesteps = []
+        self.request_ids = []
 
     def forward(self, hidden_states, timestep=None):
         self.input_ids.append(id(hidden_states))
         self.timesteps.append(timestep)
+        self.request_ids.append(get_forward_context().forward_batch.request_id)
         blocks = self.blocks[:-1] if self.skip_last else self.blocks
         for block in blocks:
             hidden_states = block(hidden_states)
-        if self.hit_counter is not None:
-            self.hit_counter["count"] += len(blocks)
         return hidden_states + self.output_offset
 
 
@@ -54,20 +83,57 @@ def _component_path(tmp_path, component_name: str):
     return path
 
 
+def _capture_manifest(tmp_path, component_name: str, hidden_states: torch.Tensor):
+    request_id = "capture-request"
+    component_path = _component_path(tmp_path, component_name)
+    batch = SimpleNamespace(
+        request_id=request_id,
+        is_warmup=False,
+        sampling_params=SimpleNamespace(
+            prompt="a raccoon",
+            seed=0,
+            width=640,
+            height=384,
+            num_frames=17,
+            num_inference_steps=12,
+            guidance_scale=4.0,
+            guidance_scale_2=3.0,
+            boundary_ratio=None,
+        ),
+    )
+    capture = WanTransformerInputCapture(
+        output_dir=tmp_path / f"capture-{component_name}",
+        request_id=request_id,
+        components=frozenset({component_name}),
+    )
+    capture.output_dir.mkdir()
+    return capture.capture(
+        current_model=_TinyWanTransformer(),
+        call_kwargs={"hidden_states": hidden_states, "timestep": 500},
+        component_name=component_name,
+        component_model_path=component_path,
+        model_root=component_path.parent,
+        forward_context=ForwardContext(
+            current_timestep=3,
+            attn_metadata=None,
+            forward_batch=batch,
+            wan_component_name=component_name,
+            wan_actual_timestep=500,
+            wan_cfg_branch_index=0,
+        ),
+    )
+
+
 def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
     reference = _TinyWanTransformer()
-    candidate_hits = {"count": 0}
-    candidate = _TinyWanTransformer(hit_counter=candidate_hits)
+    candidate = _TinyWanTransformer(hybrid=True)
     hidden_states = torch.tensor([[1.0, 2.0]])
+    manifest = _capture_manifest(tmp_path, "transformer_2", hidden_states)
 
     report = run_wan_transformer_forward_qualification(
         reference_model=reference,
         candidate_model=candidate,
-        reset_candidate_hit_count=lambda: candidate_hits.update(count=0),
-        read_candidate_hit_count=lambda: candidate_hits["count"],
-        component_name="transformer_2",
-        component_model_path=_component_path(tmp_path, "transformer_2"),
-        fixed_input={"hidden_states": hidden_states, "timestep": 500},
+        capture_manifest_path=manifest,
         run_order="candidate-first",
     )
 
@@ -85,10 +151,35 @@ def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
     assert report["num_blocks"] == 40
     assert report["candidate_per_run_wan_hybrid_hit_count"] == [40] * 5
     assert report["candidate_per_run_wan_hybrid_expected_hit_count"] == [40] * 5
-    assert set(reference.input_ids) == {id(hidden_states)}
-    assert set(candidate.input_ids) == {id(hidden_states)}
+    assert len(set(report["reference_per_run_request_id"])) == 5
+    assert len(set(report["candidate_per_run_request_id"])) == 5
+    assert not set(report["reference_per_run_request_id"]) & set(
+        report["candidate_per_run_request_id"]
+    )
+    assert all(
+        coverage["expected_hit_count"] == 0
+        and coverage["actual_hit_count"] == 0
+        and coverage["num_route_events"] == 40
+        and coverage["num_success_events"] == 0
+        for coverage in report["reference_per_run_wan_hybrid_coverage"]
+    )
+    assert all(
+        coverage["expected_hit_count"] == 40
+        and coverage["actual_hit_count"] == 40
+        and coverage["attributed_actual_hit_count"] == 40
+        and coverage["unattributed_actual_hit_count"] == 0
+        and coverage["eligible_hybrid_miss_count"] == 0
+        for coverage in report["candidate_per_run_wan_hybrid_coverage"]
+    )
+    assert len(set(reference.input_ids)) == 1
+    assert set(reference.input_ids) == set(candidate.input_ids)
     assert set(reference.timesteps) == {500}
     assert set(candidate.timesteps) == {500}
+    assert len(reference.request_ids) == 7
+    assert len(set(reference.request_ids)) == 7
+    assert len(candidate.request_ids) == 7
+    assert len(set(candidate.request_ids)) == 7
+    assert not set(reference.request_ids) & set(candidate.request_ids)
 
     cross = report["cross_variant_metrics"]
     assert cross["pairing"] == "cross-product"
@@ -109,26 +200,26 @@ def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
 
     report["cross_variant_metrics"]["comparisons"].pop()
     report["candidate_per_run_wan_hybrid_hit_count"][0] = 0
+    report["candidate_per_run_wan_hybrid_coverage"][0]["steps"][0][
+        "actual_timestep"
+    ] = 501
     errors = validate_wan_transformer_forward_report(report)
 
     assert any("run-pair coverage" in error for error in errors)
     assert "every measured candidate hit count must equal expected depth 40" in errors
+    assert any("capture coordinates" in error for error in errors)
 
 
 def test_full_transformer_report_cannot_be_relabelled(tmp_path):
     reference = _TinyWanTransformer()
-    candidate_hits = {"count": 0}
-    candidate = _TinyWanTransformer(hit_counter=candidate_hits)
+    candidate = _TinyWanTransformer(hybrid=True)
     hidden_states = torch.tensor([[1.0, 2.0]])
+    manifest = _capture_manifest(tmp_path, "transformer", hidden_states)
 
     report = run_wan_transformer_forward_qualification(
         reference_model=reference,
         candidate_model=candidate,
-        reset_candidate_hit_count=lambda: candidate_hits.update(count=0),
-        read_candidate_hit_count=lambda: candidate_hits["count"],
-        component_name="transformer",
-        component_model_path=_component_path(tmp_path, "transformer"),
-        fixed_input={"hidden_states": hidden_states, "timestep": 500},
+        capture_manifest_path=manifest,
     )
     report["component_name"] = "transformer_2"
 
@@ -144,11 +235,7 @@ def test_full_transformer_report_cannot_be_relabelled(tmp_path):
             reference_model=reference,
             candidate_model=candidate,
             reference_forward=lambda: reference(torch.zeros_like(hidden_states)),
-            reset_candidate_hit_count=lambda: candidate_hits.update(count=0),
-            read_candidate_hit_count=lambda: candidate_hits["count"],
-            component_name="transformer",
-            component_model_path=tmp_path / "wan-model" / "transformer",
-            fixed_input={"hidden_states": hidden_states},
+            capture_manifest_path=manifest,
         )
     except TypeError as error:
         assert "reference_forward" in str(error)
@@ -158,20 +245,16 @@ def test_full_transformer_report_cannot_be_relabelled(tmp_path):
 
 def test_full_transformer_forward_checks_final_output_quality(tmp_path):
     reference = _TinyWanTransformer()
-    candidate_hits = {"count": 0}
     candidate = _TinyWanTransformer(
-        output_offset=2.0, hit_counter=candidate_hits
+        output_offset=2.0, hybrid=True
     )
     hidden_states = torch.tensor([[1.0, 2.0]])
+    manifest = _capture_manifest(tmp_path, "transformer", hidden_states)
 
     report = run_wan_transformer_forward_qualification(
         reference_model=reference,
         candidate_model=candidate,
-        reset_candidate_hit_count=lambda: candidate_hits.update(count=0),
-        read_candidate_hit_count=lambda: candidate_hits["count"],
-        component_name="transformer",
-        component_model_path=_component_path(tmp_path, "transformer"),
-        fixed_input={"hidden_states": hidden_states, "timestep": 500},
+        capture_manifest_path=manifest,
     )
 
     assert report["qualification"]["passed"] is False
@@ -212,7 +295,13 @@ def test_capture_fails_when_forward_skips_a_transformer_block():
 
     try:
         capture_wan_transformer_forward(
-            model, lambda: model(torch.tensor([[1.0, 2.0]]))
+            model,
+            fixed_input={"hidden_states": torch.tensor([[1.0, 2.0]])},
+            request_id="request-a",
+            component_name="transformer",
+            step_index=0,
+            actual_timestep=500,
+            cfg_branch_index=0,
         )
     except RuntimeError as error:
         assert "captured 39 of 40" in str(error)

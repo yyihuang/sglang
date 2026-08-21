@@ -290,6 +290,45 @@ def load_wan_transformer_input_capture(
     }
     if component.get("component_sha256") != _sha256_json(component_payload):
         raise ValueError("Wan transformer capture component SHA256 is inconsistent")
+    component_path = Path(component.get("resolved_path", "")).expanduser().resolve()
+    config_files = component.get("config_files")
+    if not isinstance(config_files, list) or not config_files:
+        raise ValueError("Wan transformer capture component files are missing")
+    for item in config_files:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise ValueError("Wan transformer capture component file is invalid")
+        config_path = component_path / item["path"]
+        if not config_path.is_file() or _sha256_file(config_path) != item.get(
+            "sha256"
+        ):
+            raise ValueError(
+                "Wan transformer captured component file SHA256 is inconsistent"
+            )
+    sampling = manifest.get("sampling")
+    if not isinstance(sampling, dict):
+        raise ValueError("Wan transformer capture sampling binding is missing")
+    sampling_payload = {
+        key: value for key, value in sampling.items() if key != "sampling_sha256"
+    }
+    if sampling.get("sampling_sha256") != _sha256_json(sampling_payload):
+        raise ValueError("Wan transformer capture sampling SHA256 is inconsistent")
+    model = manifest.get("model")
+    if not isinstance(model, dict):
+        raise ValueError("Wan transformer capture model binding is missing")
+    model_payload = {
+        key: value for key, value in model.items() if key != "identity_sha256"
+    }
+    if model.get("identity_sha256") != _sha256_json(model_payload):
+        raise ValueError("Wan transformer capture model SHA256 is inconsistent")
+    if not isinstance(manifest.get("request_id"), str) or not manifest["request_id"]:
+        raise ValueError("Wan transformer capture request binding is missing")
+    coordinates = manifest.get("capture")
+    if not isinstance(coordinates, dict) or any(
+        isinstance(coordinates.get(name), bool)
+        or not isinstance(coordinates.get(name), int)
+        for name in ("step_index", "actual_timestep", "cfg_branch_index")
+    ):
+        raise ValueError("Wan transformer capture coordinates are invalid")
     artifact_path = manifest_path.parent / manifest["artifact"]["path"]
     if _sha256_file(artifact_path) != manifest["artifact"]["sha256"]:
         raise ValueError("Wan transformer tensor artifact SHA256 is inconsistent")
@@ -298,6 +337,10 @@ def load_wan_transformer_input_capture(
     if not isinstance(call_kwargs, dict):
         raise ValueError("Wan transformer tensor artifact has no call_kwargs mapping")
     input_summary = _stable_value(call_kwargs, location="call_kwargs")
+    if payload.get("input_sha256") != manifest.get("input_sha256"):
+        raise ValueError(
+            "Wan transformer tensor payload SHA256 binding is inconsistent"
+        )
     if _sha256_json(input_summary) != manifest.get("input_sha256"):
         raise ValueError("Wan transformer captured input SHA256 is inconsistent")
     return call_kwargs, manifest

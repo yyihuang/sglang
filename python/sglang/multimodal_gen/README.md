@@ -144,15 +144,36 @@ Wan self-attention layer.
 The runner's `full-transformer` scenario is still an end-to-end generation
 trajectory with the primary transformer component routed to `wan_hybrid`. It is
 not an independent transformer single-forward result. For that separate check,
-use
-`run_wan_transformer_forward_qualification`. The caller supplies already-loaded
-reference and candidate models, the resolved component directory, and the
-actual fixed mapping of model-forward keyword arguments. The harness invokes
-both models directly with that same mapping; caller-owned forward closures are
-not accepted. Run both
-`transformer` and `transformer_2` in both explicit execution orders, write each
-report with `write_wan_transformer_forward_report`, and pass all four paths to
-a `full-transformer` runner invocation:
+first capture the exact keyword arguments from one real singleton serving
+request. The capture path is qualification-only and disabled by default:
+
+```bash
+python -m sglang.multimodal_gen.tools.capture_wan_transformer_inputs \
+  --model-path /models/wan \
+  --output-dir /results/wan-inputs \
+  --output-index-json /results/wan-inputs/index.json \
+  --prompt "qualification prompt" --seed 4254 \
+  --width 1280 --height 720 --num-frames 81 \
+  --num-inference-steps 30 --guidance-scale 5.0 --guidance-scale-2 5.0 \
+  --component transformer --component transformer_2
+```
+
+Each worker-produced manifest binds the serving request, sampling parameters,
+model/component identity, step/timestep/CFG branch, and CPU tensor artifact.
+Use each manifest to load the real component twice and run a direct forward in
+both explicit execution orders:
+
+```bash
+python -m sglang.multimodal_gen.tools.run_wan_transformer_forward_report \
+  --capture-manifest /results/wan-inputs/<transformer-manifest>.json \
+  --run-order reference-first \
+  --output-json /results/transformer-reference-first.json
+```
+
+Repeat for `candidate-first` and for the `transformer_2` manifest. The direct
+harness accepts no caller-owned input mapping, forward closure, or backend-hit
+callback. Pass all four resulting paths to a `full-transformer` runner
+invocation:
 
 ```bash
   --full-transformer-forward-report /results/transformer-reference-first.json \
@@ -167,11 +188,9 @@ forward-hook snapshots from every entry in `model.blocks`, computes the complete
 5-by-5 cross-variant product and all ten same-instance run pairs, and separately
 checks the final transformer output. Each report is cryptographically bound to
 its component name, resolved component configuration, loaded model manifests,
-and fixed tensor inputs, so relabelling one component's report is rejected. The
-real model loader and captured forward inputs belong in the remote evaluation
-environment; the public harness does not guess checkpoint-specific inputs. Hook
-capture is a correctness path and must
-not be used for performance timing.
+fixed tensor inputs, request-local backend routes, and captured execution
+coordinates, so relabelling one component's report is rejected. Hook capture is
+a correctness path and must not be used for performance timing.
 
 ### Component residency
 

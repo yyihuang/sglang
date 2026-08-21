@@ -183,3 +183,40 @@ def test_capture_rejects_a_second_request_in_singleton_scope(tmp_path):
         assert "singleton" in str(error)
     else:
         raise AssertionError("capture accepted a second request_id")
+
+
+def test_capture_loader_rejects_component_changed_after_capture(tmp_path):
+    request_id = "request-a"
+    component_path = tmp_path / "model" / "transformer"
+    component_path.mkdir(parents=True)
+    config_path = component_path / "config.json"
+    config_path.write_text('{"num_layers":40}', encoding="utf-8")
+    capture = WanTransformerInputCapture(
+        output_dir=tmp_path / "capture",
+        request_id=request_id,
+        components=frozenset({"transformer"}),
+    )
+    capture.output_dir.mkdir()
+    manifest_path = capture.capture(
+        current_model=_Model(),
+        call_kwargs={"hidden_states": torch.ones(1)},
+        component_name="transformer",
+        component_model_path=component_path,
+        model_root=component_path.parent,
+        forward_context=ForwardContext(
+            current_timestep=0,
+            attn_metadata=None,
+            forward_batch=_batch(request_id),
+            wan_component_name="transformer",
+            wan_actual_timestep=999,
+            wan_cfg_branch_index=0,
+        ),
+    )
+
+    config_path.write_text('{"num_layers":39}', encoding="utf-8")
+    try:
+        load_wan_transformer_input_capture(manifest_path)
+    except ValueError as error:
+        assert "component file SHA256" in str(error)
+    else:
+        raise AssertionError("capture loader accepted a changed component config")

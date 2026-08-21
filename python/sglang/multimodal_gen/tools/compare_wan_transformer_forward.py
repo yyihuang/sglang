@@ -1,9 +1,9 @@
-"""Qualify one full Wan transformer forward with per-block coverage.
+"""Qualify one captured Wan transformer forward with per-block coverage.
 
 The public entry point accepts already-loaded reference and candidate model
-instances plus one fixed mapping of model-forward keyword arguments. It invokes
-both models itself and records every module in ``model.blocks`` using forward
-hooks, so caller-owned closures cannot substitute an unreported input.
+instances plus a verified worker-produced input manifest. It invokes both
+models itself and records every module in ``model.blocks`` using forward hooks,
+so caller-owned mappings or closures cannot substitute an unreported input.
 
 The same model instance is reused for every measured run.  Reference/candidate
 quality uses the trajectory evaluator's fixed tolerances over every run pair
@@ -17,13 +17,21 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    WanHybridEvidenceCollector,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
+    load_wan_transformer_input_capture,
+)
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MIN_QUALIFICATION_MEASURE_RUNS,
     MIN_QUALIFICATION_WARMUP_RUNS,
@@ -41,7 +49,16 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
 class WanTransformerForwardTrace:
     block_outputs: tuple[torch.Tensor, ...]
     output: torch.Tensor
-    wan_hybrid_hit_count: int | None = None
+    request_id: str
+    component_name: str
+    step_index: int
+    actual_timestep: int
+    cfg_branch_index: int
+    wan_hybrid_coverage: dict[str, Any]
+
+    @property
+    def wan_hybrid_hit_count(self) -> int:
+        return self.wan_hybrid_coverage["actual_hit_count"]
 
     @property
     def trajectory_latents(self) -> torch.Tensor:
@@ -50,6 +67,13 @@ class WanTransformerForwardTrace:
     @property
     def trajectory_timesteps(self) -> torch.Tensor:
         return torch.arange(len(self.block_outputs), dtype=torch.float32)
+
+
+@dataclass(frozen=True)
+class WanTransformerDirectRequest:
+    """Minimal request identity carried by a direct qualification context."""
+
+    request_id: str
 
 
 def _sha256_json(value: Any) -> str:
@@ -216,15 +240,15 @@ def _snapshot_tensor(value: Any, *, location: str) -> torch.Tensor:
 
 def capture_wan_transformer_forward(
     model: Any,
-    forward_call: Callable[[], Any],
     *,
-    wan_hybrid_hit_count: int | None = None,
+    fixed_input: Mapping[str, Any],
+    request_id: str,
+    component_name: str,
+    step_index: int,
+    actual_timestep: int,
+    cfg_branch_index: int,
 ) -> WanTransformerForwardTrace:
-    """Run one forward and snapshot every transformer block output.
-
-    ``forward_call`` should invoke ``model`` with a fixed real input capture.
-    Forward hooks are always removed, including when the model raises.
-    """
+    """Directly run one request-bound forward and snapshot every block output."""
 
     blocks = getattr(model, "blocks", None)
     if blocks is None:
@@ -241,9 +265,21 @@ def capture_wan_transformer_forward(
         )
 
     hooks = [block.register_forward_hook(record_block_output) for block in blocks]
+    collector = WanHybridEvidenceCollector(request_id=request_id)
     try:
-        with torch.inference_mode():
-            output = forward_call()
+        with (
+            torch.inference_mode(),
+            set_forward_context(
+                current_timestep=step_index,
+                attn_metadata=None,
+                forward_batch=WanTransformerDirectRequest(request_id=request_id),
+                wan_component_name=component_name,
+                wan_actual_timestep=actual_timestep,
+                wan_cfg_branch_index=cfg_branch_index,
+                wan_hybrid_evidence_collector=collector,
+            ),
+        ):
+            output = model(**fixed_input)
     finally:
         for hook in hooks:
             hook.remove()
@@ -256,7 +292,12 @@ def capture_wan_transformer_forward(
     return WanTransformerForwardTrace(
         block_outputs=tuple(block_outputs),
         output=_snapshot_tensor(output, location="transformer output"),
-        wan_hybrid_hit_count=wan_hybrid_hit_count,
+        request_id=request_id,
+        component_name=component_name,
+        step_index=step_index,
+        actual_timestep=actual_timestep,
+        cfg_branch_index=cfg_branch_index,
+        wan_hybrid_coverage=collector.coverage(),
     )
 
 
@@ -414,6 +455,115 @@ def _cross_variant_output_quality_failures(
     return failures
 
 
+def _direct_coverage_failure(
+    trace: WanTransformerForwardTrace,
+    *,
+    variant: str,
+) -> dict[str, Any] | None:
+    coverage = trace.wan_hybrid_coverage
+    expected_layers = list(range(len(trace.block_outputs)))
+    candidate = variant == "candidate"
+    expected_hits = len(expected_layers) if candidate else 0
+    expected_successes = expected_hits
+    if coverage.get("request_id") != trace.request_id:
+        return {"variant": variant, "reason": "request_id_mismatch"}
+    expected_scalars = {
+        "expected_hit_count": expected_hits,
+        "actual_hit_count": expected_hits,
+        "attributed_actual_hit_count": expected_hits,
+        "unattributed_actual_hit_count": 0,
+        "eligible_hybrid_miss_count": 0,
+        "num_route_events": len(expected_layers),
+        "num_success_events": expected_successes,
+    }
+    if any(coverage.get(name) != value for name, value in expected_scalars.items()):
+        return {
+            "variant": variant,
+            "reason": "coverage_scalar_mismatch",
+            "expected": expected_scalars,
+            "actual": {
+                name: coverage.get(name) for name in expected_scalars
+            },
+        }
+    steps = coverage.get("steps")
+    if not isinstance(steps, list) or len(steps) != 1:
+        return {"variant": variant, "reason": "coverage_step_mismatch"}
+    step = steps[0]
+    expected_step = {
+        "step_index": trace.step_index,
+        "actual_timestep": trace.actual_timestep,
+        "active_component": trace.component_name,
+        "executed_cfg_branch_indices": [trace.cfg_branch_index],
+    }
+    if not isinstance(step, dict) or any(
+        step.get(name) != value for name, value in expected_step.items()
+    ):
+        return {
+            "variant": variant,
+            "reason": "coverage_coordinate_mismatch",
+            "expected": expected_step,
+            "actual": (
+                {name: step.get(name) for name in expected_step}
+                if isinstance(step, dict)
+                else step
+            ),
+        }
+    branches = step.get("branches") if isinstance(step, dict) else None
+    if not isinstance(branches, list) or len(branches) != 1:
+        return {"variant": variant, "reason": "coverage_branch_mismatch"}
+    branch = branches[0]
+    expected_branch = {
+        "cfg_branch_index": trace.cfg_branch_index,
+        "num_layers": len(expected_layers),
+        "layer_indices": expected_layers,
+        "eligible_layer_indices": expected_layers if candidate else [],
+        "planned_hybrid_layer_indices": expected_layers if candidate else [],
+        "successful_hybrid_layer_indices": expected_layers if candidate else [],
+        "eligible_hybrid_miss_layer_indices": [],
+        "unexpected_successful_hybrid_layer_indices": [],
+        "configured_fallback_layer_indices": [],
+        "control_layer_indices": [] if candidate else expected_layers,
+        "expected_hit_count": expected_hits,
+        "actual_hit_count": expected_hits,
+    }
+    if any(branch.get(name) != value for name, value in expected_branch.items()):
+        return {
+            "variant": variant,
+            "reason": "coverage_route_mismatch",
+            "expected": expected_branch,
+            "actual": {name: branch.get(name) for name in expected_branch},
+        }
+    return None
+
+
+def _warmup_wan_transformer_forward(
+    model: Any,
+    *,
+    fixed_input: Mapping[str, Any],
+    request_id: str,
+    component_name: str,
+    step_index: int,
+    actual_timestep: int,
+    cfg_branch_index: int,
+) -> None:
+    """Warm up the exact request path without retaining multi-GB hook snapshots."""
+
+    collector = WanHybridEvidenceCollector(request_id=request_id)
+    with (
+        torch.inference_mode(),
+        set_forward_context(
+            current_timestep=step_index,
+            attn_metadata=None,
+            forward_batch=WanTransformerDirectRequest(request_id=request_id),
+            wan_component_name=component_name,
+            wan_actual_timestep=actual_timestep,
+            wan_cfg_branch_index=cfg_branch_index,
+            wan_hybrid_evidence_collector=collector,
+        ),
+    ):
+        model(**fixed_input)
+
+
 def evaluate_transformer_forward_correctness(
     reference_traces: Sequence[WanTransformerForwardTrace],
     candidate_traces: Sequence[WanTransformerForwardTrace],
@@ -448,6 +598,28 @@ def evaluate_transformer_forward_correctness(
         ],
         "candidate_backend_hits": hit_qualification,
     }
+    coverage_failures = [
+        failure
+        for variant, variant_traces in (
+            ("reference", reference_traces),
+            ("candidate", candidate_traces),
+        )
+        for trace in variant_traces
+        if (failure := _direct_coverage_failure(trace, variant=variant))
+        is not None
+    ]
+    qualification = qualification | {
+        "passed": qualification["passed"] and not coverage_failures,
+        "failures": qualification["failures"]
+        + [
+            {"scope": "request_local_backend_coverage"} | failure
+            for failure in coverage_failures
+        ],
+        "request_local_backend_coverage": {
+            "passed": not coverage_failures,
+            "failures": coverage_failures,
+        },
+    }
     return {
         "cross_variant_metrics": cross_variant,
         "repeatability": repeatability,
@@ -457,46 +629,109 @@ def evaluate_transformer_forward_correctness(
 
 def _run_variant(
     model: Any,
-    forward_call: Callable[[], Any],
     *,
+    fixed_input: Mapping[str, Any],
+    variant: str,
+    component_name: str,
+    step_index: int,
+    actual_timestep: int,
+    cfg_branch_index: int,
     warmup_runs: int,
     measure_runs: int,
-    reset_hit_count: Callable[[], None] | None = None,
-    read_hit_count: Callable[[], int] | None = None,
 ) -> list[WanTransformerForwardTrace]:
-    if (reset_hit_count is None) != (read_hit_count is None):
-        raise ValueError("reset_hit_count and read_hit_count must be provided together")
+    server_args = getattr(model, "_wan_qualification_server_args", None)
+    if server_args is not None:
+        from sglang.multimodal_gen.runtime.server_args import set_global_server_args
+
+        set_global_server_args(server_args)
     for _ in range(warmup_runs):
-        with torch.inference_mode():
-            forward_call()
+        _warmup_wan_transformer_forward(
+            model,
+            fixed_input=fixed_input,
+            request_id=f"wan-transformer-{variant}-warmup-{uuid.uuid4()}",
+            component_name=component_name,
+            step_index=step_index,
+            actual_timestep=actual_timestep,
+            cfg_branch_index=cfg_branch_index,
+        )
 
     traces = []
     for _ in range(measure_runs):
-        if reset_hit_count is not None:
-            reset_hit_count()
-        trace = capture_wan_transformer_forward(model, forward_call)
-        if read_hit_count is not None:
-            hit_count = read_hit_count()
-            if isinstance(hit_count, bool) or not isinstance(hit_count, int):
-                hit_count = None
-            trace = WanTransformerForwardTrace(
-                block_outputs=trace.block_outputs,
-                output=trace.output,
-                wan_hybrid_hit_count=hit_count,
+        traces.append(
+            capture_wan_transformer_forward(
+                model,
+                fixed_input=fixed_input,
+                request_id=f"wan-transformer-{variant}-measure-{uuid.uuid4()}",
+                component_name=component_name,
+                step_index=step_index,
+                actual_timestep=actual_timestep,
+                cfg_branch_index=cfg_branch_index,
             )
-        traces.append(trace)
+        )
     return traces
+
+
+def _move_fixed_input_to_model(
+    value: Any, *, device: torch.device, location: str = "input"
+) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device)
+    if isinstance(value, Mapping):
+        return {
+            key: _move_fixed_input_to_model(
+                item, device=device, location=f"{location}.{key}"
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(
+            _move_fixed_input_to_model(
+                item, device=device, location=f"{location}[{index}]"
+            )
+            for index, item in enumerate(value)
+        )
+    if isinstance(value, list):
+        return [
+            _move_fixed_input_to_model(
+                item, device=device, location=f"{location}[{index}]"
+            )
+            for index, item in enumerate(value)
+        ]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(f"{location} has unsupported direct-forward input type")
+
+
+def _model_device(model: Any) -> torch.device:
+    for tensor in itertools.chain(model.parameters(), model.buffers()):
+        return tensor.device
+    raise ValueError("Wan transformer model has neither parameters nor buffers")
+
+
+def _validate_loaded_model_against_capture(
+    model: Any, capture_model: Any, *, variant: str
+) -> None:
+    identity = _model_identity(model)
+    if not isinstance(capture_model, dict):
+        raise ValueError("Wan capture model identity is missing")
+    for name in (
+        "class",
+        "num_blocks",
+        "config_sha256",
+        "parameter_manifest_sha256",
+        "parameter_count",
+    ):
+        if identity.get(name) != capture_model.get(name):
+            raise ValueError(
+                f"{variant} loaded model does not match captured model field {name}"
+            )
 
 
 def run_wan_transformer_forward_qualification(
     *,
     reference_model: Any,
     candidate_model: Any,
-    reset_candidate_hit_count: Callable[[], None],
-    read_candidate_hit_count: Callable[[], int],
-    component_name: str,
-    component_model_path: str | Path,
-    fixed_input: Mapping[str, Any],
+    capture_manifest_path: str | Path,
     run_order: str = "reference-first",
     warmup_runs: int = MIN_QUALIFICATION_WARMUP_RUNS,
     measure_runs: int = MIN_QUALIFICATION_MEASURE_RUNS,
@@ -509,31 +744,85 @@ def run_wan_transformer_forward_qualification(
         warmup_runs=warmup_runs,
         measure_runs=measure_runs,
     )
+    fixed_input_cpu, capture_manifest = load_wan_transformer_input_capture(
+        capture_manifest_path
+    )
+    component = capture_manifest.get("component")
+    capture_coordinates = capture_manifest.get("capture")
+    if not isinstance(component, dict) or not isinstance(capture_coordinates, dict):
+        raise ValueError("Wan capture component or coordinates are missing")
+    component_name = component.get("name")
     if component_name not in ("transformer", "transformer_2"):
-        raise ValueError("component_name must be transformer or transformer_2")
-    if any(not isinstance(key, str) for key in fixed_input):
-        raise TypeError("fixed_input keys must be model-forward keyword names")
+        raise ValueError("captured component must be transformer or transformer_2")
+    component_model_path = component.get("resolved_path")
+    if not isinstance(component_model_path, str) or not component_model_path:
+        raise ValueError("captured component path is missing")
+    step_index = capture_coordinates.get("step_index")
+    actual_timestep = capture_coordinates.get("actual_timestep")
+    cfg_branch_index = capture_coordinates.get("cfg_branch_index")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (step_index, actual_timestep, cfg_branch_index)
+    ):
+        raise ValueError("captured step, timestep, and CFG branch must be integers")
+    if any(not isinstance(key, str) for key in fixed_input_cpu):
+        raise TypeError("captured input keys must be model-forward keyword names")
+    _validate_loaded_model_against_capture(
+        reference_model, capture_manifest.get("model"), variant="reference"
+    )
+    _validate_loaded_model_against_capture(
+        candidate_model, capture_manifest.get("model"), variant="candidate"
+    )
+    reference_input = _move_fixed_input_to_model(
+        fixed_input_cpu, device=_model_device(reference_model)
+    )
+    candidate_input = _move_fixed_input_to_model(
+        fixed_input_cpu, device=_model_device(candidate_model)
+    )
     evidence_binding = build_wan_transformer_evidence_binding(
         component_name=component_name,
         component_model_path=component_model_path,
-        fixed_input=fixed_input,
+        fixed_input=fixed_input_cpu,
         reference_model=reference_model,
         candidate_model=candidate_model,
+    )
+    evidence_binding = evidence_binding | {
+        "capture_manifest_sha256": capture_manifest["manifest_sha256"],
+        "capture_request_id": capture_manifest["request_id"],
+        "capture_coordinates": dict(capture_coordinates),
+        "capture_sampling_sha256": capture_manifest["sampling"][
+            "sampling_sha256"
+        ],
+    }
+    evidence_binding["binding_sha256"] = _sha256_json(
+        {
+            key: value
+            for key, value in evidence_binding.items()
+            if key != "binding_sha256"
+        }
     )
     variant_calls = {
         "reference": lambda: _run_variant(
             reference_model,
-            lambda: reference_model(**fixed_input),
+            fixed_input=reference_input,
+            variant="reference",
+            component_name=component_name,
+            step_index=step_index,
+            actual_timestep=actual_timestep,
+            cfg_branch_index=cfg_branch_index,
             warmup_runs=warmup_runs,
             measure_runs=measure_runs,
         ),
         "candidate": lambda: _run_variant(
             candidate_model,
-            lambda: candidate_model(**fixed_input),
+            fixed_input=candidate_input,
+            variant="candidate",
+            component_name=component_name,
+            step_index=step_index,
+            actual_timestep=actual_timestep,
+            cfg_branch_index=cfg_branch_index,
             warmup_runs=warmup_runs,
             measure_runs=measure_runs,
-            reset_hit_count=reset_candidate_hit_count,
-            read_hit_count=read_candidate_hit_count,
         ),
     }
     execution_order = (
@@ -544,7 +833,9 @@ def run_wan_transformer_forward_qualification(
     traces: dict[str, list[WanTransformerForwardTrace]] = {}
     for variant in execution_order:
         traces[variant] = variant_calls[variant]()
-    invocation_input_sha256 = _sha256_json(_summarize_fixed_input(fixed_input))
+    invocation_input_sha256 = _sha256_json(
+        _summarize_fixed_input(fixed_input_cpu)
+    )
     if evidence_binding["fixed_input_sha256"] != invocation_input_sha256:
         raise RuntimeError("full-transformer forward mutated the fixed input")
 
@@ -557,14 +848,28 @@ def run_wan_transformer_forward_qualification(
         "warmup_runs": warmup_runs,
         "measure_runs": measure_runs,
         "component_name": component_name,
+        "capture_manifest_path": str(Path(capture_manifest_path).resolve()),
         "evidence_binding": evidence_binding,
         "invocation_input_sha256": invocation_input_sha256,
         "num_blocks": len(traces["reference"][0].block_outputs),
         "candidate_per_run_wan_hybrid_expected_hit_count": [
-            len(trace.block_outputs) for trace in traces["candidate"]
+            trace.wan_hybrid_coverage["expected_hit_count"]
+            for trace in traces["candidate"]
         ],
         "candidate_per_run_wan_hybrid_hit_count": [
             trace.wan_hybrid_hit_count for trace in traces["candidate"]
+        ],
+        "reference_per_run_request_id": [
+            trace.request_id for trace in traces["reference"]
+        ],
+        "candidate_per_run_request_id": [
+            trace.request_id for trace in traces["candidate"]
+        ],
+        "reference_per_run_wan_hybrid_coverage": [
+            trace.wan_hybrid_coverage for trace in traces["reference"]
+        ],
+        "candidate_per_run_wan_hybrid_coverage": [
+            trace.wan_hybrid_coverage for trace in traces["candidate"]
         ],
         **result,
     }
@@ -593,6 +898,7 @@ def validate_wan_transformer_forward_report(
     if report.get("component_name") not in ("transformer", "transformer_2"):
         errors.append("component_name must identify transformer or transformer_2")
     binding = report.get("evidence_binding")
+    expected_capture_coordinates: dict[str, int] | None = None
     if not isinstance(binding, dict):
         errors.append("evidence binding is missing")
     else:
@@ -615,6 +921,35 @@ def validate_wan_transformer_forward_report(
             "fixed_input_sha256"
         ):
             errors.append("invoked input does not match fixed-input provenance")
+        capture_coordinates = binding.get("capture_coordinates")
+        if not (
+            isinstance(binding.get("capture_manifest_sha256"), str)
+            and len(binding["capture_manifest_sha256"]) == 64
+            and isinstance(binding.get("capture_request_id"), str)
+            and binding["capture_request_id"]
+            and isinstance(binding.get("capture_sampling_sha256"), str)
+            and len(binding["capture_sampling_sha256"]) == 64
+            and isinstance(capture_coordinates, dict)
+            and all(
+                not isinstance(capture_coordinates.get(name), bool)
+                and isinstance(capture_coordinates.get(name), int)
+                for name in (
+                    "step_index",
+                    "actual_timestep",
+                    "cfg_branch_index",
+                )
+            )
+        ):
+            errors.append("worker capture binding is incomplete")
+        else:
+            expected_capture_coordinates = {
+                name: capture_coordinates[name]
+                for name in (
+                    "step_index",
+                    "actual_timestep",
+                    "cfg_branch_index",
+                )
+            }
         for variant in ("reference_model", "candidate_model"):
             identity = binding.get(variant)
             if not isinstance(identity, dict):
@@ -781,6 +1116,112 @@ def validate_wan_transformer_forward_report(
     ):
         errors.append("every measured candidate hit count must equal expected depth 40")
 
+    request_ids_by_variant = {}
+    coverages_by_variant = {}
+    for variant in ("reference", "candidate"):
+        request_ids = report.get(f"{variant}_per_run_request_id")
+        coverages = report.get(f"{variant}_per_run_wan_hybrid_coverage")
+        if (
+            not isinstance(request_ids, list)
+            or len(request_ids) != expected_measure_runs
+            or any(not isinstance(item, str) or not item for item in request_ids)
+            or len(set(request_ids)) != expected_measure_runs
+        ):
+            errors.append(f"{variant} measured request IDs are not unique")
+            request_ids = []
+        if not isinstance(coverages, list) or len(coverages) != expected_measure_runs:
+            errors.append(f"{variant} request-local coverage is incomplete")
+            coverages = []
+        request_ids_by_variant[variant] = request_ids
+        coverages_by_variant[variant] = coverages
+    if set(request_ids_by_variant.get("reference", ())) & set(
+        request_ids_by_variant.get("candidate", ())
+    ):
+        errors.append("reference and candidate request IDs overlap")
+    for variant, coverages in coverages_by_variant.items():
+        candidate = variant == "candidate"
+        expected_hits = 40 if candidate else 0
+        for run_index, coverage in enumerate(coverages):
+            location = f"{variant}_per_run_wan_hybrid_coverage[{run_index}]"
+            if not isinstance(coverage, dict):
+                errors.append(f"{location}: coverage is not an object")
+                continue
+            expected_request_ids = request_ids_by_variant.get(variant, [])
+            expected_request_id = (
+                expected_request_ids[run_index]
+                if run_index < len(expected_request_ids)
+                else None
+            )
+            scalars = {
+                "schema_version": 2,
+                "request_id": expected_request_id,
+                "expected_hit_count": expected_hits,
+                "actual_hit_count": expected_hits,
+                "attributed_actual_hit_count": expected_hits,
+                "unattributed_actual_hit_count": 0,
+                "eligible_hybrid_miss_count": 0,
+                "num_route_events": 40,
+                "num_success_events": expected_hits,
+            }
+            if any(coverage.get(name) != value for name, value in scalars.items()):
+                errors.append(f"{location}: request-local scalar coverage is invalid")
+                continue
+            steps = coverage.get("steps")
+            step = (
+                steps[0]
+                if isinstance(steps, list)
+                and len(steps) == 1
+                and isinstance(steps[0], dict)
+                else None
+            )
+            if step is None or expected_capture_coordinates is None:
+                errors.append(f"{location}: step/branch coverage is invalid")
+                continue
+            expected_step = {
+                "step_index": expected_capture_coordinates["step_index"],
+                "actual_timestep": expected_capture_coordinates[
+                    "actual_timestep"
+                ],
+                "active_component": report.get("component_name"),
+                "executed_cfg_branch_indices": [
+                    expected_capture_coordinates["cfg_branch_index"]
+                ],
+            }
+            if any(step.get(name) != value for name, value in expected_step.items()):
+                errors.append(f"{location}: capture coordinates are invalid")
+                continue
+            branches = step.get("branches")
+            if not isinstance(branches, list) or len(branches) != 1:
+                errors.append(f"{location}: step/branch coverage is invalid")
+                continue
+            branch = branches[0]
+            expected_layers = list(range(40))
+            expected_routes = {
+                "cfg_branch_index": expected_capture_coordinates[
+                    "cfg_branch_index"
+                ],
+                "num_layers": 40,
+                "layer_indices": expected_layers,
+                "eligible_layer_indices": expected_layers if candidate else [],
+                "planned_hybrid_layer_indices": (
+                    expected_layers if candidate else []
+                ),
+                "successful_hybrid_layer_indices": (
+                    expected_layers if candidate else []
+                ),
+                "eligible_hybrid_miss_layer_indices": [],
+                "unexpected_successful_hybrid_layer_indices": [],
+                "configured_fallback_layer_indices": [],
+                "control_layer_indices": [] if candidate else expected_layers,
+                "expected_hit_count": expected_hits,
+                "actual_hit_count": expected_hits,
+            }
+            if any(
+                branch.get(name) != value
+                for name, value in expected_routes.items()
+            ):
+                errors.append(f"{location}: planned/success route coverage is invalid")
+
     qualification = report.get("qualification")
     if (
         not isinstance(qualification, dict)
@@ -800,6 +1241,11 @@ def validate_wan_transformer_forward_report(
         "failures": [],
     }:
         errors.append("candidate backend-hit qualification is incomplete")
+    elif qualification.get("request_local_backend_coverage") != {
+        "passed": True,
+        "failures": [],
+    }:
+        errors.append("request-local backend coverage qualification is incomplete")
     return errors
 
 
