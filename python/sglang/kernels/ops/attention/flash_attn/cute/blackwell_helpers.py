@@ -1188,31 +1188,15 @@ def gemm_blockscaled(
     tCtSFB: cute.Tensor,
     zero_init: bool | Boolean = True,
     sB: Optional[cute.Tensor] = None,
-    kblock_idx: cutlass.Constexpr[Optional[int]] = None,
     **kwargs,
 ) -> None:
     """Blockscaled GEMM using cute.gemm with per-kblock SFA/SFB TMEM addresses."""
-    if const_expr(kblock_idx is None):
-        num_kblocks = cute.size(tCrA.shape[2])
-        for kblock in cutlass.range(num_kblocks, unroll_full=True):
-            sf_kblock_coord = (None, None, kblock)
-            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
-            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
-            tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or kblock != 0)
-            cute.gemm(
-                tiled_mma,
-                acc,
-                tCrA[None, None, kblock],
-                tCrB[None, None, kblock],
-                acc,
-            )
-    else:
+    num_kblocks = cute.size(tCrA.shape[2])
+    for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
         sf_kblock_coord = (None, None, kblock_idx)
         tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
         tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
-        tiled_mma.set(
-            tcgen05.Field.ACCUMULATE, not zero_init or kblock_idx != 0
-        )
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or kblock_idx != 0)
         cute.gemm(
             tiled_mma,
             acc,
@@ -1220,6 +1204,34 @@ def gemm_blockscaled(
             tCrB[None, None, kblock_idx],
             acc,
         )
+
+
+@cute.jit
+def gemm_blockscaled_kblock(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    tCtSFA: cute.Tensor,
+    tCtSFB: cute.Tensor,
+    kblock_idx: cutlass.Constexpr[int],
+    zero_init: bool | Boolean = True,
+    sB: Optional[cute.Tensor] = None,
+    **kwargs,
+) -> None:
+    """Issue one blockscaled MMA K block without mutating the caller's MMA state."""
+    mma_atom = cute.make_mma_atom(tiled_mma.op)
+    sf_kblock_coord = (None, None, kblock_idx)
+    mma_atom.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
+    mma_atom.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
+    mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or kblock_idx != 0)
+    cute.gemm(
+        mma_atom,
+        acc,
+        tCrA[None, None, kblock_idx],
+        tCrB[None, None, kblock_idx],
+        acc,
+    )
 
 
 @cute.jit
