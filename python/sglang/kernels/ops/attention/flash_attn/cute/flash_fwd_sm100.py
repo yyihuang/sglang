@@ -258,6 +258,7 @@ class FlashAttentionForwardSm100:
         qk_blockscaled: bool = False,
         v_dequant: bool = False,
         pv_nvfp4: bool = False,
+        pv_nvfp4_residual: cutlass.Constexpr[bool] = True,
         q_sf_interleaved: bool = False,
         kv_sf_interleaved: bool = False,
         batch_invariant: bool = False,
@@ -283,6 +284,10 @@ class FlashAttentionForwardSm100:
         # correction, epilogue, and scheduling remain the production BF16 path;
         # only P@V changes to native NVFP4 block-scaled MMA.
         self.pv_nvfp4 = pv_nvfp4
+        # Internal attribution switch. The default preserves the qualified
+        # two-level V path; disabling it only removes residual SFB publication
+        # and the residual P@V contribution.
+        self.pv_nvfp4_residual = pv_nvfp4_residual
         if self.pv_nvfp4:
             # E4M3 cannot directly encode amax(P) / 6 for diffuse Wan rows
             # (uniform P at S=4800 would underflow the scale to zero).  Scale
@@ -4327,13 +4332,14 @@ class FlashAttentionForwardSm100:
                                 ],
                                 pv_sf_copies[stage].tCtSFBBase_s2t,
                             )
-                            cute.copy(
-                                pv_sf_copies[stage].tiled_copy_sfb_residual,
-                                pv_sf_copies[stage].tCsSFBResidual_s2t[
-                                    (None, None, None, None, Vi_index)
-                                ],
-                                pv_sf_copies[stage].tCtSFBResidual_s2t,
-                            )
+                            if const_expr(self.pv_nvfp4_residual):
+                                cute.copy(
+                                    pv_sf_copies[stage].tiled_copy_sfb_residual,
+                                    pv_sf_copies[stage].tCsSFBResidual_s2t[
+                                        (None, None, None, None, Vi_index)
+                                    ],
+                                    pv_sf_copies[stage].tCtSFBResidual_s2t,
+                                )
                         gemm_Pi[stage](
                             tCrB=tOrVi,
                             sB=sV_cur,
@@ -4346,7 +4352,9 @@ class FlashAttentionForwardSm100:
                             ),
                             mbar_phase=P_full_O_rescaled_phase,
                         )
-                        if const_expr(self.pv_nvfp4):
+                        if const_expr(
+                            self.pv_nvfp4 and self.pv_nvfp4_residual
+                        ):
                             gemm_Pi_residual[stage](
                                 tCrB=tOrViResidual,
                                 sB=sVResidual[None, None, None, Vi_index],
@@ -4475,13 +4483,14 @@ class FlashAttentionForwardSm100:
                             ],
                             pv_sf_copies[stage].tCtSFBBase_s2t,
                         )
-                        cute.copy(
-                            pv_sf_copies[stage].tiled_copy_sfb_residual,
-                            pv_sf_copies[stage].tCsSFBResidual_s2t[
-                                (None, None, None, None, Vi_index)
-                            ],
-                            pv_sf_copies[stage].tCtSFBResidual_s2t,
-                        )
+                        if const_expr(self.pv_nvfp4_residual):
+                            cute.copy(
+                                pv_sf_copies[stage].tiled_copy_sfb_residual,
+                                pv_sf_copies[stage].tCsSFBResidual_s2t[
+                                    (None, None, None, None, Vi_index)
+                                ],
+                                pv_sf_copies[stage].tCtSFBResidual_s2t,
+                            )
                     gemm_Pi[stage](
                         tCrB=tOrVi,
                         sB=sV_cur,
@@ -4494,7 +4503,7 @@ class FlashAttentionForwardSm100:
                         ),
                         mbar_phase=P_full_O_rescaled_phase,
                     )
-                    if const_expr(self.pv_nvfp4):
+                    if const_expr(self.pv_nvfp4 and self.pv_nvfp4_residual):
                         gemm_Pi_residual[stage](
                             tCrB=tOrViResidual,
                             sB=sVResidual[None, None, None, Vi_index],

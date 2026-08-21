@@ -544,6 +544,7 @@ def _flash_attn_fwd(
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     pv_nvfp4: bool = False,
+    pv_nvfp4_residual: bool = True,
     v_base: Optional[torch.Tensor] = None,
     v_residual: Optional[torch.Tensor] = None,
     sfv_base: Optional[torch.Tensor] = None,
@@ -1536,6 +1537,7 @@ def _flash_attn_fwd(
         sfk.ndim if sfk is not None else None,
         sfv.ndim if sfv is not None else None,
         pv_nvfp4,
+        pv_nvfp4_residual,
         batch_invariant,
         fa_logging.get_fa_log_level(),
     )
@@ -1766,6 +1768,7 @@ def _flash_attn_fwd(
                             kv_sf_interleaved=kv_sf_interleaved,
                             batch_invariant=batch_invariant,
                             pv_nvfp4=pv_nvfp4,
+                            pv_nvfp4_residual=pv_nvfp4_residual,
                         )
                     ),
                 )
