@@ -4152,26 +4152,16 @@ class FlashAttentionForwardSm100:
                 )
                 for stage in range(self.q_stage)
             ]
-            gemm_Pi_kblock = [
+            gemm_Pi_split = [
                 partial(
-                    sm100_utils.gemm_blockscaled_kblock,
+                    sm100_utils.gemm_blockscaled_split_k2,
                     tiled_mma_pv,
                     tOtO[None, None, None, stage],
                     tOrP[None, None, None, stage],
                     tCtSFA=pv_sf_copies[stage].tCtSFA,
-                    tCtSFB=pv_sf_copies[stage].tCtSFBBase,
-                )
-                for stage in range(self.q_stage)
-            ]
-            gemm_Pi_residual_kblock = [
-                partial(
-                    sm100_utils.gemm_blockscaled_kblock,
-                    tiled_mma_pv,
-                    tOtO[None, None, None, stage],
-                    tOrP[None, None, None, stage],
-                    tCtSFA=pv_sf_copies[stage].tCtSFA,
-                    tCtSFB=pv_sf_copies[stage].tCtSFBResidual,
-                    zero_init=False,
+                    tCtSFB_base=pv_sf_copies[stage].tCtSFBBase,
+                    tCtSFB_residual=pv_sf_copies[stage].tCtSFBResidual,
+                    use_residual=self.pv_nvfp4_residual,
                 )
                 for stage in range(self.q_stage)
             ]
@@ -4366,34 +4356,15 @@ class FlashAttentionForwardSm100:
                                     pv_sf_copies[stage].tCtSFBResidual_s2t,
                                 )
                         if const_expr(self.pv_nvfp4 and self.split_P_arrive > 0):
-                            gemm_Pi_kblock[stage](
-                                tCrB=tOrVi,
-                                sB=sV_cur,
+                            gemm_Pi_split[stage](
+                                tCrB_base=tOrVi,
+                                tCrB_residual=tOrViResidual,
+                                lastsplit_mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(
+                                    stage
+                                ),
+                                lastsplit_phase=P_full_O_rescaled_phase,
                                 zero_init=not O_should_accumulate,
-                                kblock_idx=0,
                             )
-                            if const_expr(self.pv_nvfp4_residual):
-                                gemm_Pi_residual_kblock[stage](
-                                    tCrB=tOrViResidual,
-                                    sB=sVResidual[None, None, None, Vi_index],
-                                    kblock_idx=0,
-                                )
-                            cute.arch.mbarrier_wait(
-                                pipeline_p_lastsplit.sync_object_full.get_barrier(stage),
-                                phase=P_full_O_rescaled_phase,
-                            )
-                            gemm_Pi_kblock[stage](
-                                tCrB=tOrVi,
-                                sB=sV_cur,
-                                zero_init=False,
-                                kblock_idx=1,
-                            )
-                            if const_expr(self.pv_nvfp4_residual):
-                                gemm_Pi_residual_kblock[stage](
-                                    tCrB=tOrViResidual,
-                                    sB=sVResidual[None, None, None, Vi_index],
-                                    kblock_idx=1,
-                                )
                         else:
                             gemm_Pi[stage](
                                 tCrB=tOrVi,
@@ -4540,34 +4511,15 @@ class FlashAttentionForwardSm100:
                                 pv_sf_copies[stage].tCtSFBResidual_s2t,
                             )
                     if const_expr(self.pv_nvfp4 and self.split_P_arrive > 0):
-                        gemm_Pi_kblock[stage](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
+                        gemm_Pi_split[stage](
+                            tCrB_base=tOrVi,
+                            tCrB_residual=tOrViResidual,
+                            lastsplit_mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(
+                                stage
+                            ),
+                            lastsplit_phase=P_full_O_rescaled_phase,
                             zero_init=not O_should_accumulate,
-                            kblock_idx=0,
                         )
-                        if const_expr(self.pv_nvfp4_residual):
-                            gemm_Pi_residual_kblock[stage](
-                                tCrB=tOrViResidual,
-                                sB=sVResidual[None, None, None, Vi_index],
-                                kblock_idx=0,
-                            )
-                        cute.arch.mbarrier_wait(
-                            pipeline_p_lastsplit.sync_object_full.get_barrier(stage),
-                            phase=P_full_O_rescaled_phase,
-                        )
-                        gemm_Pi_kblock[stage](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
-                            zero_init=False,
-                            kblock_idx=1,
-                        )
-                        if const_expr(self.pv_nvfp4_residual):
-                            gemm_Pi_residual_kblock[stage](
-                                tCrB=tOrViResidual,
-                                sB=sVResidual[None, None, None, Vi_index],
-                                kblock_idx=1,
-                            )
                     else:
                         gemm_Pi[stage](
                             tCrB=tOrVi,
