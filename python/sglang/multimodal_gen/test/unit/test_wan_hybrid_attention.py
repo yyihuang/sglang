@@ -9,9 +9,13 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
     WanHybridAttentionBackend,
     WanHybridAttentionImpl,
     _SHARED_SCRATCH,
+    _record_successful_wan_hybrid_forward,
+    read_wan_hybrid_coverage,
     read_wan_hybrid_hit_count,
+    record_wan_attention_route,
     reset_wan_hybrid_hit_count,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -29,13 +33,14 @@ def _exact_cuda_inputs():
     return tuple(tensors)
 
 
-def _make_impl():
+def _make_impl(*, prefix=""):
     return WanHybridAttentionImpl(
         num_heads=40,
         num_kv_heads=40,
         head_size=128,
         softmax_scale=128**-0.5,
         causal=False,
+        prefix=prefix,
     )
 
 
@@ -53,6 +58,57 @@ class TestWanHybridAttentionBackend(unittest.TestCase):
 
     def test_constructor_accepts_exact_wan_self_attention(self):
         self.assertEqual(_make_impl().num_heads, 40)
+        self.assertEqual(
+            _make_impl(prefix="blocks.17.attn1.impl")._wan_layer_index, 17
+        )
+
+    def test_request_coverage_uses_real_context_and_route_events(self):
+        result = torch.ones(1)
+        with set_forward_context(
+            current_timestep=0,
+            attn_metadata=None,
+            wan_component_name="transformer",
+            wan_actual_timestep=999,
+            wan_cfg_branch_index=0,
+            capture_wan_hybrid_evidence=True,
+        ):
+            for layer_index in range(2):
+                record_wan_attention_route(
+                    layer_index=layer_index,
+                    hybrid_configured=True,
+                    eligible_for_hybrid=True,
+                )
+                _record_successful_wan_hybrid_forward(
+                    result, layer_index=layer_index
+                )
+        with set_forward_context(
+            current_timestep=1,
+            attn_metadata=None,
+            wan_component_name="transformer_2",
+            wan_actual_timestep=100,
+            wan_cfg_branch_index=0,
+            capture_wan_hybrid_evidence=True,
+        ):
+            for layer_index in range(2):
+                record_wan_attention_route(
+                    layer_index=layer_index,
+                    hybrid_configured=False,
+                    eligible_for_hybrid=False,
+                )
+
+        coverage = read_wan_hybrid_coverage()
+
+        self.assertEqual(coverage["expected_hit_count"], 2)
+        self.assertEqual(coverage["actual_hit_count"], 2)
+        self.assertEqual(coverage["unattributed_actual_hit_count"], 0)
+        self.assertEqual(
+            coverage["steps"][0]["branches"][0]["hybrid_layer_indices"],
+            [0, 1],
+        )
+        self.assertEqual(
+            coverage["steps"][1]["branches"][0]["control_layer_indices"],
+            [0, 1],
+        )
 
     def test_constructor_rejects_unsupported_contracts(self):
         cases = (

@@ -2,7 +2,9 @@
 
 import threading
 import weakref
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -25,12 +27,16 @@ _SHARED_SCRATCH: weakref.WeakValueDictionary[tuple, _WanHybridSharedScratch] = (
 )
 _HIT_COUNT_LOCK = threading.Lock()
 _SUCCESSFUL_FORWARD_HIT_COUNT = 0
+_ROUTE_EVENTS: list[dict[str, Any]] = []
+_SUCCESS_EVENTS: list[dict[str, Any]] = []
 
 
 def reset_wan_hybrid_hit_count() -> None:
     global _SUCCESSFUL_FORWARD_HIT_COUNT
     with _HIT_COUNT_LOCK:
         _SUCCESSFUL_FORWARD_HIT_COUNT = 0
+        _ROUTE_EVENTS.clear()
+        _SUCCESS_EVENTS.clear()
 
 
 def read_wan_hybrid_hit_count() -> int:
@@ -38,11 +44,192 @@ def read_wan_hybrid_hit_count() -> int:
         return _SUCCESSFUL_FORWARD_HIT_COUNT
 
 
-def _record_successful_wan_hybrid_forward(result: torch.Tensor) -> torch.Tensor:
+def _current_evidence_coordinates(layer_index: int) -> dict[str, Any] | None:
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        get_forward_context,
+    )
+
+    try:
+        context = get_forward_context()
+    except AssertionError:
+        return None
+    if not context.capture_wan_hybrid_evidence:
+        return None
+    coordinates = {
+        "step_index": context.current_timestep,
+        "actual_timestep": context.wan_actual_timestep,
+        "component_name": context.wan_component_name,
+        "cfg_branch_index": context.wan_cfg_branch_index,
+        "layer_index": layer_index,
+    }
+    missing = [name for name, value in coordinates.items() if value is None]
+    if missing:
+        raise RuntimeError(
+            "Wan hybrid evidence context is incomplete: " + ", ".join(missing)
+        )
+    return coordinates
+
+
+def record_wan_attention_route(
+    *,
+    layer_index: int,
+    hybrid_configured: bool,
+    eligible_for_hybrid: bool,
+) -> None:
+    """Record the actual self-attention route before a Wan block executes it."""
+
+    coordinates = _current_evidence_coordinates(layer_index)
+    if coordinates is None:
+        return
+    if eligible_for_hybrid and not hybrid_configured:
+        raise RuntimeError("Wan hybrid evidence marked an FA-only layer as eligible")
+    event = coordinates | {
+        "hybrid_configured": hybrid_configured,
+        "eligible_for_hybrid": eligible_for_hybrid,
+        "selected_backend": "wan_hybrid" if eligible_for_hybrid else "fa",
+        "fallback": hybrid_configured and not eligible_for_hybrid,
+        "control": not hybrid_configured,
+    }
+    with _HIT_COUNT_LOCK:
+        _ROUTE_EVENTS.append(event)
+
+
+def _record_successful_wan_hybrid_forward(
+    result: torch.Tensor, *, layer_index: int | None
+) -> torch.Tensor:
     global _SUCCESSFUL_FORWARD_HIT_COUNT
+    coordinates = (
+        _current_evidence_coordinates(layer_index)
+        if layer_index is not None
+        else None
+    )
     with _HIT_COUNT_LOCK:
         _SUCCESSFUL_FORWARD_HIT_COUNT += 1
+        if coordinates is not None:
+            _SUCCESS_EVENTS.append(coordinates)
     return result
+
+
+def read_wan_hybrid_coverage() -> dict[str, Any]:
+    """Return request-local route and successful-hit evidence grouped by real calls."""
+
+    with _HIT_COUNT_LOCK:
+        routes = [dict(event) for event in _ROUTE_EVENTS]
+        successes = [dict(event) for event in _SUCCESS_EVENTS]
+        actual_hit_count = _SUCCESSFUL_FORWARD_HIT_COUNT
+
+    success_counts = Counter(
+        (
+            event["step_index"],
+            event["actual_timestep"],
+            event["component_name"],
+            event["cfg_branch_index"],
+            event["layer_index"],
+        )
+        for event in successes
+    )
+    grouped: dict[tuple[int, int, str], dict[int, list[dict[str, Any]]]] = (
+        defaultdict(lambda: defaultdict(list))
+    )
+    for event in routes:
+        grouped[
+            (
+                event["step_index"],
+                event["actual_timestep"],
+                event["component_name"],
+            )
+        ][event["cfg_branch_index"]].append(event)
+
+    steps = []
+    expected_hit_count = 0
+    attributed_actual_hit_count = 0
+    eligible_self_fallback_count = 0
+    for (step_index, actual_timestep, component_name), branch_groups in sorted(
+        grouped.items()
+    ):
+        branches = []
+        for branch_index, branch_routes in sorted(branch_groups.items()):
+            branch_routes.sort(key=lambda event: event["layer_index"])
+            layer_indices = [event["layer_index"] for event in branch_routes]
+            eligible_layers = [
+                event["layer_index"]
+                for event in branch_routes
+                if event["eligible_for_hybrid"]
+            ]
+            hybrid_layers = [
+                event["layer_index"]
+                for event in branch_routes
+                if event["selected_backend"] == "wan_hybrid"
+            ]
+            fallback_layers = [
+                event["layer_index"]
+                for event in branch_routes
+                if event["fallback"]
+            ]
+            control_layers = [
+                event["layer_index"]
+                for event in branch_routes
+                if event["control"]
+            ]
+            successful_layers = []
+            for layer_index in sorted(set(layer_indices)):
+                successful_layers.extend(
+                    [layer_index]
+                    * success_counts[
+                        (
+                            step_index,
+                            actual_timestep,
+                            component_name,
+                            branch_index,
+                            layer_index,
+                        )
+                    ]
+                )
+            branch_expected = len(hybrid_layers)
+            branch_actual = len(successful_layers)
+            expected_hit_count += branch_expected
+            attributed_actual_hit_count += branch_actual
+            eligible_self_fallback_count += sum(
+                event["eligible_for_hybrid"]
+                and event["selected_backend"] != "wan_hybrid"
+                for event in branch_routes
+            )
+            branches.append(
+                {
+                    "cfg_branch_index": branch_index,
+                    "num_layers": len(layer_indices),
+                    "layer_indices": layer_indices,
+                    "eligible_layer_indices": eligible_layers,
+                    "hybrid_layer_indices": hybrid_layers,
+                    "successful_hybrid_layer_indices": successful_layers,
+                    "fallback_layer_indices": fallback_layers,
+                    "control_layer_indices": control_layers,
+                    "expected_hit_count": branch_expected,
+                    "actual_hit_count": branch_actual,
+                }
+            )
+        steps.append(
+            {
+                "step_index": step_index,
+                "actual_timestep": actual_timestep,
+                "active_component": component_name,
+                "executed_cfg_branch_indices": sorted(branch_groups),
+                "branches": branches,
+            }
+        )
+
+    return {
+        "schema_version": 1,
+        "expected_hit_count": expected_hit_count,
+        "actual_hit_count": actual_hit_count,
+        "attributed_actual_hit_count": attributed_actual_hit_count,
+        "unattributed_actual_hit_count": actual_hit_count
+        - attributed_actual_hit_count,
+        "eligible_self_fallback_count": eligible_self_fallback_count,
+        "num_route_events": len(routes),
+        "num_success_events": len(successes),
+        "steps": steps,
+    }
 
 
 class WanHybridAttentionBackend(AttentionBackend):
@@ -80,7 +267,7 @@ class WanHybridAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        del prefix, extra_impl_args
+        del extra_impl_args
         if head_size != 128:
             raise ValueError(
                 f"Wan hybrid attention requires head_size=128, got {head_size}"
@@ -101,6 +288,16 @@ class WanHybridAttentionImpl(AttentionImpl):
         self.num_heads = num_heads
         self.head_size = head_size
         self.softmax_scale = softmax_scale
+        prefix_parts = prefix.split(".")
+        self._wan_layer_index = None
+        for part_index in range(len(prefix_parts) - 2):
+            if (
+                prefix_parts[part_index] == "blocks"
+                and prefix_parts[part_index + 1].isdigit()
+                and prefix_parts[part_index + 2] == "attn1"
+            ):
+                self._wan_layer_index = int(prefix_parts[part_index + 1])
+                break
         self._workspace_key = None
         self._shared_scratch = None
         self._output = None
@@ -209,5 +406,6 @@ class WanHybridAttentionImpl(AttentionImpl):
                 sm_scale=self.softmax_scale,
                 qkv_layout="NHD",
                 causal=False,
-            )
+            ),
+            layer_index=self._wan_layer_index,
         )

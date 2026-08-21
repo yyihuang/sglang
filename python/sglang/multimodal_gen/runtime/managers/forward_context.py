@@ -38,6 +38,10 @@ class ForwardContext:
     attn_metadata: "AttentionMetadata"  # set dynamically for each forward pass
     forward_batch: Optional["Req"] = None
     attention_backend_cls: Optional[Type] = None
+    wan_component_name: str | None = None
+    wan_actual_timestep: int | None = None
+    wan_cfg_branch_index: int | None = None
+    capture_wan_hybrid_evidence: bool = False
 
     def set_attn_backend_cls(self, attention_backend_cls: Type):
         if self.attention_backend_cls:
@@ -64,7 +68,14 @@ def get_forward_context() -> "ForwardContext":
 # TODO(will): finalize the interface
 @contextmanager
 def set_forward_context(
-    current_timestep, attn_metadata, forward_batch: Optional["Req"] = None
+    current_timestep,
+    attn_metadata,
+    forward_batch: Optional["Req"] = None,
+    *,
+    wan_component_name: str | None = None,
+    wan_actual_timestep: int | None = None,
+    wan_cfg_branch_index: int | None = None,
+    capture_wan_hybrid_evidence: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -80,6 +91,10 @@ def set_forward_context(
         current_timestep=current_timestep,
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
+        wan_component_name=wan_component_name,
+        wan_actual_timestep=wan_actual_timestep,
+        wan_cfg_branch_index=wan_cfg_branch_index,
+        capture_wan_hybrid_evidence=capture_wan_hybrid_evidence,
     )
 
     try:

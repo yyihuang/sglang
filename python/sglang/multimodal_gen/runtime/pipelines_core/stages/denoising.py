@@ -346,6 +346,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.profiler = None
         self._is_warmed_up = False
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
+        self._wan_hybrid_evidence_enabled = any(
+            getattr(module, "backend", None) == AttentionBackendEnum.WAN_HYBRID
+            for transformer in (self.transformer, self.transformer_2)
+            if transformer is not None
+            for module in transformer.modules()
+        )
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
         backends = {
@@ -1511,6 +1517,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 server_args=server_args,
                 guidance=ctx.guidance,
                 latents=ctx.latents,
+                wan_component_name=self._component_name_for_stage_module(
+                    step.current_model,
+                    "transformer"
+                    if step.current_model is self.transformer
+                    else "transformer_2",
+                ),
+                wan_actual_timestep=step.t_int,
             )
         if server_args.comfyui_mode:
             batch.noise_pred = noise_pred
@@ -2038,11 +2051,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         server_args: ServerArgs,
         guidance: torch.Tensor,
         latents: torch.Tensor,
+        wan_component_name: str | None = None,
+        wan_actual_timestep: int | None = None,
     ) -> "torch.Tensor | tuple[torch.Tensor, ...]":
         """Run all CFG branch forward passes and combine into the final noise estimate."""
         cfg_scale = server_args.pipeline_config.get_classifier_free_guidance_scale(
             batch, current_guidance_scale
         )
+
+        branch_indices = {
+            id(branch): branch_index
+            for branch_index, branch in enumerate(cfg_policy.branches)
+        }
 
         def predict_fn(branch):
             branch.configure_batch(batch)
@@ -2050,6 +2070,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
+                wan_component_name=wan_component_name,
+                wan_actual_timestep=wan_actual_timestep,
+                wan_cfg_branch_index=branch_indices[id(branch)],
+                capture_wan_hybrid_evidence=getattr(
+                    self, "_wan_hybrid_evidence_enabled", False
+                ),
             ):
                 raw = self._predict_noise(
                     current_model=current_model,

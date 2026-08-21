@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     UlyssesAttention_VSA,
     USPAttention,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    record_wan_attention_route,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
@@ -636,6 +639,7 @@ class WanTransformerBlock(nn.Module):
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
         use_wan_hybrid: bool = True,
+        wan_evidence_layer_index: int | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -672,10 +676,14 @@ class WanTransformerBlock(nn.Module):
         value, _ = self.to_v(norm_hidden_states)
         cos, sin = freqs_cis
 
-        use_wan_hybrid = (
-            self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
-            and use_wan_hybrid
-        )
+        hybrid_configured = self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
+        use_wan_hybrid = hybrid_configured and use_wan_hybrid
+        if wan_evidence_layer_index is not None:
+            record_wan_attention_route(
+                layer_index=wan_evidence_layer_index,
+                hybrid_configured=hybrid_configured,
+                eligible_for_hybrid=use_wan_hybrid,
+            )
         if use_wan_hybrid:
             if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
                 raise NotImplementedError(
@@ -1208,7 +1216,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         guidance=None,
         **kwargs,
     ) -> torch.Tensor:
-        forward_batch = get_forward_context().forward_batch
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
         if forward_batch is not None:
             sequence_shard_enabled = (
                 forward_batch.enable_sequence_shard and self.sp_size > 1
@@ -1386,6 +1395,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         self.wan_hybrid_layer_indices is None
                         or block_index in self.wan_hybrid_layer_indices
                     )
+                    if forward_context.capture_wan_hybrid_evidence:
+                        block_kwargs["wan_evidence_layer_index"] = block_index
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states,
