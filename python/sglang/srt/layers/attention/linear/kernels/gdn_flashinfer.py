@@ -707,6 +707,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 device=q.device,
             )
             self._cake_gdn_prefill_outputs[key] = output
+        if output.shape[0] == total_tokens:
+            return output
         return output[:total_tokens]
 
     def _cake_prefill_workspace(
