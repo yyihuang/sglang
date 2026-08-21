@@ -1395,7 +1395,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         self.wan_hybrid_layer_indices is None
                         or block_index in self.wan_hybrid_layer_indices
                     )
-                    if forward_context.capture_wan_hybrid_evidence:
+                    if forward_context.wan_hybrid_evidence_collector is not None:
                         block_kwargs["wan_evidence_layer_index"] = block_index
                 hidden_states = block(
                     hidden_states,

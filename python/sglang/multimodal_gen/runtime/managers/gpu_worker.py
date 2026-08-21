@@ -50,9 +50,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
-    read_wan_hybrid_coverage,
-    read_wan_hybrid_hit_count,
-    reset_wan_hybrid_hit_count,
+    WanHybridEvidenceCollector,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
@@ -501,27 +499,45 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
             for item in log_reqs:
                 item.log(server_args=self.server_args)
+            collectors_by_request_id: dict[str, WanHybridEvidenceCollector] = {}
+            for item in log_reqs:
+                request_id = item.request_id
+                if not isinstance(request_id, str) or not request_id:
+                    raise RuntimeError(
+                        "Wan hybrid evidence requires a nonempty request_id"
+                    )
+                if request_id in collectors_by_request_id:
+                    raise RuntimeError(
+                        "Wan hybrid evidence cannot attribute duplicate request_id "
+                        f"{request_id!r}"
+                    )
+                collector = WanHybridEvidenceCollector(request_id=request_id)
+                item._wan_hybrid_evidence_collector = collector
+                collectors_by_request_id[request_id] = collector
             with ExitStack() as stack:
                 for item in log_reqs:
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
                 try:
-                    reset_wan_hybrid_hit_count()
                     result = forward_fn()
                 except Exception:
                     forward_failed = True
                     raise
 
-            wan_hybrid_hit_count = read_wan_hybrid_hit_count()
-            wan_hybrid_coverage = read_wan_hybrid_coverage()
-
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
             if return_req and isinstance(result, Req):
                 if result.metrics is not None:
-                    result.metrics.wan_hybrid_hit_count = wan_hybrid_hit_count
-                    result.metrics.wan_hybrid_coverage = wan_hybrid_coverage
+                    result_request_id = result.metrics.request_id
+                    collector = collectors_by_request_id.get(result_request_id)
+                    if collector is None:
+                        raise RuntimeError(
+                            "Wan hybrid evidence could not map returned request_id "
+                            f"{result_request_id!r}"
+                        )
+                    result.metrics.wan_hybrid_hit_count = collector.hit_count()
+                    result.metrics.wan_hybrid_coverage = collector.coverage()
                 return result
 
             output_batch = self._to_output_batch(result)
@@ -535,8 +551,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             duration_ms = (time.monotonic() - start_time) * 1000
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
-                metrics.wan_hybrid_hit_count = wan_hybrid_hit_count
-                metrics.wan_hybrid_coverage = wan_hybrid_coverage
+                collector = collectors_by_request_id.get(metrics.request_id)
+                if collector is None:
+                    raise RuntimeError(
+                        "Wan hybrid evidence could not map output request_id "
+                        f"{metrics.request_id!r}"
+                    )
+                metrics.wan_hybrid_hit_count = collector.hit_count()
+                metrics.wan_hybrid_coverage = collector.coverage()
 
             self._materialize_output_transport(output_batch, req, save_output_paths)
             self._record_output_peak_memory(output_batch)

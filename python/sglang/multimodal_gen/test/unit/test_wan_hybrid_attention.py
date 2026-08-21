@@ -7,10 +7,10 @@ from unittest.mock import Mock, patch
 import torch
 from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
     WanHybridAttentionBackend,
+    WanHybridEvidenceCollector,
     WanHybridAttentionImpl,
     _SHARED_SCRATCH,
     _record_successful_wan_hybrid_forward,
-    read_wan_hybrid_coverage,
     read_wan_hybrid_hit_count,
     record_wan_attention_route,
     reset_wan_hybrid_hit_count,
@@ -64,13 +64,14 @@ class TestWanHybridAttentionBackend(unittest.TestCase):
 
     def test_request_coverage_uses_real_context_and_route_events(self):
         result = torch.ones(1)
+        collector = WanHybridEvidenceCollector(request_id="request-a")
         with set_forward_context(
             current_timestep=0,
             attn_metadata=None,
             wan_component_name="transformer",
             wan_actual_timestep=999,
             wan_cfg_branch_index=0,
-            capture_wan_hybrid_evidence=True,
+            wan_hybrid_evidence_collector=collector,
         ):
             for layer_index in range(2):
                 record_wan_attention_route(
@@ -87,7 +88,7 @@ class TestWanHybridAttentionBackend(unittest.TestCase):
             wan_component_name="transformer_2",
             wan_actual_timestep=100,
             wan_cfg_branch_index=0,
-            capture_wan_hybrid_evidence=True,
+            wan_hybrid_evidence_collector=collector,
         ):
             for layer_index in range(2):
                 record_wan_attention_route(
@@ -96,19 +97,70 @@ class TestWanHybridAttentionBackend(unittest.TestCase):
                     eligible_for_hybrid=False,
                 )
 
-        coverage = read_wan_hybrid_coverage()
+        coverage = collector.coverage()
 
+        self.assertEqual(coverage["schema_version"], 2)
+        self.assertEqual(coverage["request_id"], "request-a")
         self.assertEqual(coverage["expected_hit_count"], 2)
         self.assertEqual(coverage["actual_hit_count"], 2)
         self.assertEqual(coverage["unattributed_actual_hit_count"], 0)
         self.assertEqual(
-            coverage["steps"][0]["branches"][0]["hybrid_layer_indices"],
+            coverage["steps"][0]["branches"][0][
+                "planned_hybrid_layer_indices"
+            ],
             [0, 1],
         )
         self.assertEqual(
             coverage["steps"][1]["branches"][0]["control_layer_indices"],
             [0, 1],
         )
+
+    def test_interleaved_collectors_are_isolated_and_misses_are_real(self):
+        result = torch.ones(1)
+        first = WanHybridEvidenceCollector(request_id="request-a")
+        second = WanHybridEvidenceCollector(request_id="request-b")
+        with set_forward_context(
+            current_timestep=0,
+            attn_metadata=None,
+            wan_component_name="transformer",
+            wan_actual_timestep=999,
+            wan_cfg_branch_index=0,
+            wan_hybrid_evidence_collector=first,
+        ):
+            record_wan_attention_route(
+                layer_index=0,
+                hybrid_configured=True,
+                eligible_for_hybrid=True,
+            )
+            with set_forward_context(
+                current_timestep=0,
+                attn_metadata=None,
+                wan_component_name="transformer",
+                wan_actual_timestep=999,
+                wan_cfg_branch_index=0,
+                wan_hybrid_evidence_collector=second,
+            ):
+                record_wan_attention_route(
+                    layer_index=0,
+                    hybrid_configured=True,
+                    eligible_for_hybrid=True,
+                )
+                record_wan_attention_route(
+                    layer_index=1,
+                    hybrid_configured=True,
+                    eligible_for_hybrid=False,
+                )
+            _record_successful_wan_hybrid_forward(result, layer_index=0)
+
+        first_coverage = first.coverage()
+        second_coverage = second.coverage()
+        self.assertEqual(first_coverage["actual_hit_count"], 1)
+        self.assertEqual(first_coverage["eligible_hybrid_miss_count"], 0)
+        self.assertEqual(second_coverage["actual_hit_count"], 0)
+        self.assertEqual(second_coverage["eligible_hybrid_miss_count"], 1)
+        second_branch = second_coverage["steps"][0]["branches"][0]
+        self.assertEqual(second_branch["eligible_hybrid_miss_layer_indices"], [0])
+        self.assertEqual(second_branch["configured_fallback_layer_indices"], [1])
 
     def test_constructor_rejects_unsupported_contracts(self):
         cases = (

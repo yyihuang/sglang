@@ -450,8 +450,10 @@ def _validate_wan_hybrid_coverage(
     if not isinstance(coverage, dict):
         return [f"{location}: missing coverage object"]
     errors = []
-    if coverage.get("schema_version") != 1:
+    if coverage.get("schema_version") != 2:
         errors.append(f"{location}: unsupported coverage schema")
+    if not isinstance(coverage.get("request_id"), str) or not coverage["request_id"]:
+        errors.append(f"{location}: request identity is missing")
     steps = coverage.get("steps")
     if not isinstance(steps, list) or len(steps) != expected_num_steps:
         return errors + [f"{location}: denoising-step coverage is incomplete"]
@@ -518,10 +520,13 @@ def _validate_wan_hybrid_coverage(
                 expected_control = expected_layers
             if (
                 branch.get("eligible_layer_indices") != expected_eligible
-                or branch.get("hybrid_layer_indices") != expected_eligible
+                or branch.get("planned_hybrid_layer_indices") != expected_eligible
                 or branch.get("successful_hybrid_layer_indices")
                 != expected_eligible
-                or branch.get("fallback_layer_indices") != expected_fallback
+                or branch.get("eligible_hybrid_miss_layer_indices") != []
+                or branch.get("unexpected_successful_hybrid_layer_indices") != []
+                or branch.get("configured_fallback_layer_indices")
+                != expected_fallback
                 or branch.get("control_layer_indices") != expected_control
             ):
                 errors.append(
@@ -547,7 +552,7 @@ def _validate_wan_hybrid_coverage(
         or coverage.get("actual_hit_count") != actual_hit_count
         or coverage.get("attributed_actual_hit_count") != actual_hit_count
         or coverage.get("unattributed_actual_hit_count") != 0
-        or coverage.get("eligible_self_fallback_count") != 0
+        or coverage.get("eligible_hybrid_miss_count") != 0
         or coverage.get("num_route_events") != route_event_count
         or coverage.get("num_success_events") != actual_hit_count
     ):

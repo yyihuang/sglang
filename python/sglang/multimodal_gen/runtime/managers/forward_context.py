@@ -5,8 +5,9 @@
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Any, Optional, Type
 
 import torch
 
@@ -41,7 +42,7 @@ class ForwardContext:
     wan_component_name: str | None = None
     wan_actual_timestep: int | None = None
     wan_cfg_branch_index: int | None = None
-    capture_wan_hybrid_evidence: bool = False
+    wan_hybrid_evidence_collector: Any | None = None
 
     def set_attn_backend_cls(self, attention_backend_cls: Type):
         if self.attention_backend_cls:
@@ -54,15 +55,23 @@ class ForwardContext:
 
 
 _forward_context: Optional["ForwardContext"] = None
+_forward_context_var: ContextVar[Optional["ForwardContext"]] = ContextVar(
+    "sglang_multimodal_forward_context", default=None
+)
 
 
 def get_forward_context() -> "ForwardContext":
     """Get the current forward context."""
-    assert _forward_context is not None, (
+    context = _forward_context_var.get()
+    if context is None:
+        # Some component-accuracy fixtures install an explicit process-local
+        # context. Serving paths always use the request-scoped ContextVar.
+        context = _forward_context
+    assert context is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
     )
-    return _forward_context
+    return context
 
 
 # TODO(will): finalize the interface
@@ -75,7 +84,7 @@ def set_forward_context(
     wan_component_name: str | None = None,
     wan_actual_timestep: int | None = None,
     wan_cfg_branch_index: int | None = None,
-    capture_wan_hybrid_evidence: bool = False,
+    wan_hybrid_evidence_collector: Any | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -85,16 +94,16 @@ def set_forward_context(
     need_to_track_batchsize = track_batchsize and attn_metadata is not None
     if need_to_track_batchsize:
         forward_start_time = time.perf_counter()
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = ForwardContext(
-        current_timestep=current_timestep,
-        attn_metadata=attn_metadata,
-        forward_batch=forward_batch,
-        wan_component_name=wan_component_name,
-        wan_actual_timestep=wan_actual_timestep,
-        wan_cfg_branch_index=wan_cfg_branch_index,
-        capture_wan_hybrid_evidence=capture_wan_hybrid_evidence,
+    token = _forward_context_var.set(
+        ForwardContext(
+            current_timestep=current_timestep,
+            attn_metadata=attn_metadata,
+            forward_batch=forward_batch,
+            wan_component_name=wan_component_name,
+            wan_actual_timestep=wan_actual_timestep,
+            wan_cfg_branch_index=wan_cfg_branch_index,
+            wan_hybrid_evidence_collector=wan_hybrid_evidence_collector,
+        )
     )
 
     try:
@@ -132,4 +141,4 @@ def set_forward_context(
                         ),
                         forward_stats,
                     )
-        _forward_context = prev_context
+        _forward_context_var.reset(token)

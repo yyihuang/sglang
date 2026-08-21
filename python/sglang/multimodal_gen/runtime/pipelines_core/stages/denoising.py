@@ -93,6 +93,9 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    WanHybridEvidenceCollector,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -1874,8 +1877,34 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        with self._offload_for_torch_compile_warmup(batch):
-            return self._denoise(batch, server_args)
+        collector = None
+        if self._wan_hybrid_evidence_enabled:
+            collector = getattr(batch, "_wan_hybrid_evidence_collector", None)
+            if collector is None:
+                collector = WanHybridEvidenceCollector(request_id=batch.request_id)
+                batch._wan_hybrid_evidence_collector = collector
+            if collector.request_id != batch.request_id:
+                raise RuntimeError(
+                    "Wan hybrid evidence collector request_id does not match batch"
+                )
+            if (
+                collector.route_events
+                or collector.success_events
+                or collector.raw_success_count
+            ):
+                raise RuntimeError("Wan hybrid evidence collector was reused")
+        try:
+            with self._offload_for_torch_compile_warmup(batch):
+                result = self._denoise(batch, server_args)
+        finally:
+            if collector is not None and hasattr(
+                batch, "_wan_hybrid_evidence_collector"
+            ):
+                del batch._wan_hybrid_evidence_collector
+        if collector is not None and result.metrics is not None:
+            result.metrics.wan_hybrid_hit_count = collector.hit_count()
+            result.metrics.wan_hybrid_coverage = collector.coverage()
+        return result
 
     @torch.no_grad()
     def _denoise(
@@ -2073,8 +2102,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 wan_component_name=wan_component_name,
                 wan_actual_timestep=wan_actual_timestep,
                 wan_cfg_branch_index=branch_indices[id(branch)],
-                capture_wan_hybrid_evidence=getattr(
-                    self, "_wan_hybrid_evidence_enabled", False
+                wan_hybrid_evidence_collector=getattr(
+                    batch, "_wan_hybrid_evidence_collector", None
                 ),
             ):
                 raw = self._predict_noise(

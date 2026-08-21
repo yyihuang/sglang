@@ -3,7 +3,8 @@
 import threading
 import weakref
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -25,26 +26,55 @@ _SHARED_SCRATCH_LOCK = threading.Lock()
 _SHARED_SCRATCH: weakref.WeakValueDictionary[tuple, _WanHybridSharedScratch] = (
     weakref.WeakValueDictionary()
 )
-_HIT_COUNT_LOCK = threading.Lock()
-_SUCCESSFUL_FORWARD_HIT_COUNT = 0
-_ROUTE_EVENTS: list[dict[str, Any]] = []
-_SUCCESS_EVENTS: list[dict[str, Any]] = []
+
+
+@dataclass
+class WanHybridEvidenceCollector:
+    """Evidence owned by exactly one Wan serving request."""
+
+    request_id: str | None = None
+    route_events: list[dict[str, Any]] = field(default_factory=list)
+    success_events: list[dict[str, Any]] = field(default_factory=list)
+    raw_success_count: int = 0
+
+    def record_route(self, event: dict[str, Any]) -> None:
+        self.route_events.append(dict(event))
+
+    def record_success(self, event: dict[str, Any] | None) -> None:
+        self.raw_success_count += 1
+        if event is not None:
+            self.success_events.append(dict(event))
+
+    def hit_count(self) -> int:
+        return self.raw_success_count
+
+    def coverage(self) -> dict[str, Any]:
+        return _build_wan_hybrid_coverage(
+            self.route_events,
+            self.success_events,
+            self.raw_success_count,
+            request_id=self.request_id,
+        )
+
+
+_STANDALONE_EVIDENCE: ContextVar[WanHybridEvidenceCollector] = ContextVar(
+    "wan_hybrid_standalone_evidence", default=WanHybridEvidenceCollector()
+)
 
 
 def reset_wan_hybrid_hit_count() -> None:
-    global _SUCCESSFUL_FORWARD_HIT_COUNT
-    with _HIT_COUNT_LOCK:
-        _SUCCESSFUL_FORWARD_HIT_COUNT = 0
-        _ROUTE_EVENTS.clear()
-        _SUCCESS_EVENTS.clear()
+    """Reset context-local standalone evidence used outside serving requests."""
+
+    _STANDALONE_EVIDENCE.set(WanHybridEvidenceCollector())
 
 
 def read_wan_hybrid_hit_count() -> int:
-    with _HIT_COUNT_LOCK:
-        return _SUCCESSFUL_FORWARD_HIT_COUNT
+    return _STANDALONE_EVIDENCE.get().hit_count()
 
 
-def _current_evidence_coordinates(layer_index: int) -> dict[str, Any] | None:
+def _current_evidence_coordinates(
+    layer_index: int,
+) -> tuple[WanHybridEvidenceCollector, dict[str, Any]] | None:
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         get_forward_context,
     )
@@ -53,7 +83,8 @@ def _current_evidence_coordinates(layer_index: int) -> dict[str, Any] | None:
         context = get_forward_context()
     except AssertionError:
         return None
-    if not context.capture_wan_hybrid_evidence:
+    collector = context.wan_hybrid_evidence_collector
+    if collector is None:
         return None
     coordinates = {
         "step_index": context.current_timestep,
@@ -67,7 +98,7 @@ def _current_evidence_coordinates(layer_index: int) -> dict[str, Any] | None:
         raise RuntimeError(
             "Wan hybrid evidence context is incomplete: " + ", ".join(missing)
         )
-    return coordinates
+    return collector, coordinates
 
 
 def record_wan_attention_route(
@@ -78,45 +109,72 @@ def record_wan_attention_route(
 ) -> None:
     """Record the actual self-attention route before a Wan block executes it."""
 
-    coordinates = _current_evidence_coordinates(layer_index)
-    if coordinates is None:
+    evidence = _current_evidence_coordinates(layer_index)
+    if evidence is None:
         return
+    collector, coordinates = evidence
     if eligible_for_hybrid and not hybrid_configured:
         raise RuntimeError("Wan hybrid evidence marked an FA-only layer as eligible")
     event = coordinates | {
         "hybrid_configured": hybrid_configured,
         "eligible_for_hybrid": eligible_for_hybrid,
-        "selected_backend": "wan_hybrid" if eligible_for_hybrid else "fa",
-        "fallback": hybrid_configured and not eligible_for_hybrid,
+        "planned_backend": "wan_hybrid" if eligible_for_hybrid else "fa",
+        "configured_fallback": hybrid_configured and not eligible_for_hybrid,
         "control": not hybrid_configured,
     }
-    with _HIT_COUNT_LOCK:
-        _ROUTE_EVENTS.append(event)
+    collector.record_route(event)
 
 
 def _record_successful_wan_hybrid_forward(
     result: torch.Tensor, *, layer_index: int | None
 ) -> torch.Tensor:
-    global _SUCCESSFUL_FORWARD_HIT_COUNT
-    coordinates = (
+    if layer_index is None:
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        try:
+            context = get_forward_context()
+        except AssertionError:
+            context = None
+        if (
+            context is not None
+            and context.wan_hybrid_evidence_collector is not None
+        ):
+            raise RuntimeError(
+                "Wan hybrid evidence cannot attribute a successful call without "
+                "a layer index"
+            )
+    evidence = (
         _current_evidence_coordinates(layer_index)
         if layer_index is not None
         else None
     )
-    with _HIT_COUNT_LOCK:
-        _SUCCESSFUL_FORWARD_HIT_COUNT += 1
-        if coordinates is not None:
-            _SUCCESS_EVENTS.append(coordinates)
+    if evidence is None:
+        _STANDALONE_EVIDENCE.get().record_success(None)
+    else:
+        collector, coordinates = evidence
+        collector.record_success(coordinates)
     return result
 
 
 def read_wan_hybrid_coverage() -> dict[str, Any]:
-    """Return request-local route and successful-hit evidence grouped by real calls."""
+    """Return context-local standalone evidence outside serving requests."""
 
-    with _HIT_COUNT_LOCK:
-        routes = [dict(event) for event in _ROUTE_EVENTS]
-        successes = [dict(event) for event in _SUCCESS_EVENTS]
-        actual_hit_count = _SUCCESSFUL_FORWARD_HIT_COUNT
+    return _STANDALONE_EVIDENCE.get().coverage()
+
+
+def _build_wan_hybrid_coverage(
+    route_events: list[dict[str, Any]],
+    success_events: list[dict[str, Any]],
+    actual_hit_count: int,
+    *,
+    request_id: str | None,
+) -> dict[str, Any]:
+    """Group planned routes and independently attributed successful calls."""
+
+    routes = [dict(event) for event in route_events]
+    successes = [dict(event) for event in success_events]
 
     success_counts = Counter(
         (
@@ -143,7 +201,7 @@ def read_wan_hybrid_coverage() -> dict[str, Any]:
     steps = []
     expected_hit_count = 0
     attributed_actual_hit_count = 0
-    eligible_self_fallback_count = 0
+    eligible_hybrid_miss_count = 0
     for (step_index, actual_timestep, component_name), branch_groups in sorted(
         grouped.items()
     ):
@@ -156,15 +214,15 @@ def read_wan_hybrid_coverage() -> dict[str, Any]:
                 for event in branch_routes
                 if event["eligible_for_hybrid"]
             ]
-            hybrid_layers = [
+            planned_hybrid_layers = [
                 event["layer_index"]
                 for event in branch_routes
-                if event["selected_backend"] == "wan_hybrid"
+                if event["planned_backend"] == "wan_hybrid"
             ]
-            fallback_layers = [
+            configured_fallback_layers = [
                 event["layer_index"]
                 for event in branch_routes
-                if event["fallback"]
+                if event["configured_fallback"]
             ]
             control_layers = [
                 event["layer_index"]
@@ -185,24 +243,28 @@ def read_wan_hybrid_coverage() -> dict[str, Any]:
                         )
                     ]
                 )
-            branch_expected = len(hybrid_layers)
+            planned_counts = Counter(planned_hybrid_layers)
+            successful_counts = Counter(successful_layers)
+            eligible_misses = list((planned_counts - successful_counts).elements())
+            unexpected_successes = list(
+                (successful_counts - planned_counts).elements()
+            )
+            branch_expected = len(planned_hybrid_layers)
             branch_actual = len(successful_layers)
             expected_hit_count += branch_expected
             attributed_actual_hit_count += branch_actual
-            eligible_self_fallback_count += sum(
-                event["eligible_for_hybrid"]
-                and event["selected_backend"] != "wan_hybrid"
-                for event in branch_routes
-            )
+            eligible_hybrid_miss_count += len(eligible_misses)
             branches.append(
                 {
                     "cfg_branch_index": branch_index,
                     "num_layers": len(layer_indices),
                     "layer_indices": layer_indices,
                     "eligible_layer_indices": eligible_layers,
-                    "hybrid_layer_indices": hybrid_layers,
+                    "planned_hybrid_layer_indices": planned_hybrid_layers,
                     "successful_hybrid_layer_indices": successful_layers,
-                    "fallback_layer_indices": fallback_layers,
+                    "eligible_hybrid_miss_layer_indices": eligible_misses,
+                    "unexpected_successful_hybrid_layer_indices": unexpected_successes,
+                    "configured_fallback_layer_indices": configured_fallback_layers,
                     "control_layer_indices": control_layers,
                     "expected_hit_count": branch_expected,
                     "actual_hit_count": branch_actual,
@@ -219,13 +281,14 @@ def read_wan_hybrid_coverage() -> dict[str, Any]:
         )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "request_id": request_id,
         "expected_hit_count": expected_hit_count,
         "actual_hit_count": actual_hit_count,
         "attributed_actual_hit_count": attributed_actual_hit_count,
         "unattributed_actual_hit_count": actual_hit_count
         - attributed_actual_hit_count,
-        "eligible_self_fallback_count": eligible_self_fallback_count,
+        "eligible_hybrid_miss_count": eligible_hybrid_miss_count,
         "num_route_events": len(routes),
         "num_success_events": len(successes),
         "steps": steps,
