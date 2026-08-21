@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -14,6 +15,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args.server_args import (
     RING_CAPABLE_ATTENTION_BACKENDS,
 )
@@ -52,6 +57,30 @@ class TestRingAdmission(unittest.TestCase):
             )
 
         self.assertEqual(attention.backend, SDPABackend.get_enum())
+
+    def test_explicit_usp_backend_constructs_and_runs(self):
+        torch.manual_seed(0)
+        attention = USPAttention(
+            num_heads=2,
+            head_size=32,
+            supported_attention_backends={AttentionBackendEnum.TORCH_SDPA},
+            selected_attention_backend=AttentionBackendEnum.TORCH_SDPA,
+            skip_sequence_parallel=True,
+        )
+        q = torch.randn(1, 4, 2, 32)
+        k = torch.randn(1, 4, 2, 32)
+        v = torch.randn(1, 4, 2, 32)
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            actual = attention(q, k, v)
+        expected = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            scale=32**-0.5,
+        ).transpose(1, 2)
+
+        self.assertEqual(attention.backend, AttentionBackendEnum.TORCH_SDPA)
+        torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":
