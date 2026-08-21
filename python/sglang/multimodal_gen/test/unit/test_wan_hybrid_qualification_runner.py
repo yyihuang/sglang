@@ -645,7 +645,7 @@ def test_runtime_revision_is_read_from_module_git_checkout(tmp_path):
 def test_cli_and_readme_require_four_component_order_reports(capsys):
     with pytest.raises(SystemExit):
         _parse_args(["--help"])
-    assert "pass exactly four" in capsys.readouterr().out
+    assert "pass exactly four" in " ".join(capsys.readouterr().out.split())
 
     readme = Path(__file__).resolve().parents[2] / "README.md"
     documentation = readme.read_text(encoding="utf-8")
