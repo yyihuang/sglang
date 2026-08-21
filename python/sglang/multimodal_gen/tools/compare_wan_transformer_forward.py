@@ -290,6 +290,7 @@ def evaluate_transformer_forward_correctness(
     }
     hit_qualification = evaluate_candidate_backend_hit_qualification(
         [trace.wan_hybrid_hit_count for trace in candidate_traces],
+        [len(trace.block_outputs) for trace in candidate_traces],
     )
     qualification = qualification | {
         "passed": qualification["passed"] and hit_qualification["passed"],
@@ -348,6 +349,7 @@ def run_wan_transformer_forward_qualification(
     candidate_forward: Callable[[], Any],
     reset_candidate_hit_count: Callable[[], None],
     read_candidate_hit_count: Callable[[], int],
+    component_name: str,
     run_order: str = "reference-first",
     warmup_runs: int = MIN_QUALIFICATION_WARMUP_RUNS,
     measure_runs: int = MIN_QUALIFICATION_MEASURE_RUNS,
@@ -360,6 +362,8 @@ def run_wan_transformer_forward_qualification(
         warmup_runs=warmup_runs,
         measure_runs=measure_runs,
     )
+    if component_name not in ("transformer", "transformer_2"):
+        raise ValueError("component_name must be transformer or transformer_2")
     variant_calls = {
         "reference": lambda: _run_variant(
             reference_model,
@@ -393,7 +397,11 @@ def run_wan_transformer_forward_qualification(
         "run_order": run_order,
         "warmup_runs": warmup_runs,
         "measure_runs": measure_runs,
+        "component_name": component_name,
         "num_blocks": len(traces["reference"][0].block_outputs),
+        "candidate_per_run_wan_hybrid_expected_hit_count": [
+            len(trace.block_outputs) for trace in traces["candidate"]
+        ],
         "candidate_per_run_wan_hybrid_hit_count": [
             trace.wan_hybrid_hit_count for trace in traces["candidate"]
         ],
@@ -420,13 +428,15 @@ def validate_wan_transformer_forward_report(
         errors.append("warmup run count does not match the protocol")
     if report.get("measure_runs") != expected_measure_runs:
         errors.append("measured run count does not match the protocol")
+    if report.get("component_name") not in ("transformer", "transformer_2"):
+        errors.append("component_name must identify transformer or transformer_2")
     num_blocks = report.get("num_blocks")
     if (
         isinstance(num_blocks, bool)
         or not isinstance(num_blocks, int)
-        or num_blocks <= 0
+        or num_blocks != 40
     ):
-        errors.append("num_blocks must be a positive integer")
+        errors.append("num_blocks must equal the Wan serving depth of 40")
 
     expected_cross_pairs = set(
         itertools.product(
@@ -513,17 +523,18 @@ def validate_wan_transformer_forward_report(
             )
 
     hit_counts = report.get("candidate_per_run_wan_hybrid_hit_count")
+    expected_hit_counts = report.get(
+        "candidate_per_run_wan_hybrid_expected_hit_count"
+    )
     if (
         not isinstance(hit_counts, list)
         or len(hit_counts) != expected_measure_runs
-        or any(
-            isinstance(hit_count, bool)
-            or not isinstance(hit_count, int)
-            or hit_count <= 0
-            for hit_count in hit_counts
-        )
+        or not isinstance(expected_hit_counts, list)
+        or len(expected_hit_counts) != expected_measure_runs
+        or any(hit_count != 40 for hit_count in hit_counts)
+        or any(expected_hit_count != 40 for expected_hit_count in expected_hit_counts)
     ):
-        errors.append("every measured candidate hit count must be positive")
+        errors.append("every measured candidate hit count must equal expected depth 40")
 
     qualification = report.get("qualification")
     if (
@@ -535,7 +546,12 @@ def validate_wan_transformer_forward_report(
         errors.append("correctness qualification is incomplete")
     elif qualification.get("candidate_backend_hits") != {
         "passed": True,
-        "thresholds": {"candidate_hit_count_min_exclusive": 0},
+        "thresholds": {
+            "candidate_hit_count_equals_expected": True,
+            "expected_hit_count_min_exclusive": 0,
+        },
+        "expected_hit_counts": [40] * expected_measure_runs,
+        "actual_hit_counts": [40] * expected_measure_runs,
         "failures": [],
     }:
         errors.append("candidate backend-hit qualification is incomplete")

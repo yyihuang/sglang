@@ -19,10 +19,10 @@ class _AddBlock(nn.Module):
         return hidden_states + self.value
 
 
-class _FakeWanTransformer(nn.Module):
+class _TinyWanTransformer(nn.Module):
     def __init__(self, *, output_offset: float = 0.0, skip_last: bool = False):
         super().__init__()
-        self.blocks = nn.ModuleList([_AddBlock(1.0), _AddBlock(2.0), _AddBlock(3.0)])
+        self.blocks = nn.ModuleList([_AddBlock(0.01) for _ in range(40)])
         self.output_offset = output_offset
         self.skip_last = skip_last
 
@@ -34,8 +34,8 @@ class _FakeWanTransformer(nn.Module):
 
 
 def test_full_transformer_forward_uses_every_pair_and_every_block():
-    reference = _FakeWanTransformer()
-    candidate = _FakeWanTransformer()
+    reference = _TinyWanTransformer()
+    candidate = _TinyWanTransformer()
     hidden_states = torch.tensor([[1.0, 2.0]])
     candidate_hits = {"count": 0}
 
@@ -50,21 +50,24 @@ def test_full_transformer_forward_uses_every_pair_and_every_block():
         candidate_forward=candidate_forward,
         reset_candidate_hit_count=lambda: candidate_hits.update(count=0),
         read_candidate_hit_count=lambda: candidate_hits["count"],
+        component_name="transformer_2",
         run_order="candidate-first",
     )
 
     assert report["qualification"]["passed"] is True
     assert report["qualification"]["failures"] == []
     assert report["run_order"] == "candidate-first"
-    assert report["num_blocks"] == 3
-    assert report["candidate_per_run_wan_hybrid_hit_count"] == [3] * 5
+    assert report["component_name"] == "transformer_2"
+    assert report["num_blocks"] == 40
+    assert report["candidate_per_run_wan_hybrid_hit_count"] == [40] * 5
+    assert report["candidate_per_run_wan_hybrid_expected_hit_count"] == [40] * 5
 
     cross = report["cross_variant_metrics"]
     assert cross["pairing"] == "cross-product"
     assert cross["num_pairs"] == 25
     assert all(
-        comparison["trajectory_metrics"]["num_steps"] == 3
-        and len(comparison["trajectory_metrics"]["per_step_metrics"]) == 3
+        comparison["trajectory_metrics"]["num_steps"] == 40
+        and len(comparison["trajectory_metrics"]["per_step_metrics"]) == 40
         for comparison in cross["comparisons"]
     )
     for variant in ("reference", "candidate"):
@@ -81,17 +84,17 @@ def test_full_transformer_forward_uses_every_pair_and_every_block():
     errors = validate_wan_transformer_forward_report(report)
 
     assert any("run-pair coverage" in error for error in errors)
-    assert "every measured candidate hit count must be positive" in errors
+    assert "every measured candidate hit count must equal expected depth 40" in errors
 
 
 def test_full_transformer_forward_checks_final_output_quality():
-    reference = _FakeWanTransformer()
-    candidate = _FakeWanTransformer(output_offset=2.0)
+    reference = _TinyWanTransformer()
+    candidate = _TinyWanTransformer(output_offset=2.0)
     hidden_states = torch.tensor([[1.0, 2.0]])
     candidate_hits = {"count": 0}
 
     def candidate_forward():
-        candidate_hits["count"] += 1
+        candidate_hits["count"] += len(candidate.blocks)
         return candidate(hidden_states)
 
     report = run_wan_transformer_forward_qualification(
@@ -101,6 +104,7 @@ def test_full_transformer_forward_checks_final_output_quality():
         candidate_forward=candidate_forward,
         reset_candidate_hit_count=lambda: candidate_hits.update(count=0),
         read_candidate_hit_count=lambda: candidate_hits["count"],
+        component_name="transformer",
     )
 
     assert report["qualification"]["passed"] is False
@@ -112,14 +116,14 @@ def test_full_transformer_forward_checks_final_output_quality():
 
 
 def test_capture_fails_when_forward_skips_a_transformer_block():
-    model = _FakeWanTransformer(skip_last=True)
+    model = _TinyWanTransformer(skip_last=True)
 
     try:
         capture_wan_transformer_forward(
             model, lambda: model(torch.tensor([[1.0, 2.0]]))
         )
     except RuntimeError as error:
-        assert "captured 2 of 3" in str(error)
+        assert "captured 39 of 40" in str(error)
     else:
         raise AssertionError("missing full-block coverage did not fail closed")
 

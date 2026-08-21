@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MODEL_QUALIFICATION_THRESHOLDS,
     _cosine_similarity,
+    _extract_wan_hybrid_coverage,
     _extract_wan_hybrid_hit_count,
     _extract_generation_time_s,
     _with_candidate_backend_hit_qualification,
@@ -21,6 +22,7 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     evaluate_dual_order_performance_qualification,
     evaluate_performance_qualification,
     summarize_cross_variant_metrics,
+    summarize_result_output,
     summarize_run_repeatability,
     validate_qualification_protocol,
 )
@@ -168,6 +170,32 @@ def test_request_metrics_transports_wan_hybrid_hit_count():
     assert metrics.to_dict()["wan_hybrid_hit_count"] == 0
     metrics.wan_hybrid_hit_count = 11
     assert metrics.to_dict()["wan_hybrid_hit_count"] == 11
+    metrics.wan_hybrid_coverage = {"expected_hit_count": 11}
+    assert metrics.to_dict()["wan_hybrid_coverage"] == {"expected_hit_count": 11}
+
+
+def test_extract_wan_hybrid_coverage_requires_object_metric():
+    coverage = {"schema_version": 1, "expected_hit_count": 2}
+    result = SimpleNamespace(metrics={"wan_hybrid_coverage": coverage})
+
+    assert _extract_wan_hybrid_coverage(result) == coverage
+    assert _extract_wan_hybrid_coverage(SimpleNamespace(metrics={})) is None
+
+
+def test_output_summary_hashes_materialized_frame_bytes():
+    result = SimpleNamespace(
+        frames=[np.arange(12, dtype=np.uint8).reshape(2, 2, 3)],
+        samples=None,
+        output_file_path=None,
+    )
+
+    summary = summarize_result_output(result)
+
+    assert len(summary["sha256"]) == 64
+    assert summary["num_frames"] == 1
+    assert summary["frame_shapes"] == [[2, 2, 3]]
+    assert summary["frame_dtypes"] == ["uint8"]
+    assert summary["finite"] is True
 
 
 def _generation_result(latent_offset=0.0, frame_offset=0):
@@ -354,7 +382,10 @@ def _performance_order_result(
     return {
         "reference_generation": dict(generation),
         "candidate_generation": generation
-        | {"per_run_wan_hybrid_hit_count": hit_counts},
+        | {
+            "per_run_wan_hybrid_hit_count": hit_counts,
+            "per_run_wan_hybrid_expected_hit_count": [1] * measure_runs,
+        },
         "performance": {"wall_median_speedup": speedup},
     }
 
@@ -423,7 +454,9 @@ def test_dual_order_performance_qualification_fails_closed():
     assert reasons == {
         "wall_median_speedup_below_minimum",
         "candidate_hit_count_cardinality_mismatch",
+        "candidate_expected_hit_count_cardinality_mismatch",
         "candidate_hit_count_not_positive",
+        "candidate_hit_count_mismatch",
         "missing_run_order_result",
     }
 
@@ -439,15 +472,26 @@ def test_dual_order_performance_qualification_fails_closed():
         (None, False),
     ],
 )
-def test_candidate_backend_hit_qualification_requires_every_run(hit_counts, passed):
-    qualification = evaluate_candidate_backend_hit_qualification(hit_counts)
+def test_candidate_backend_hit_qualification_requires_exact_expected_hits(
+    hit_counts, passed
+):
+    expected_hit_counts = (
+        list(hit_counts)
+        if isinstance(hit_counts, list) and all(hit_count for hit_count in hit_counts)
+        else [1] * len(hit_counts)
+        if isinstance(hit_counts, list)
+        else None
+    )
+    qualification = evaluate_candidate_backend_hit_qualification(
+        hit_counts, expected_hit_counts
+    )
 
     assert qualification["passed"] is passed
 
 
 def test_candidate_backend_hit_failure_is_part_of_overall_qualification():
     qualification = _with_candidate_backend_hit_qualification(
-        {"passed": True, "failures": [], "thresholds": {}}, [0]
+        {"passed": True, "failures": [], "thresholds": {}}, [0], [1]
     )
 
     assert qualification["passed"] is False
@@ -457,7 +501,14 @@ def test_candidate_backend_hit_failure_is_part_of_overall_qualification():
             "reason": "candidate_hit_count_not_positive",
             "run_index": 0,
             "hit_count": 0,
-        }
+        },
+        {
+            "scope": "candidate_backend_hits",
+            "reason": "candidate_hit_count_mismatch",
+            "run_index": 0,
+            "expected_hit_count": 1,
+            "actual_hit_count": 0,
+        },
     ]
 
 

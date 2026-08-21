@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
+import importlib.metadata
 import itertools
 import json
 import math
@@ -641,6 +643,11 @@ def evaluate_dual_order_performance_qualification(
             if isinstance(candidate_generation, dict)
             else None
         )
+        expected_hit_counts = (
+            candidate_generation.get("per_run_wan_hybrid_expected_hit_count")
+            if isinstance(candidate_generation, dict)
+            else None
+        )
         measure_runs = (
             candidate_generation.get("measure_runs")
             if isinstance(candidate_generation, dict)
@@ -656,7 +663,9 @@ def evaluate_dual_order_performance_qualification(
                     "actual": len(hit_counts) if isinstance(hit_counts, list) else None,
                 }
             )
-        hit_qualification = evaluate_candidate_backend_hit_qualification(hit_counts)
+        hit_qualification = evaluate_candidate_backend_hit_qualification(
+            hit_counts, expected_hit_counts
+        )
         failures.extend(
             {"run_order": run_order, "scope": "candidate_backend_hits"} | failure
             for failure in hit_qualification["failures"]
@@ -669,7 +678,8 @@ def evaluate_dual_order_performance_qualification(
             "warmup_runs_min": MIN_QUALIFICATION_WARMUP_RUNS,
             "measure_runs_min": MIN_QUALIFICATION_MEASURE_RUNS,
             "speedup_min": MODEL_QUALIFICATION_THRESHOLDS["speedup_min"],
-            "candidate_hit_count_min_exclusive": 0,
+            "candidate_hit_count_equals_expected": True,
+            "expected_hit_count_min_exclusive": 0,
         },
         "failures": failures,
     }
@@ -677,12 +687,35 @@ def evaluate_dual_order_performance_qualification(
 
 def evaluate_candidate_backend_hit_qualification(
     per_run_hit_counts: Any,
+    per_run_expected_hit_counts: Any,
 ) -> dict[str, Any]:
     failures: list[dict[str, Any]] = []
     if not isinstance(per_run_hit_counts, list) or not per_run_hit_counts:
         failures.append({"reason": "missing_candidate_hit_counts"})
-    else:
+    if (
+        not isinstance(per_run_expected_hit_counts, list)
+        or not per_run_expected_hit_counts
+    ):
+        failures.append({"reason": "missing_candidate_expected_hit_counts"})
+    elif isinstance(per_run_hit_counts, list) and len(
+        per_run_expected_hit_counts
+    ) != len(per_run_hit_counts):
+        failures.append(
+            {
+                "reason": "candidate_expected_hit_count_cardinality_mismatch",
+                "expected": len(per_run_hit_counts),
+                "actual": len(per_run_expected_hit_counts),
+            }
+        )
+    if isinstance(per_run_hit_counts, list) and isinstance(
+        per_run_expected_hit_counts, list
+    ):
         for run_index, hit_count in enumerate(per_run_hit_counts):
+            expected_hit_count = (
+                per_run_expected_hit_counts[run_index]
+                if run_index < len(per_run_expected_hit_counts)
+                else None
+            )
             if (
                 isinstance(hit_count, bool)
                 or not isinstance(hit_count, int)
@@ -695,9 +728,35 @@ def evaluate_candidate_backend_hit_qualification(
                         "hit_count": hit_count,
                     }
                 )
+            if (
+                isinstance(expected_hit_count, bool)
+                or not isinstance(expected_hit_count, int)
+                or expected_hit_count <= 0
+            ):
+                failures.append(
+                    {
+                        "reason": "candidate_expected_hit_count_not_positive",
+                        "run_index": run_index,
+                        "expected_hit_count": expected_hit_count,
+                    }
+                )
+            elif hit_count != expected_hit_count:
+                failures.append(
+                    {
+                        "reason": "candidate_hit_count_mismatch",
+                        "run_index": run_index,
+                        "expected_hit_count": expected_hit_count,
+                        "actual_hit_count": hit_count,
+                    }
+                )
     return {
         "passed": not failures,
-        "thresholds": {"candidate_hit_count_min_exclusive": 0},
+        "thresholds": {
+            "candidate_hit_count_equals_expected": True,
+            "expected_hit_count_min_exclusive": 0,
+        },
+        "expected_hit_counts": per_run_expected_hit_counts,
+        "actual_hit_counts": per_run_hit_counts,
         "failures": failures,
     }
 
@@ -705,9 +764,10 @@ def evaluate_candidate_backend_hit_qualification(
 def _with_candidate_backend_hit_qualification(
     qualification: dict[str, Any],
     per_run_hit_counts: Any,
+    per_run_expected_hit_counts: Any,
 ) -> dict[str, Any]:
     hit_qualification = evaluate_candidate_backend_hit_qualification(
-        per_run_hit_counts
+        per_run_hit_counts, per_run_expected_hit_counts
     )
     hit_failures = [
         {"scope": "candidate_backend_hits"} | failure
@@ -767,6 +827,139 @@ def extract_result_frames(result: Any) -> list[np.ndarray]:
     if array.dtype != np.uint8:
         array = (np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8)
     return [frame for frame in array]
+
+
+def summarize_result_output(result: Any) -> dict[str, Any]:
+    """Describe and hash the caller-visible materialized output."""
+
+    frames = extract_result_frames(result)
+    digest = hashlib.sha256()
+    shapes = []
+    dtypes = []
+    finite = True
+    for frame in frames:
+        array = np.ascontiguousarray(frame)
+        shape = list(array.shape)
+        dtype = str(array.dtype)
+        digest.update(
+            json.dumps(
+                {"dtype": dtype, "shape": shape},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(array.tobytes())
+        shapes.append(shape)
+        dtypes.append(dtype)
+        finite = finite and bool(np.isfinite(array).all())
+    return {
+        "sha256": digest.hexdigest(),
+        "num_frames": len(frames),
+        "frame_shapes": shapes,
+        "frame_dtypes": dtypes,
+        "finite": finite,
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_qualification_provenance(
+    args: argparse.Namespace,
+    *,
+    reference_server_kwargs: dict[str, Any],
+    candidate_server_kwargs: dict[str, Any],
+    sampling_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Build stable input, model-config, runtime, and backend provenance."""
+
+    from sglang.multimodal_gen.runtime.utils.perf_logger import get_git_commit_hash
+
+    model_root = Path(args.model_path).expanduser().resolve()
+    model_configs = []
+    for relative_path in (
+        "model_index.json",
+        "config.json",
+        "transformer/config.json",
+        "transformer_2/config.json",
+    ):
+        path = model_root / relative_path
+        if path.is_file():
+            model_configs.append(
+                {"path": relative_path, "sha256": _sha256_file(path)}
+            )
+
+    fixed_input = {
+        "model_path": str(model_root),
+        "model_id": args.model_id,
+        "prompt": args.prompt,
+        "seed": args.seed,
+        "sampling_kwargs": sampling_kwargs,
+    }
+    input_sha256 = hashlib.sha256(
+        json.dumps(
+            fixed_input, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+    ).hexdigest()
+
+    try:
+        flashinfer_version = importlib.metadata.version("flashinfer-python")
+    except importlib.metadata.PackageNotFoundError:
+        flashinfer_version = None
+    try:
+        import flashinfer
+
+        flashinfer_public_api = {
+            "WanHybridAttentionWorkspace": hasattr(
+                flashinfer, "WanHybridAttentionWorkspace"
+            ),
+            "is_wan_hybrid_attention_available": hasattr(
+                flashinfer, "is_wan_hybrid_attention_available"
+            ),
+            "wan_hybrid_attention": hasattr(flashinfer, "wan_hybrid_attention"),
+        }
+    except ImportError:
+        flashinfer_public_api = {
+            "WanHybridAttentionWorkspace": False,
+            "is_wan_hybrid_attention_available": False,
+            "wan_hybrid_attention": False,
+        }
+
+    gpu = None
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device)
+        gpu = {
+            "name": properties.name,
+            "compute_capability": list(torch.cuda.get_device_capability(device)),
+            "total_memory_bytes": properties.total_memory,
+            "torch_cuda_version": torch.version.cuda,
+        }
+
+    return {
+        "input_sha256": input_sha256,
+        "fixed_input": fixed_input,
+        "model": {
+            "resolved_path": str(model_root),
+            "model_id": args.model_id,
+            "config_files": model_configs,
+        },
+        "runtime": {
+            "sglang_revision": get_git_commit_hash(),
+            "flashinfer_version": flashinfer_version,
+            "flashinfer_public_api": flashinfer_public_api,
+            "gpu": gpu,
+        },
+        "normalized_backend_request": {
+            "reference": reference_server_kwargs,
+            "candidate": candidate_server_kwargs,
+        },
+    }
 
 
 def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, Any]:
@@ -909,6 +1102,16 @@ def _extract_wan_hybrid_hit_count(result: Any) -> int | None:
     return hit_count
 
 
+def _extract_wan_hybrid_coverage(result: Any) -> dict[str, Any] | None:
+    metrics = getattr(result, "metrics", None)
+    if not isinstance(metrics, dict):
+        return None
+    coverage = metrics.get("wan_hybrid_coverage")
+    if not isinstance(coverage, dict):
+        return None
+    return coverage
+
+
 def _extract_generation_time_s(result: Any) -> float:
     """Return a populated end-to-end generation duration.
 
@@ -992,10 +1195,20 @@ def run_variant(
     wan_hybrid_hit_counts = [
         _extract_wan_hybrid_hit_count(result) for result in measured_results
     ]
+    wan_hybrid_coverages = [
+        _extract_wan_hybrid_coverage(result) for result in measured_results
+    ]
+    wan_hybrid_expected_hit_counts = [
+        coverage.get("expected_hit_count") if coverage is not None else None
+        for coverage in wan_hybrid_coverages
+    ]
     valid_wan_hybrid_hit_counts = [
         hit_count
         for hit_count in wan_hybrid_hit_counts
         if hit_count is not None
+    ]
+    output_summaries = [
+        summarize_result_output(result) for result in measured_results
     ]
 
     return {
@@ -1008,6 +1221,7 @@ def run_variant(
         "avg_generation_time_s": sum(generation_times) / len(generation_times),
         "median_generation_time_s": statistics.median(generation_times),
         "per_run_generation_time_s": generation_times,
+        "timer_scope": "complete DiffGenerator.generate call including output materialization",
         "peak_memory_mb": peak_memories[-1],
         "max_peak_memory_mb": max(peak_memories) if peak_memories else 0.0,
         "per_run_peak_memory_mb": peak_memories,
@@ -1027,6 +1241,9 @@ def run_variant(
             else None
         ),
         "per_run_wan_hybrid_hit_count": wan_hybrid_hit_counts,
+        "per_run_wan_hybrid_expected_hit_count": wan_hybrid_expected_hit_counts,
+        "per_run_wan_hybrid_coverage": wan_hybrid_coverages,
+        "per_run_output_summaries": output_summaries,
     }
 
 
@@ -1281,6 +1498,7 @@ def main() -> None:
 
     result = {
         "model_path": args.model_path,
+        "model_id": args.model_id,
         "prompt": args.prompt,
         "seed": args.seed,
         "warmup_runs": args.warmup_runs,
@@ -1316,6 +1534,12 @@ def main() -> None:
             ],
         },
     }
+    result["provenance"] = build_qualification_provenance(
+        args,
+        reference_server_kwargs=ref_server_kwargs,
+        candidate_server_kwargs=cand_server_kwargs,
+        sampling_kwargs=result["sampling_kwargs"],
+    )
 
     if args.comparison_mode == "correctness":
         reference_run, candidate_run = run_one_order(args.run_order)
@@ -1341,6 +1565,9 @@ def main() -> None:
         result["qualification"] = _with_candidate_backend_hit_qualification(
             result["qualification"],
             result["candidate_generation"]["per_run_wan_hybrid_hit_count"],
+            result["candidate_generation"][
+                "per_run_wan_hybrid_expected_hit_count"
+            ],
         )
     else:
         order_results = {}
