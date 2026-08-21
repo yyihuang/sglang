@@ -49,7 +49,6 @@ _PAIR_READERS = {
     "batch_overlap/two_batch_overlap.py": "prefill (extend positions)",
     "managers/scheduler.py": "prefill (truncation align knobs)",
     "entrypoints/engine.py": "either half (flashinfer version floor)",
-    "models/sarvam_moe.py": "the half serving the forward (attn dispatch)",
 }
 
 

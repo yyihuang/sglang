@@ -153,7 +153,6 @@ def get_attn_backend(
     supported_attention_backends: set[AttentionBackendEnum] | None = None,
     selected_attention_backend: AttentionBackendEnum | None = None,
     attention_requirements: AttentionRequirements | None = None,
-    default_attention_backend: AttentionBackendEnum | None = None,
     is_cross_attention: bool = False,
 ) -> type[AttentionBackend]:
     requirements = attention_requirements or AttentionRequirements()
@@ -188,9 +187,6 @@ def get_attn_backend(
             selection_is_explicit = isinstance(
                 server_args, ServerArgs
             ) and server_args.is_arg_explicitly_set("attention_backend")
-
-    if selected_backend is None:
-        selected_backend = default_attention_backend
 
     allowed_fallback_reason = None
     if selected_backend is None:

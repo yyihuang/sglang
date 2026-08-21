@@ -213,10 +213,8 @@ class UpsamplerLoader(ComponentLoader):
 
         logger.info("Loading LatentUpsampler with config: %s", config)
 
-        component_starts_on_cpu = server_args.should_start_component_on_cpu(
-            component_name
-        )
-        target_device = self.target_device(component_starts_on_cpu)
+        should_offload = server_args.should_cpu_offload_component(component_name)
+        target_device = self.target_device(should_offload)
 
         with torch.device("meta"):
             model = LatentUpsampler(**config)

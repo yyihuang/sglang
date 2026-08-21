@@ -46,7 +46,10 @@ class ServerArgsAutoTuner:
 
     def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
-        self._explicit_dit_residency = self._has_explicit_dit_residency()
+        self._explicit_memory_policy = self._has_explicit_memory_policy()
+        self._explicit_layerwise_replacement_policy = (
+            self._has_explicit_layerwise_replacement_policy()
+        )
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
@@ -124,9 +127,12 @@ class ServerArgsAutoTuner:
         if args.performance_mode != "auto" or current_platform.is_cpu():
             return
 
-        # Explicit placement is component-scoped; unmatched components still
-        # receive automatic defaults.
+        # Explicitness is component-scoped below.  For example, explicitly
+        # disabling DiT layerwise offload must not freeze an unrelated,
+        # implicit ``dit_cpu_offload=True`` default on a high-memory GPU.
+        # Each mutation below already preserves its own explicit CLI flag.
 
+        explicit_cpu_components = args.is_arg_explicitly_set("cpu_offload_components")
         explicit_layerwise_components = (
             normalize_layerwise_offload_components(args.layerwise_offload_components)
             if args.is_arg_explicitly_set("layerwise_offload_components")
@@ -174,7 +180,8 @@ class ServerArgsAutoTuner:
             if (
                 args.dit_cpu_offload
                 and "dit" in components
-                and args.explicit_residency_mode("transformer") is None
+                and not args.is_arg_explicitly_set("dit_cpu_offload")
+                and not explicit_cpu_components
                 and not explicit_dit_layerwise
             ):
                 args.dit_cpu_offload = False
@@ -182,21 +189,24 @@ class ServerArgsAutoTuner:
             if (
                 args.text_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in components
-                and args.explicit_residency_mode("text_encoder") is None
+                and not args.is_arg_explicitly_set("text_encoder_cpu_offload")
+                and not explicit_cpu_components
             ):
                 args.text_encoder_cpu_offload = False
                 changed.append("text_encoder_cpu_offload=False")
             if (
                 args.image_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in components
-                and args.explicit_residency_mode("image_encoder") is None
+                and not args.is_arg_explicitly_set("image_encoder_cpu_offload")
+                and not explicit_cpu_components
             ):
                 args.image_encoder_cpu_offload = False
                 changed.append("image_encoder_cpu_offload=False")
             if (
                 args.vae_cpu_offload
                 and LAYERWISE_OFFLOAD_VAE_GROUP in components
-                and args.explicit_residency_mode("vae") is None
+                and not args.is_arg_explicitly_set("vae_cpu_offload")
+                and not explicit_cpu_components
             ):
                 args.vae_cpu_offload = False
                 changed.append("vae_cpu_offload=False")
@@ -225,21 +235,14 @@ class ServerArgsAutoTuner:
 
         # high-memory resident mode keeps both DiTs on GPU; unset auxiliary
         # placement should stay resident instead of using default layerwise
-        if (
-            args.text_encoder_cpu_offload
-            and args.explicit_residency_mode("text_encoder") is None
+        for arg_name in (
+            "text_encoder_cpu_offload",
+            "image_encoder_cpu_offload",
+            "vae_cpu_offload",
         ):
-            args.text_encoder_cpu_offload = False
-            changed.append("text_encoder_cpu_offload=False")
-        if (
-            args.image_encoder_cpu_offload
-            and args.explicit_residency_mode("image_encoder") is None
-        ):
-            args.image_encoder_cpu_offload = False
-            changed.append("image_encoder_cpu_offload=False")
-        if args.vae_cpu_offload and args.explicit_residency_mode("vae") is None:
-            args.vae_cpu_offload = False
-            changed.append("vae_cpu_offload=False")
+            if getattr(args, arg_name) and not args.is_arg_explicitly_set(arg_name):
+                setattr(args, arg_name, False)
+                changed.append(f"{arg_name}=False")
 
         if changed:
             logger.info(
@@ -252,7 +255,7 @@ class ServerArgsAutoTuner:
         if (
             args.performance_mode == "auto"
             and args.num_gpus >= 2
-            and not self._explicit_dit_residency
+            and not self._explicit_memory_policy
             and self._auto_uses_dit_offload()
             and self._can_apply_fsdp_policy(require_memory_headroom=True)
         ):
@@ -277,6 +280,7 @@ class ServerArgsAutoTuner:
         if (
             args.layerwise_offload_components is not None
             or args.dit_layerwise_offload is True
+            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             return
         if not current_platform.is_cuda():
@@ -297,12 +301,12 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if (
             not self.could_override_server_args()
+            or self._explicit_layerwise_replacement_policy
             or current_platform.is_cpu()
             or not current_platform.is_cuda()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.layerwise_offload_components is not None
-            or args.dit_layerwise_offload is True
         ):
             return
 
@@ -311,19 +315,17 @@ class ServerArgsAutoTuner:
             layerwise_components.append(LAYERWISE_OFFLOAD_DIT_GROUP)
 
         changed: list[str] = []
-        if (
-            args.text_encoder_cpu_offload
-            and args.explicit_residency_mode("text_encoder") is None
+        if args.text_encoder_cpu_offload and not args.is_arg_explicitly_set(
+            "text_encoder_cpu_offload"
         ):
             layerwise_components.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
             changed.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
-        if (
-            args.image_encoder_cpu_offload
-            and args.explicit_residency_mode("image_encoder") is None
+        if args.image_encoder_cpu_offload and not args.is_arg_explicitly_set(
+            "image_encoder_cpu_offload"
         ):
             layerwise_components.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
             changed.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
-        if args.vae_cpu_offload and args.explicit_residency_mode("vae") is None:
+        if args.vae_cpu_offload and not args.is_arg_explicitly_set("vae_cpu_offload"):
             layerwise_components.append(LAYERWISE_OFFLOAD_VAE_GROUP)
             changed.append(LAYERWISE_OFFLOAD_VAE_GROUP)
 
@@ -436,6 +438,7 @@ class ServerArgsAutoTuner:
         if (
             args.is_arg_explicitly_set("layerwise_offload_components")
             or args.dit_layerwise_offload is True
+            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             # The legacy --dit-layerwise-offload flag is a DiT-only selector.
             # Do not merge implicit defaults into that explicit mode.
@@ -447,7 +450,7 @@ class ServerArgsAutoTuner:
         components = [
             component_name
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
-            if args.explicit_residency_mode(component_name) is None
+            if not args.is_arg_explicitly_set(arg_name)
         ]
         components = self._filter_high_memory_resident_components(components)
         if self._should_auto_enable_dit_layerwise_offload():
@@ -500,7 +503,8 @@ class ServerArgsAutoTuner:
             or not current_platform.enable_dit_layerwise_offload_by_default()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
-            or args.explicit_residency_mode("transformer") is not None
+            or args.is_arg_explicitly_set("dit_cpu_offload")
+            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             return False
 
@@ -540,11 +544,28 @@ class ServerArgsAutoTuner:
             )
         )
 
-    def _has_explicit_dit_residency(self) -> bool:
+    def _has_explicit_memory_policy(self) -> bool:
         args = self.server_args
-        return bool(
-            args.is_arg_explicitly_set("use_fsdp_inference")
-            or args.explicit_residency_mode("transformer") is not None
+        return any(
+            args.is_arg_explicitly_set(arg_name)
+            for arg_name in (
+                "use_fsdp_inference",
+                "dit_cpu_offload",
+                "dit_layerwise_offload",
+                "layerwise_offload_components",
+                "cpu_offload_components",
+            )
+        )
+
+    def _has_explicit_layerwise_replacement_policy(self) -> bool:
+        args = self.server_args
+        return any(
+            args.is_arg_explicitly_set(arg_name)
+            for arg_name in (
+                "dit_layerwise_offload",
+                "layerwise_offload_components",
+                "cpu_offload_components",
+            )
         )
 
     def _has_explicit_parallel_policy(self) -> bool:

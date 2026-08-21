@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     flashinfer_gdn_prefill_default,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -200,6 +201,50 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             backend.init_forward_metadata(forward_batch)
 
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
+
+    def test_sm100_extend_passes_indexed_state_pool_in_place(self):
+        kernel = object.__new__(FlashInferGDNKernel)
+        kernel.use_state_pool = True
+        kernel._prefill_fn = MagicMock()
+
+        q = torch.randn(1, 4, 2, 128, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn(1, 4, 2, 128, dtype=torch.bfloat16)
+        g = torch.randn(1, 4, 2, dtype=torch.float32)
+        beta = torch.randn(1, 4, 2, dtype=torch.float32)
+        state_pool = torch.randn(5, 2, 128, 128, dtype=torch.bfloat16)
+        cache_indices = torch.tensor([3, -1], dtype=torch.int64)
+        query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+        expected_output = torch.randn(4, 2, 128, dtype=torch.bfloat16)
+
+        def prefill(**kwargs):
+            return expected_output, kwargs["output_state"]
+
+        kernel._prefill_fn.side_effect = prefill
+        with patch(
+            "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
+            side_effect=lambda tensor: tensor,
+        ):
+            output, _, checkpoints = kernel.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=state_pool,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            )
+
+        call = kernel._prefill_fn.call_args.kwargs
+        self.assertIs(call["initial_state"], state_pool)
+        self.assertIs(call["output_state"], state_pool)
+        self.assertEqual(call["state_indices"].dtype, torch.int32)
+        torch.testing.assert_close(
+            call["state_indices"], torch.tensor([3, 0], dtype=torch.int32)
+        )
+        self.assertIsNone(checkpoints)
+        torch.testing.assert_close(output, expected_output.unsqueeze(0))
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)

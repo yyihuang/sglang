@@ -16,7 +16,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
-from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import pytest
@@ -405,9 +404,6 @@ class ServerManager:
         ]
         if self.extra_args.strip():
             command.extend(self.extra_args.strip().split())
-        access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
-        if not any(arg.startswith(access_log_exclude_flag) for arg in command):
-            command.extend(["--uvicorn-access-log-exclude-prefixes", "/health"])
 
         env = os.environ.copy()
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
@@ -475,9 +471,9 @@ class ServerManager:
         )
 
     def _wait_for_ready(self, process: subprocess.Popen, stdout_path: Path) -> None:
-        """Wait until model warmup finishes and inference traffic is accepted."""
+        """Wait for server to become ready."""
         start = time.time()
-        health_url = f"http://127.0.0.1:{self.port}/health"
+        ready_message = "Application startup complete."
         log_period = 30
         prev_log_period_count = 0
 
@@ -488,13 +484,14 @@ class ServerManager:
                     f"Server exited early (code {process.returncode}).\n{tail}"
                 )
 
-            try:
-                with urlopen(health_url, timeout=1) as response:
-                    if response.status == 200:
+            if stdout_path.exists():
+                try:
+                    content = stdout_path.read_text(encoding="utf-8", errors="ignore")
+                    if ready_message in content:
                         logger.info("[server-test] Server ready")
                         return
-            except (HTTPError, URLError, TimeoutError, OSError):
-                pass
+                except Exception as e:
+                    logger.debug("Could not read log yet: %s", e)
 
             elapsed = int(time.time() - start)
             if (elapsed // log_period) > prev_log_period_count:

@@ -40,9 +40,9 @@ DEFAULT_HEAD_V_DIM = 32
 DEFAULT_MAX_CONTEXT_LEN = 64
 DEFAULT_DTYPE = torch.bfloat16
 DEFAULT_DEVICE = "cuda"
-GDN_ATOL = 3e-2
-GDN_RTOL = 3e-2
-GDN_TREE_ATOL = 5e-2
+GDN_ATOL = 1e-2
+GDN_RTOL = 1e-2
+GDN_TREE_ATOL = 1e-2
 
 
 @dataclass(frozen=True)

@@ -17,7 +17,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -1897,11 +1897,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens = None
 
         if batch.return_logprob:
-            compute_spec_logprobs(
+            output_indices = torch.arange(
+                bs * block_size, dtype=torch.int64, device=device
+            ).view(bs, block_size)
+            compute_spec_v2_logprobs(
                 batch,
                 logits_output,
                 out_tokens.reshape(-1),
-                chain_stride=block_size,
+                output_indices,
+                block_size - 1,
             )
 
         if self._need_mamba_verify_commit:

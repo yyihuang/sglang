@@ -157,7 +157,10 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
         with threshold.override(threshold.default):
             self.assertIsNone(build_plan())
-        with threshold.override(query_rows):
+        with (
+            threshold.override(query_rows),
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
+        ):
             plan = build_plan()
         self.assertEqual(
             (plan.seq_len_sum, plan.max_seqlen_k, plan.query_rows),

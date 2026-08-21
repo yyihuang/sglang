@@ -5,13 +5,12 @@ import logging
 import math
 import tempfile
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
@@ -113,11 +112,6 @@ class SchedulerMetricsReporter:
         )
         self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
         self._install_device_timer_on_runners()
-        # Keep log history after the existing async result copy so reporting does
-        # not synchronize the model stream once per generated token.
-        self._eplb_balancedness_history = [
-            deque(maxlen=window_size) for window_size in EPLB_BALANCEDNESS_WINDOW_SIZES
-        ]
 
     def _init_metrics(
         self,
@@ -459,14 +453,6 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    @staticmethod
-    def _prefill_attention_pairs(batch) -> float:
-        """Causal query-key pairs: each chunk against its cached prefix, plus
-        the causal pairs within the chunk itself."""
-        prefix_pairs = sum(c * p for c, p in zip(batch.extend_lens, batch.prefix_lens))
-        within_chunk_pairs = sum(c * (c + 1) / 2.0 for c in batch.extend_lens)
-        return float(prefix_pairs + within_chunk_pairs)
-
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
         if batch is None or batch.extend_lens is None:
             return 0.0, 0.0, 0.0
@@ -474,20 +460,17 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        context_product = self._prefill_attention_pairs(batch)
+        # Causal prefill token-context product.
+        context_product = tokens * (tokens + 1) / 2.0
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * context_product
         )
 
-        # The chunk's queries share one pass over the cached prefix, so charge the
-        # prefix KV once per chunk -- not once per query-key pair.
-        prefix_kv_tokens = float(sum(batch.prefix_lens))
         read_bytes = (
             tokens * self._weight_read_bytes_per_token
             + tokens * self._qkv_act_bytes_per_token
             + tokens * self._prefill_attn_act_read_per_token
-            + prefix_kv_tokens * self._kv_cache_bytes_per_token
         )
         write_bytes = (
             tokens * self._kv_cache_bytes_per_token
@@ -523,8 +506,8 @@ class SchedulerMetricsReporter:
 
     def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
         """Hook: model-specific speed-of-light % suffix for the prefill log line.
-        Call ``_prefill_attention_pairs(batch)`` for the exact causal
-        attention pair-count. No model arch here, so returns "";
+        ``batch`` carries the per-request extend/prefix lengths a subclass needs
+        for an exact attention pair-count. No model arch here, so returns "";
         a subclass may override it."""
         return ""
 
@@ -968,45 +951,16 @@ class SchedulerMetricsReporter:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if not self.enable_metrics:
+            return
         if not isinstance(result, GenerationBatchResult):
             return
 
         if (m := result.expert_distribution_metrics) is not None:
-            balancedness = m.eplb_balancedness.item()
-
-            if (
-                self.scheduler.server_args.should_log_expert_balancedness_to_server_log()
-            ):
-                if m.reset_server_log_history:
-                    for history in self._eplb_balancedness_history:
-                        history.clear()
-                for history in self._eplb_balancedness_history:
-                    history.append(balancedness)
-                balancedness_history_means = {
-                    history.maxlen: sum(history) / len(history)
-                    for history in self._eplb_balancedness_history
-                    if len(history) > 0
-                }
-                assert m.gpu_physical_count_sum is not None
-                gpu_physical_count_sum = m.gpu_physical_count_sum.item()
-
-                logger.info(
-                    f"[Expert Balancedness] "
-                    f"forward_pass_id={m.forward_pass_id} "
-                    f"current_pass_balancedness={balancedness:.03f} "
-                    f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in balancedness_history_means.items())} "
-                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
-                )
-
-            if (
-                self.enable_metrics
-                and self.scheduler.server_args.should_export_expert_balancedness_to_prometheus()
-            ):
-                assert self.metrics_collector is not None
-                self.metrics_collector.increment_eplb_balancedness(
-                    forward_mode=batch.forward_mode.name.lower(),
-                    balancedness=balancedness,
-                )
+            self.metrics_collector.increment_eplb_balancedness(
+                forward_mode=batch.forward_mode.name.lower(),
+                balancedness=m.eplb_balancedness.item(),
+            )
 
     def _emit_forward_pass_metrics(
         self,

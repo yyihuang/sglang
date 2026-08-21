@@ -1,6 +1,5 @@
 import unittest
 
-import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.layers.quantization.fp8_utils import input_to_float8

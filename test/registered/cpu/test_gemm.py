@@ -1,7 +1,6 @@
 import unittest
 
 # TODO: use interface in cpu.py
-import sgl_kernel  # noqa: F401
 import torch
 import torch.nn as nn
 

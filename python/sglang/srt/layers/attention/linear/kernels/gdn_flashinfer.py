@@ -306,8 +306,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # Negative indices (e.g. -1) are padding markers for slots not yet
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
-            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
-            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
+            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int32)
+            # SM100/SM103 FlashInfer accepts the indexed state pool directly.
+            # Keep the pool in place instead of gathering a batch-sized state
+            # tensor and scattering it back after the kernel.
+            initial_state_fi = ssm_states
             cu_seqlens = query_start_loc  # already int32
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
@@ -321,7 +324,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             cu_seqlens = query_start_loc.to(torch.int64)
 
         # Keep final state and checkpoints in the same kernel state dtype.
-        output_state_fi = torch.empty_like(initial_state_fi)
+        output_state_fi = (
+            ssm_states if self.use_state_pool else torch.empty_like(initial_state_fi)
+        )
         state_checkpoints = (
             initial_state_fi.new_empty(
                 (num_state_checkpoints, *initial_state_fi.shape[1:])
@@ -344,15 +349,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
-            use_cp="auto",
+            state_indices=ssm_cache_indices if self.use_state_pool else None,
         )
 
-        # Write back state to pool
-        ssm_states.index_copy_(
-            0,
-            ssm_cache_indices,
-            output_state_fi.to(ssm_states.dtype),
-        )
+        if not self.use_state_pool:
+            # SM90 still uses the packed state ABI and needs an explicit writeback.
+            ssm_states.index_copy_(
+                0,
+                ssm_cache_indices,
+                output_state_fi.to(ssm_states.dtype),
+            )
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)

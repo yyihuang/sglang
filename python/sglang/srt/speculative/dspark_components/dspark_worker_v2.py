@@ -11,7 +11,6 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -66,11 +65,9 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
-
-_is_npu = is_npu()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -96,14 +93,14 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
-            get_parallel().enable_dp_attention and not self._draft_is_moe
+            server_args.enable_dp_attention and not self._draft_is_moe
         )
         self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
-            not get_exec().graph.disable_cuda_graph and not self._is_pd_prefill
+            not server_args.disable_cuda_graph and not self._is_pd_prefill
         )
         if (
-            get_parallel().enable_dp_attention
+            server_args.enable_dp_attention
             and self._draft_is_moe
             and ps.attn_tp_size > 1
         ):
@@ -129,6 +126,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._linear_accept_index_cache = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -175,22 +173,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.gamma), device=self.device
         )
 
-        if getattr(self.draft_model, "uses_own_vocab_modules", False):
-            if self.ps.tp_rank == 0:
-                logger.info(
-                    "DSpark draft uses its checkpoint-local embedding and LM head."
-                )
-        else:
-            target_model = self.target_worker.model_runner.model
-            lm_head = getattr(target_model, "lm_head", None)
-            if lm_head is None or not hasattr(lm_head, "weight"):
-                raise RuntimeError(
-                    "DSpark requires the target model to expose `lm_head` with `weight`."
-                )
-            self.draft_model.attach_shared_modules(
-                embed_tokens=self._resolve_target_embed_tokens(target_model),
-                lm_head=lm_head,
+        target_model = self.target_worker.model_runner.model
+        lm_head = getattr(target_model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            raise RuntimeError(
+                "DSpark requires the target model to expose `lm_head` with `weight`."
             )
+        self.draft_model.attach_shared_modules(
+            embed_tokens=self._resolve_target_embed_tokens(target_model),
+            lm_head=lm_head,
+        )
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -202,7 +194,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
         )
         if (
-            get_parallel().enable_dp_attention
+            server_args.enable_dp_attention
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
@@ -228,7 +220,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
-            dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
+            dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
         )
         self._verify_epilogue = None
         if (
@@ -337,12 +329,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         with self._draft_context():
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.extra_ops_loader import (
-                    initialize_dspark_sparse_attn_ops,
-                )
-
-                initialize_dspark_sparse_attn_ops()
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
@@ -425,6 +411,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
+        if getattr(batch, "return_logprob", False):
+            raise ValueError(
+                "DSpark speculative decoding does not support return_logprob yet."
+            )
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -584,6 +575,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
+
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -688,6 +680,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
@@ -715,14 +708,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
-        if batch.return_logprob:
-            compute_spec_logprobs(
-                batch,
-                logits_output,
-                accept.out_tokens.reshape(-1),
-                chain_stride=self.verify_num_draft_tokens,
-            )
-
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)

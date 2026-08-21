@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
@@ -239,10 +240,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
         labels: Dict[str, str],
-        server_args: ServerArgs,
         enable_lora: bool = False,
         enable_hierarchical_cache: bool = False,
         enable_streaming_session: bool = False,
+        server_args: Optional[ServerArgs] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
@@ -873,8 +874,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         if (
             labels["moe_ep_rank"] == 0
-            and server_args.should_export_expert_balancedness_to_prometheus()
-        ):
+        ) and envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
             self.eplb_balancedness = Summary(
                 name="sglang:eplb_balancedness",
                 documentation="Balancedness of MoE in expert parallelism.",
