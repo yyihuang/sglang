@@ -14,6 +14,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+    is_layerwise_offloaded_module,
+)
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
     WanTransformerInputCapture,
 )
@@ -25,6 +29,9 @@ from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
     capture_wan_transformer_forward,
     run_wan_transformer_forward_qualification,
     validate_wan_transformer_forward_report,
+)
+from sglang.multimodal_gen.tools.run_wan_transformer_forward_report import (
+    _configure_standalone_layerwise_offload,
 )
 
 
@@ -93,6 +100,53 @@ class _AutocastWanTransformer(_TinyWanTransformer):
         return super().forward(hidden_states + conditioned, timestep=timestep)
 
 
+class _LayerwiseCudaBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, hidden_states):
+        assert hidden_states.is_cuda
+        return hidden_states + self.weight
+
+
+class _LayerwiseCudaTransformer(nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["blocks"]
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([_LayerwiseCudaBlock() for _ in range(2)])
+
+    def forward(self, hidden_states):
+        for block in self.blocks:
+            hidden_states = block(hidden_states)
+        return hidden_states
+
+
+class _DirectLayerwiseServerArgs:
+    component_residency = None
+    layerwise_offload_components = ["dit"]
+    pipeline_class_name = None
+    pin_cpu_memory = False
+
+    @staticmethod
+    def has_layerwise_offload_components():
+        return True
+
+    @staticmethod
+    def is_arg_explicitly_set(_name):
+        return False
+
+    @staticmethod
+    def layerwise_tuning_for(_component_name, *, dit_group):
+        assert dit_group is True
+        return 1, 0, "leading"
+
+    @staticmethod
+    def record_component_layerwise_capability(_component_name, *, supported):
+        assert supported is True
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA autocast")
 def test_direct_forward_replays_production_cuda_bf16_autocast():
     model = _AutocastWanTransformer().cuda()
@@ -153,6 +207,28 @@ def test_layerwise_offloaded_model_uses_local_execution_device(monkeypatch):
 
     assert moved_input["hidden_states"].device == expected
     assert fixed_input["hidden_states"].device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA offload")
+def test_standalone_loader_replays_worker_layerwise_setup():
+    model = _LayerwiseCudaTransformer()
+    assert next(model.parameters()).device.type == "cpu"
+
+    _configure_standalone_layerwise_offload(
+        model,
+        component_name="transformer",
+        server_args=_DirectLayerwiseServerArgs(),
+    )
+
+    assert is_layerwise_offloaded_module(model)
+    fixed_input = {"hidden_states": torch.ones(1, 2)}
+    moved_input = _move_fixed_input_to_model(
+        fixed_input, device=_model_device(model)
+    )
+    output = model(**moved_input)
+    assert moved_input["hidden_states"].is_cuda
+    assert output.is_cuda
+    assert torch.equal(output.cpu(), torch.full((1, 2), 3.0))
 
 
 def _component_path(tmp_path, component_name: str):

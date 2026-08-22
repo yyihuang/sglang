@@ -20,6 +20,33 @@ from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
 )
 
 
+def _configure_standalone_layerwise_offload(
+    model: Any, *, component_name: str, server_args: Any
+) -> None:
+    """Mirror worker layerwise setup after loading one standalone component."""
+
+    if not server_args.has_layerwise_offload_components():
+        return
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        configure_layerwise_offload_modules,
+    )
+
+    configure_layerwise_offload_modules(
+        {component_name: model},
+        server_args,
+        component_names=(
+            None
+            if server_args.component_residency is not None
+            else server_args.layerwise_offload_components
+        ),
+        warn_missing=(
+            server_args.component_residency is not None
+            or server_args.is_arg_explicitly_set("layerwise_offload_components")
+            or server_args.is_arg_explicitly_set("dit_layerwise_offload")
+        ),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-manifest", required=True)
@@ -137,6 +164,11 @@ def _load_component(
         component_architecture=architecture,
         component_attn_backend=backend,
         component_attn_name=matched_name or component_name,
+    )
+    _configure_standalone_layerwise_offload(
+        model,
+        component_name=component_name,
+        server_args=server_args,
     )
     model.eval()
     model._wan_qualification_server_args = server_args
