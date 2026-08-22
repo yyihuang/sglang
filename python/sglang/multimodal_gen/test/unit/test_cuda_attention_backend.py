@@ -157,6 +157,29 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         ), self.assertRaisesRegex(RuntimeError, "installed FlashInfer"):
             _WanHybridAttentionBackendResolver.resolve(FakeCudaPlatform)
 
+    def test_wan_hybrid_resolver_fails_closed_without_public_exports(self):
+        public_exports = {
+            "WanHybridAttentionWorkspace": object(),
+            "wan_hybrid_attention": object(),
+            "is_wan_hybrid_attention_available": lambda: True,
+        }
+        for missing_export in public_exports:
+            flashinfer = types.ModuleType("flashinfer")
+            for name, value in public_exports.items():
+                if name != missing_export:
+                    setattr(flashinfer, name, value)
+            with (
+                self.subTest(missing_export=missing_export),
+                patch.dict(sys.modules, {"flashinfer": flashinfer}),
+                patch.object(
+                    FakeCudaPlatform,
+                    "get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
+                self.assertRaisesRegex(ImportError, "public wan_hybrid"),
+            ):
+                _WanHybridAttentionBackendResolver.resolve(FakeCudaPlatform)
+
     def test_wan_hybrid_resolver_rejects_other_architectures(self):
         with patch.object(
             FakeCudaPlatform,

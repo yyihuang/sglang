@@ -228,6 +228,46 @@ class TestWanHybridAttentionBackend(unittest.TestCase):
             self.assertEqual(call.kwargs["qkv_layout"], "NHD")
             self.assertFalse(call.kwargs["causal"])
 
+    def test_successful_public_forward_is_attributed_to_active_request(self):
+        impl = _make_impl(prefix="blocks.7.attn1.impl")
+        query, key, value = _exact_cuda_inputs()
+        output = object()
+        collector = WanHybridEvidenceCollector(request_id="request-public-api")
+        fake_flashinfer = ModuleType("flashinfer")
+        fake_flashinfer.is_wan_hybrid_attention_available = Mock(return_value=True)
+        fake_flashinfer.wan_hybrid_attention = Mock(return_value=output)
+
+        with (
+            patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
+            patch.object(
+                impl,
+                "_get_workspace_and_output",
+                return_value=(object(), output),
+            ),
+            set_forward_context(
+                current_timestep=3,
+                attn_metadata=None,
+                wan_component_name="transformer",
+                wan_actual_timestep=777,
+                wan_cfg_branch_index=1,
+                wan_hybrid_evidence_collector=collector,
+            ),
+        ):
+            record_wan_attention_route(
+                layer_index=7,
+                hybrid_configured=True,
+                eligible_for_hybrid=True,
+            )
+            result = impl.forward(query, key, value, None)
+
+        coverage = collector.coverage()
+        self.assertIs(result, output)
+        self.assertEqual(coverage["expected_hit_count"], 1)
+        self.assertEqual(coverage["actual_hit_count"], 1)
+        self.assertEqual(coverage["unattributed_actual_hit_count"], 0)
+        self.assertEqual(read_wan_hybrid_hit_count(), 0)
+        fake_flashinfer.wan_hybrid_attention.assert_called_once()
+
     def test_unavailable_public_backend_fails_closed_without_hit(self):
         impl = _make_impl()
         query, key, value = _exact_cuda_inputs()
@@ -297,14 +337,42 @@ class TestWanHybridAttentionBackend(unittest.TestCase):
         self.assertIsNot(first_output, second_output)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_public_backend_reuses_storage_and_replays_cuda_graph(self):
-        try:
-            from flashinfer import is_wan_hybrid_attention_available
-        except ImportError:
-            self.skipTest("FlashInfer public wan_hybrid API is not installed")
+    def test_injected_public_api_reuses_storage_and_replays_cuda_graph(self):
+        """Exercise SGLang graph integration without the unfinished device impl."""
+
         device = torch.device("cuda", torch.cuda.current_device())
-        if not is_wan_hybrid_attention_available(device):
-            self.skipTest("FlashInfer wan_hybrid implementation is unavailable")
+
+        class FakePublicWorkspace:
+            instances = []
+
+            def __init__(self, workspace_device):
+                self.device = torch.device(workspace_device)
+                self.__class__.instances.append(self)
+
+        def fake_public_attention(
+            q,
+            k,
+            v,
+            *,
+            out,
+            workspace,
+            sm_scale,
+            qkv_layout,
+            causal,
+        ):
+            self.assertIsInstance(workspace, FakePublicWorkspace)
+            self.assertEqual(sm_scale, 128**-0.5)
+            self.assertEqual(qkv_layout, "NHD")
+            self.assertFalse(causal)
+            self.assertEqual(q.device, k.device)
+            self.assertEqual(q.device, v.device)
+            out.copy_(q)
+            return out
+
+        fake_flashinfer = ModuleType("flashinfer")
+        fake_flashinfer.WanHybridAttentionWorkspace = FakePublicWorkspace
+        fake_flashinfer.is_wan_hybrid_attention_available = lambda _device: True
+        fake_flashinfer.wan_hybrid_attention = fake_public_attention
 
         torch.manual_seed(4254)
         query, key, value = (
@@ -319,34 +387,42 @@ class TestWanHybridAttentionBackend(unittest.TestCase):
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
 
-        with torch.cuda.stream(stream):
-            first = impl.forward(query, key, value, None)
-            second = impl.forward(query, key, value, None)
-        stream.synchronize()
-        self.assertIs(first, second)
-        output_ptr = first.data_ptr()
-        workspace = impl._shared_scratch.workspace
+        with (
+            patch.dict(_SHARED_SCRATCH, {}, clear=True),
+            patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
+        ):
+            with torch.cuda.stream(stream):
+                first = impl.forward(query, key, value, None)
+                second = impl.forward(query, key, value, None)
+            stream.synchronize()
+            self.assertIs(first, second)
+            output_ptr = first.data_ptr()
+            workspace = impl._shared_scratch.workspace
+            self.assertEqual(len(FakePublicWorkspace.instances), 1)
 
-        allocated_before = torch.cuda.memory_allocated(device)
-        with torch.cuda.stream(stream):
-            third = impl.forward(query, key, value, None)
-        stream.synchronize()
-        self.assertEqual(torch.cuda.memory_allocated(device), allocated_before)
-        self.assertEqual(third.data_ptr(), output_ptr)
-        self.assertIs(impl._shared_scratch.workspace, workspace)
+            with torch.cuda.stream(stream):
+                third = impl.forward(query, key, value, None)
+            stream.synchronize()
+            self.assertEqual(third.data_ptr(), output_ptr)
+            self.assertIs(impl._shared_scratch.workspace, workspace)
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            captured = impl.forward(query, key, value, None)
-        graph.replay()
-        stream.synchronize()
-        expected = captured.clone()
-        graph.replay()
-        stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = impl.forward(query, key, value, None)
+            graph.replay()
+            stream.synchronize()
 
-        self.assertEqual(captured.data_ptr(), output_ptr)
-        self.assertTrue(torch.equal(captured, expected))
-        self.assertGreater(read_wan_hybrid_hit_count(), 0)
+            query.fill_(2)
+            captured.zero_()
+            torch.cuda.synchronize(device)
+            graph.replay()
+            stream.synchronize()
+
+            self.assertEqual(captured.data_ptr(), output_ptr)
+            self.assertTrue(torch.equal(captured, query))
+            self.assertIs(impl._shared_scratch.workspace, workspace)
+            self.assertEqual(len(FakePublicWorkspace.instances), 1)
+            self.assertGreater(read_wan_hybrid_hit_count(), 0)
 
     def test_forward_rejects_non_exact_sequence(self):
         impl = _make_impl()
