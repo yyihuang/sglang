@@ -763,9 +763,11 @@ class WanTransformerBlock(nn.Module):
         attention = (
             self.attn1
             if use_wan_hybrid
-            else self.attn1_fallback
-            if self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
-            else self.attn1
+            else (
+                self.attn1_fallback
+                if self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
+                else self.attn1
+            )
         )
         assert attention is not None
         attn_output = attention(query, key, value)

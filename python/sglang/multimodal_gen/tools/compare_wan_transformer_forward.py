@@ -30,10 +30,10 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
     WanHybridEvidenceCollector,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
     _model_identity,
     load_wan_transformer_input_capture,
@@ -87,9 +87,9 @@ class WanTransformerDirectRequest:
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(
-        json.dumps(
-            value, sort_keys=True, separators=(",", ":"), default=str
-        ).encode("utf-8")
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
     ).hexdigest()
 
 
@@ -149,9 +149,7 @@ def build_wan_transformer_evidence_binding(
         raise FileNotFoundError(
             f"component config is required for provenance: {config_path}"
         )
-    config_files = [
-        {"path": "config.json", "sha256": _sha256_file(config_path)}
-    ]
+    config_files = [{"path": "config.json", "sha256": _sha256_file(config_path)}]
     index_path = component_path / "diffusion_pytorch_model.safetensors.index.json"
     if index_path.is_file():
         config_files.append(
@@ -311,8 +309,7 @@ def _comparison_envelope(comparisons: Sequence[dict[str, Any]]) -> dict[str, flo
         for metrics in comparison["trajectory_metrics"]["per_step_metrics"]
     ]
     outputs = [
-        comparison["output_metrics"]["all_frames_metrics"]
-        for comparison in comparisons
+        comparison["output_metrics"]["all_frames_metrics"] for comparison in comparisons
     ]
     return {
         "min_all_blocks_cosine": min(
@@ -320,9 +317,7 @@ def _comparison_envelope(comparisons: Sequence[dict[str, Any]]) -> dict[str, flo
         ),
         "max_all_blocks_mae": max(metrics["mae"] for metrics in all_steps),
         "max_all_blocks_max_abs": max(metrics["max_abs"] for metrics in all_steps),
-        "min_output_cosine": min(
-            metrics["cosine_similarity"] for metrics in outputs
-        ),
+        "min_output_cosine": min(metrics["cosine_similarity"] for metrics in outputs),
         "max_output_mae": max(metrics["mae"] for metrics in outputs),
         "max_output_max_abs": max(metrics["max_abs"] for metrics in outputs),
     }
@@ -407,9 +402,7 @@ def _cross_variant_output_quality_failures(
                     "max_abs": metrics["max_abs"],
                 }
             )
-        if metrics["cosine_similarity"] < MODEL_QUALIFICATION_THRESHOLDS[
-            "cosine_min"
-        ]:
+        if metrics["cosine_similarity"] < MODEL_QUALIFICATION_THRESHOLDS["cosine_min"]:
             failures.append(
                 location
                 | {
@@ -452,9 +445,7 @@ def _direct_coverage_failure(
             "variant": variant,
             "reason": "coverage_scalar_mismatch",
             "expected": expected_scalars,
-            "actual": {
-                name: coverage.get(name) for name in expected_scalars
-            },
+            "actual": {name: coverage.get(name) for name in expected_scalars},
         }
     steps = coverage.get("steps")
     if not isinstance(steps, list) or len(steps) != 1:
@@ -553,9 +544,7 @@ def evaluate_transformer_forward_correctness(
         "reference": summarize_transformer_forward_repeatability(reference_traces),
         "candidate": summarize_transformer_forward_repeatability(candidate_traces),
     }
-    qualification = evaluate_correctness_qualification(
-        cross_variant, repeatability
-    )
+    qualification = evaluate_correctness_qualification(cross_variant, repeatability)
     output_failures = _cross_variant_output_quality_failures(
         cross_variant["comparisons"]
     )
@@ -778,9 +767,7 @@ def run_wan_transformer_forward_qualification(
         "capture_manifest_sha256": capture_manifest["manifest_sha256"],
         "capture_request_id": capture_manifest["request_id"],
         "capture_coordinates": dict(capture_coordinates),
-        "capture_sampling_sha256": capture_manifest["sampling"][
-            "sampling_sha256"
-        ],
+        "capture_sampling_sha256": capture_manifest["sampling"]["sampling_sha256"],
     }
     evidence_binding["binding_sha256"] = _sha256_json(
         {
@@ -821,9 +808,7 @@ def run_wan_transformer_forward_qualification(
     traces: dict[str, list[WanTransformerForwardTrace]] = {}
     for variant in execution_order:
         traces[variant] = variant_calls[variant]()
-    invocation_input_sha256 = _sha256_json(
-        _summarize_fixed_input(fixed_input_cpu)
-    )
+    invocation_input_sha256 = _sha256_json(_summarize_fixed_input(fixed_input_cpu))
     if evidence_binding["fixed_input_sha256"] != invocation_input_sha256:
         raise RuntimeError("full-transformer forward mutated the fixed input")
 
@@ -911,14 +896,11 @@ def validate_wan_transformer_forward_report(
         if binding.get("component_name") != report.get("component_name"):
             errors.append("evidence binding component does not match report")
         fixed_input = binding.get("fixed_input")
-        if (
-            fixed_input is None
-            or binding.get("fixed_input_sha256") != _sha256_json(fixed_input)
+        if fixed_input is None or binding.get("fixed_input_sha256") != _sha256_json(
+            fixed_input
         ):
             errors.append("fixed-input provenance is incomplete")
-        if report.get("invocation_input_sha256") != binding.get(
-            "fixed_input_sha256"
-        ):
+        if report.get("invocation_input_sha256") != binding.get("fixed_input_sha256"):
             errors.append("invoked input does not match fixed-input provenance")
         capture_coordinates = binding.get("capture_coordinates")
         if not (
@@ -964,15 +946,12 @@ def validate_wan_transformer_forward_report(
             if identity.get("num_blocks") != 40:
                 errors.append(f"{variant} identity does not contain 40 blocks")
         config_files = binding.get("component_config_files")
-        if (
-            not isinstance(config_files, list)
-            or not any(
-                isinstance(item, dict)
-                and item.get("path") == "config.json"
-                and isinstance(item.get("sha256"), str)
-                and len(item["sha256"]) == 64
-                for item in config_files
-            )
+        if not isinstance(config_files, list) or not any(
+            isinstance(item, dict)
+            and item.get("path") == "config.json"
+            and isinstance(item.get("sha256"), str)
+            and len(item["sha256"]) == 64
+            for item in config_files
         ):
             errors.append("component config provenance is incomplete")
         if expected_model_path is not None and report.get("component_name") in (
@@ -985,12 +964,8 @@ def validate_wan_transformer_forward_report(
                 .joinpath(report["component_name"])
                 .resolve()
             )
-            if binding.get("resolved_component_path") != str(
-                expected_component_path
-            ):
-                errors.append(
-                    "resolved component path does not match model/component"
-                )
+            if binding.get("resolved_component_path") != str(expected_component_path):
+                errors.append("resolved component path does not match model/component")
             expected_config_path = expected_component_path / "config.json"
             reported_config = next(
                 (
@@ -1003,8 +978,7 @@ def validate_wan_transformer_forward_report(
             if (
                 not expected_config_path.is_file()
                 or reported_config is None
-                or reported_config.get("sha256")
-                != _sha256_file(expected_config_path)
+                or reported_config.get("sha256") != _sha256_file(expected_config_path)
             ):
                 errors.append(
                     "component config provenance does not match resolved model"
@@ -1032,13 +1006,9 @@ def validate_wan_transformer_forward_report(
     candidate_expected_hits = len(candidate_layer_indices)
 
     expected_cross_pairs = set(
-        itertools.product(
-            range(expected_measure_runs), range(expected_measure_runs)
-        )
+        itertools.product(range(expected_measure_runs), range(expected_measure_runs))
     )
-    expected_repeat_pairs = set(
-        itertools.combinations(range(expected_measure_runs), 2)
-    )
+    expected_repeat_pairs = set(itertools.combinations(range(expected_measure_runs), 2))
 
     def validate_comparisons(
         comparisons: Any,
@@ -1070,9 +1040,7 @@ def validate_wan_transformer_forward_report(
                 else None
             )
             num_steps = (
-                trajectory.get("num_steps")
-                if isinstance(trajectory, dict)
-                else None
+                trajectory.get("num_steps") if isinstance(trajectory, dict) else None
             )
             if (
                 not isinstance(per_step, list)
@@ -1116,9 +1084,7 @@ def validate_wan_transformer_forward_report(
             )
 
     hit_counts = report.get("candidate_per_run_wan_hybrid_hit_count")
-    expected_hit_counts = report.get(
-        "candidate_per_run_wan_hybrid_expected_hit_count"
-    )
+    expected_hit_counts = report.get("candidate_per_run_wan_hybrid_expected_hit_count")
     if (
         not isinstance(hit_counts, list)
         or len(hit_counts) != expected_measure_runs
@@ -1198,9 +1164,7 @@ def validate_wan_transformer_forward_report(
                 continue
             expected_step = {
                 "step_index": expected_capture_coordinates["step_index"],
-                "actual_timestep": expected_capture_coordinates[
-                    "actual_timestep"
-                ],
+                "actual_timestep": expected_capture_coordinates["actual_timestep"],
                 "active_component": report.get("component_name"),
                 "executed_cfg_branch_indices": [
                     expected_capture_coordinates["cfg_branch_index"]
@@ -1216,9 +1180,7 @@ def validate_wan_transformer_forward_report(
             branch = branches[0]
             expected_layers = list(range(40))
             expected_routes = {
-                "cfg_branch_index": expected_capture_coordinates[
-                    "cfg_branch_index"
-                ],
+                "cfg_branch_index": expected_capture_coordinates["cfg_branch_index"],
                 "num_layers": 40,
                 "layer_indices": expected_layers,
                 "eligible_layer_indices": expected_hybrid_layers,
@@ -1240,8 +1202,7 @@ def validate_wan_transformer_forward_report(
                 "actual_hit_count": expected_hits,
             }
             if any(
-                branch.get(name) != value
-                for name, value in expected_routes.items()
+                branch.get(name) != value for name, value in expected_routes.items()
             ):
                 errors.append(f"{location}: planned/success route coverage is invalid")
 

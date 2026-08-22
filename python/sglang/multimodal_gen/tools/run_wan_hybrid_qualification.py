@@ -28,7 +28,6 @@ from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
     validate_wan_transformer_forward_report,
 )
 
-
 QUALIFICATION_SCENARIOS = ("single-block", "full-transformer", "generation")
 QUALIFICATION_MODES = ("correctness", "performance")
 WAN_TRANSFORMER_COMPONENTS = ("transformer", "transformer_2")
@@ -88,9 +87,7 @@ class WanQualificationConfig:
         if invalid_modes:
             raise ValueError(f"unsupported modes: {sorted(invalid_modes)}")
         if self.warmup_runs < MIN_QUALIFICATION_WARMUP_RUNS:
-            raise ValueError(
-                f"warmup_runs must be >= {MIN_QUALIFICATION_WARMUP_RUNS}"
-            )
+            raise ValueError(f"warmup_runs must be >= {MIN_QUALIFICATION_WARMUP_RUNS}")
         if self.measure_runs < MIN_QUALIFICATION_MEASURE_RUNS:
             raise ValueError(
                 f"measure_runs must be >= {MIN_QUALIFICATION_MEASURE_RUNS}"
@@ -251,9 +248,9 @@ def validate_full_transformer_forward_evidence(
             observed_evidence.append(
                 (report.get("component_name"), report.get("run_order"))
             )
-    if set(observed_evidence) != expected_evidence or len(
-        observed_evidence
-    ) != len(expected_evidence):
+    if set(observed_evidence) != expected_evidence or len(observed_evidence) != len(
+        expected_evidence
+    ):
         errors.append(
             "independent full-transformer evidence must cover transformer and "
             "transformer_2 in both execution orders"
@@ -294,9 +291,7 @@ def _full_transformer_forward_evidence(
         "scope": FULL_TRANSFORMER_FORWARD_EVIDENCE_SCOPE,
         "expected_run_orders": list(QUALIFICATION_RUN_ORDERS),
         "expected_components": list(WAN_TRANSFORMER_COMPONENTS),
-        "report_paths": [
-            str(path) for path in config.full_transformer_forward_reports
-        ],
+        "report_paths": [str(path) for path in config.full_transformer_forward_reports],
     }
     if not required:
         evidence["validation_status"] = "not-required"
@@ -318,12 +313,14 @@ def _full_transformer_forward_evidence(
                 f"{exc}"
             )
     evidence["observed_component_run_orders"] = [
-        {
-            "component_name": report.get("component_name"),
-            "run_order": report.get("run_order"),
-        }
-        if isinstance(report, dict)
-        else None
+        (
+            {
+                "component_name": report.get("component_name"),
+                "run_order": report.get("run_order"),
+            }
+            if isinstance(report, dict)
+            else None
+        )
         for report in reports
     ]
     if not errors:
@@ -390,9 +387,10 @@ def _validate_generation_summary(
     ):
         errors.append(f"{location}: timer_scope does not include complete generation")
     output_summaries = generation.get("per_run_output_summaries")
-    if not isinstance(output_summaries, list) or len(
-        output_summaries
-    ) != expected_measure_runs:
+    if (
+        not isinstance(output_summaries, list)
+        or len(output_summaries) != expected_measure_runs
+    ):
         errors.append(f"{location}: missing per-run output summaries")
     else:
         for run_index, output in enumerate(output_summaries):
@@ -420,9 +418,7 @@ def _validate_generation_summary(
     if require_hits:
         request_ids = generation.get("per_run_request_id")
         hit_counts = generation.get("per_run_wan_hybrid_hit_count")
-        expected_hit_counts = generation.get(
-            "per_run_wan_hybrid_expected_hit_count"
-        )
+        expected_hit_counts = generation.get("per_run_wan_hybrid_expected_hit_count")
         coverages = generation.get("per_run_wan_hybrid_coverage")
         if (
             not isinstance(request_ids, list)
@@ -436,9 +432,7 @@ def _validate_generation_summary(
             or not isinstance(coverages, list)
             or len(coverages) != expected_measure_runs
         ):
-            errors.append(
-                f"{location}: missing exact per-run wan_hybrid hit evidence"
-            )
+            errors.append(f"{location}: missing exact per-run wan_hybrid hit evidence")
         else:
             for run_index, (
                 request_id,
@@ -554,9 +548,7 @@ def _validate_wan_hybrid_coverage(
             ):
                 expected_eligible = WAN_HYBRID_DEFAULT_LAYER_INDICES
                 expected_fallback = [
-                    index
-                    for index in expected_layers
-                    if index not in expected_eligible
+                    index for index in expected_layers if index not in expected_eligible
                 ]
                 expected_control = []
             elif scenario == "single-block":
@@ -570,12 +562,10 @@ def _validate_wan_hybrid_coverage(
             if (
                 branch.get("eligible_layer_indices") != expected_eligible
                 or branch.get("planned_hybrid_layer_indices") != expected_eligible
-                or branch.get("successful_hybrid_layer_indices")
-                != expected_eligible
+                or branch.get("successful_hybrid_layer_indices") != expected_eligible
                 or branch.get("eligible_hybrid_miss_layer_indices") != []
                 or branch.get("unexpected_successful_hybrid_layer_indices") != []
-                or branch.get("configured_fallback_layer_indices")
-                != expected_fallback
+                or branch.get("configured_fallback_layer_indices") != expected_fallback
                 or branch.get("control_layer_indices") != expected_control
             ):
                 errors.append(
@@ -861,9 +851,7 @@ def validate_qualification_report(
         )
         cross = report.get("cross_variant_metrics")
         expected_cross_pairs = set(
-            itertools.product(
-                range(config.measure_runs), range(config.measure_runs)
-            )
+            itertools.product(range(config.measure_runs), range(config.measure_runs))
         )
         if not isinstance(cross, dict) or cross.get("pairing") != "cross-product":
             errors.append("cross-variant comparison is not a cross-product")
@@ -937,9 +925,7 @@ def validate_qualification_report(
                         expected_frame_shape=(config.height, config.width, 3),
                     )
                 )
-                speedup = order_result.get("performance", {}).get(
-                    "wall_median_speedup"
-                )
+                speedup = order_result.get("performance", {}).get("wall_median_speedup")
                 if (
                     isinstance(speedup, bool)
                     or not isinstance(speedup, (int, float))
@@ -1120,12 +1106,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--measure-runs", type=int, default=MIN_QUALIFICATION_MEASURE_RUNS
     )
     parser.add_argument("--master-port", type=int, default=30000)
-    parser.add_argument(
-        "--reference-fp4-gemm-backend", default="flashinfer_trtllm"
-    )
-    parser.add_argument(
-        "--candidate-fp4-gemm-backend", default="flashinfer_trtllm"
-    )
+    parser.add_argument("--reference-fp4-gemm-backend", default="flashinfer_trtllm")
+    parser.add_argument("--candidate-fp4-gemm-backend", default="flashinfer_trtllm")
     parser.add_argument(
         "--compare-arg",
         dest="extra_compare_args",

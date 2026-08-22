@@ -92,9 +92,7 @@ class _TinyWanTransformer(nn.Module):
         self.output_offset = output_offset
         self.skip_last = skip_last
         self.hybrid = hybrid
-        self.wan_hybrid_layer_indices = (
-            selected_hybrid_layers if hybrid else None
-        )
+        self.wan_hybrid_layer_indices = selected_hybrid_layers if hybrid else None
         self.config = {"num_layers": 40}
         self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
         self.input_ids = []
@@ -176,9 +174,7 @@ def test_direct_forward_replays_production_cuda_bf16_autocast():
     model = _AutocastWanTransformer().cuda()
     fixed_input = {
         "hidden_states": torch.ones(1, 2, dtype=torch.bfloat16, device="cuda"),
-        "encoder_hidden_states": torch.ones(
-            1, 2, dtype=torch.float32, device="cuda"
-        ),
+        "encoder_hidden_states": torch.ones(1, 2, dtype=torch.float32, device="cuda"),
         "timestep": torch.tensor([999], device="cuda"),
     }
 
@@ -225,9 +221,7 @@ def test_layerwise_offloaded_model_uses_local_execution_device(monkeypatch):
     )
 
     fixed_input = {"hidden_states": torch.ones(1, 2)}
-    moved_input = _move_fixed_input_to_model(
-        fixed_input, device=_model_device(model)
-    )
+    moved_input = _move_fixed_input_to_model(fixed_input, device=_model_device(model))
 
     assert moved_input["hidden_states"].device == expected
     assert fixed_input["hidden_states"].device.type == "cpu"
@@ -246,9 +240,7 @@ def test_standalone_loader_replays_worker_layerwise_setup():
 
     assert is_layerwise_offloaded_module(model)
     fixed_input = {"hidden_states": torch.ones(1, 2)}
-    moved_input = _move_fixed_input_to_model(
-        fixed_input, device=_model_device(model)
-    )
+    moved_input = _move_fixed_input_to_model(fixed_input, device=_model_device(model))
     output = model(**moved_input)
     assert moved_input["hidden_states"].is_cuda
     assert output.is_cuda
@@ -324,9 +316,10 @@ def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
     assert report["evidence_binding"]["fixed_input"]["hidden_states"]["kind"] == (
         "tensor"
     )
-    assert report["invocation_input_sha256"] == report["evidence_binding"][
-        "fixed_input_sha256"
-    ]
+    assert (
+        report["invocation_input_sha256"]
+        == report["evidence_binding"]["fixed_input_sha256"]
+    )
     assert report["num_blocks"] == 40
     assert report["candidate_wan_hybrid_layer_indices"] == [39]
     assert report["candidate_per_run_wan_hybrid_hit_count"] == [1] * 5
@@ -394,9 +387,7 @@ def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
 
 def test_full_transformer_forward_preserves_explicit_multi_layer_override(tmp_path):
     reference = _TinyWanTransformer()
-    candidate = _TinyWanTransformer(
-        hybrid=True, hybrid_layer_indices=(35, 39)
-    )
+    candidate = _TinyWanTransformer(hybrid=True, hybrid_layer_indices=(35, 39))
     hidden_states = torch.tensor([[1.0, 2.0]])
     manifest = _capture_manifest(tmp_path, "transformer", hidden_states)
 
@@ -447,9 +438,7 @@ def test_full_transformer_report_cannot_be_relabelled(tmp_path):
 
 def test_full_transformer_forward_checks_final_output_quality(tmp_path):
     reference = _TinyWanTransformer()
-    candidate = _TinyWanTransformer(
-        output_offset=2.0, hybrid=True
-    )
+    candidate = _TinyWanTransformer(output_offset=2.0, hybrid=True)
     hidden_states = torch.tensor([[1.0, 2.0]])
     manifest = _capture_manifest(tmp_path, "transformer", hidden_states)
 

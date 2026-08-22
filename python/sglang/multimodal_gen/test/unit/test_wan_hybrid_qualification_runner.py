@@ -62,9 +62,7 @@ def _coverage(
                 scenario == "full-transformer" and component == "transformer"
             ):
                 eligible = WAN_HYBRID_DEFAULT_LAYER_INDICES
-                fallback = [
-                    index for index in expected_layers if index not in eligible
-                ]
+                fallback = [index for index in expected_layers if index not in eligible]
                 control = []
             elif scenario == "single-block":
                 eligible = [0]
@@ -115,7 +113,9 @@ def _coverage(
     }
 
 
-def _generation(measure_runs: int, *, include_hits: bool, scenario="generation") -> dict:
+def _generation(
+    measure_runs: int, *, include_hits: bool, scenario="generation"
+) -> dict:
     request_ids = [f"request-{index}" for index in range(measure_runs)]
     result = {
         "warmup_runs": 2,
@@ -128,8 +128,7 @@ def _generation(measure_runs: int, *, include_hits: bool, scenario="generation")
     }
     if include_hits:
         coverages = [
-            _coverage(scenario, request_id=request_id)
-            for request_id in request_ids
+            _coverage(scenario, request_id=request_id) for request_id in request_ids
         ]
         expected = [coverage["expected_hit_count"] for coverage in coverages]
         result["per_run_wan_hybrid_hit_count"] = expected
@@ -286,12 +285,8 @@ def _performance_report(measure_runs: int = 5) -> dict:
         "server_kwargs": server_kwargs,
         "order_results": {
             run_order: {
-                "reference_generation": _generation(
-                    measure_runs, include_hits=False
-                ),
-                "candidate_generation": _generation(
-                    measure_runs, include_hits=True
-                ),
+                "reference_generation": _generation(measure_runs, include_hits=False),
+                "candidate_generation": _generation(measure_runs, include_hits=True),
                 "performance": {"wall_median_speedup": 1.01},
             }
             for run_order in ("reference-first", "candidate-first")
@@ -367,9 +362,7 @@ def _full_transformer_forward_report(
         },
     }
     capture_sampling_sha256 = hashlib.sha256(
-        json.dumps(
-            capture_sampling, sort_keys=True, separators=(",", ":")
-        ).encode()
+        json.dumps(capture_sampling, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     binding = {
         "schema_version": 1,
@@ -440,9 +433,7 @@ def _full_transformer_forward_report(
                     ],
                     "branches": [
                         {
-                            "cfg_branch_index": capture_coordinates[
-                                "cfg_branch_index"
-                            ],
+                            "cfg_branch_index": capture_coordinates["cfg_branch_index"],
                             "num_layers": 40,
                             "layer_indices": layers,
                             "eligible_layer_indices": hybrid_layers,
@@ -548,9 +539,7 @@ def test_plan_uses_two_correctness_orders_and_one_dual_order_performance(tmp_pat
             "correctness",
             "performance",
         ]
-    ports = {
-        item.command[item.command.index("--master-port") + 1] for item in plan
-    }
+    ports = {item.command[item.command.index("--master-port") + 1] for item in plan}
     assert len(ports) == 9
     assert all("--reference-attention-backend" in item.command for item in plan)
 
