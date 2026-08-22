@@ -75,6 +75,7 @@ class WanTransformerDirectRequest:
     """Minimal request identity carried by a direct qualification context."""
 
     request_id: str
+    enable_sequence_shard: bool = False
 
 
 def _sha256_json(value: Any) -> str:
