@@ -79,11 +79,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Optional component=step selection; omitted means first active call.",
     )
-    parser.add_argument("--cfg-branch-index", type=int, default=0)
-    parser.add_argument("--component-path", action="append", default=[])
     parser.add_argument(
-        "--component-attention-backend", action="append", default=[]
+        "--cfg-branch-index",
+        action="append",
+        type=int,
+        dest="cfg_branch_indices",
+        help="CFG branch to capture; repeat to capture multiple branches.",
     )
+    parser.add_argument(
+        "--all-steps",
+        action="store_true",
+        help="Capture every executed step for the selected components/branches.",
+    )
+    parser.add_argument("--component-path", action="append", default=[])
+    parser.add_argument("--component-attention-backend", action="append", default=[])
     return parser
 
 
@@ -93,16 +102,21 @@ def main() -> None:
     if len(selected_components) != len(set(selected_components)):
         raise ValueError("--component contains a duplicate component")
     components = tuple(selected_components)
-    component_steps = _parse_assignments(
-        args.component_step, option="--component-step"
-    )
+    component_steps = _parse_assignments(args.component_step, option="--component-step")
     if set(component_steps) - set(components):
         raise ValueError("--component-step selected a component not being captured")
     for component, step in component_steps.items():
         if component not in WAN_COMPONENT_NAMES or int(step) < 0:
-            raise ValueError("--component-step must use a Wan component and nonnegative step")
-    if args.cfg_branch_index < 0:
+            raise ValueError(
+                "--component-step must use a Wan component and nonnegative step"
+            )
+    cfg_branch_indices = args.cfg_branch_indices or [0]
+    if any(branch < 0 for branch in cfg_branch_indices):
         raise ValueError("--cfg-branch-index must be nonnegative")
+    if len(cfg_branch_indices) != len(set(cfg_branch_indices)):
+        raise ValueError("--cfg-branch-index contains a duplicate branch")
+    if args.all_steps and component_steps:
+        raise ValueError("--all-steps cannot be combined with --component-step")
 
     request_id = f"wan-transformer-capture-{uuid.uuid4()}"
     request_dir = Path(args.output_dir).expanduser().resolve() / request_id
@@ -124,9 +138,7 @@ def main() -> None:
         server_kwargs["attention_backend_config"] = args.attention_backend_config
     if args.transformer_weights_path:
         server_kwargs["transformer_weights_path"] = args.transformer_weights_path
-    component_paths = _parse_assignments(
-        args.component_path, option="--component-path"
-    )
+    component_paths = _parse_assignments(args.component_path, option="--component-path")
     if component_paths:
         server_kwargs["component_paths"] = component_paths
     component_backends = _parse_assignments(
@@ -153,9 +165,13 @@ def main() -> None:
         CAPTURE_DIR_ENV: str(request_dir),
         CAPTURE_REQUEST_ID_ENV: request_id,
         CAPTURE_COMPONENTS_ENV: ",".join(components),
-        CAPTURE_BRANCH_ENV: str(args.cfg_branch_index),
-        CAPTURE_STEPS_ENV: ",".join(
-            f"{component}={step}" for component, step in component_steps.items()
+        CAPTURE_BRANCH_ENV: ",".join(str(index) for index in cfg_branch_indices),
+        CAPTURE_STEPS_ENV: (
+            "*"
+            if args.all_steps
+            else ",".join(
+                f"{component}={step}" for component, step in component_steps.items()
+            )
         ),
     }
     from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
@@ -174,7 +190,7 @@ def main() -> None:
         raise RuntimeError("Wan capture result request_id does not match request")
 
     manifests = sorted(request_dir.glob("*.manifest.json"))
-    if len(manifests) != len(components):
+    if not args.all_steps and len(manifests) != len(components):
         raise RuntimeError(
             "Wan capture must produce exactly one artifact per requested component; "
             f"expected {len(components)}, found {len(manifests)}"
@@ -192,16 +208,49 @@ def main() -> None:
                 "manifest_path": str(manifest_path),
                 "manifest_sha256": manifest["manifest_sha256"],
                 "artifact_sha256": manifest["artifact"]["sha256"],
+                "capture": dict(manifest["capture"]),
             }
         )
-    if sorted(observed_components) != sorted(components):
+    if set(observed_components) != set(components):
         raise RuntimeError(
             "Wan capture components are missing or duplicated: "
             f"{observed_components}"
         )
+    coordinate_inventory = [
+        {
+            "component_name": record["component_name"],
+            **record["capture"],
+        }
+        for record in records
+    ]
+    if args.all_steps:
+        expected_coordinates = {
+            (step_index, branch_index)
+            for step_index in range(args.num_inference_steps)
+            for branch_index in cfg_branch_indices
+        }
+        actual_coordinates = {
+            (
+                record["capture"]["step_index"],
+                record["capture"]["cfg_branch_index"],
+            )
+            for record in records
+        }
+        if actual_coordinates != expected_coordinates or len(records) != len(
+            expected_coordinates
+        ):
+            raise RuntimeError(
+                "Wan all-step capture did not produce exactly one active component "
+                "artifact per requested step/branch"
+            )
     index = {
-        "schema_version": 1,
+        "schema_version": 2,
         "request_id": request_id,
+        "capture_mode": "all_steps" if args.all_steps else "selected_steps",
+        "requested_components": list(components),
+        "requested_cfg_branch_indices": cfg_branch_indices,
+        "num_inference_steps": args.num_inference_steps,
+        "coordinate_inventory": coordinate_inventory,
         "components": records,
     }
     output_index.write_text(

@@ -27,7 +27,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     iter_materialized_weights,
 )
 
-
 CAPTURE_DIR_ENV = "SGLANG_WAN_TRANSFORMER_INPUT_CAPTURE_DIR"
 CAPTURE_COMPONENTS_ENV = "SGLANG_WAN_TRANSFORMER_INPUT_CAPTURE_COMPONENTS"
 CAPTURE_BRANCH_ENV = "SGLANG_WAN_TRANSFORMER_INPUT_CAPTURE_CFG_BRANCH"
@@ -82,9 +81,7 @@ def _stable_value(value: Any, *, location: str) -> Any:
         return value
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _stable_value(dataclasses.asdict(value), location=location)
-    raise TypeError(
-        f"{location} has unsupported capture type {type(value).__name__}"
-    )
+    raise TypeError(f"{location} has unsupported capture type {type(value).__name__}")
 
 
 def _snapshot_value(value: Any, *, location: str) -> Any:
@@ -119,9 +116,7 @@ def _snapshot_value(value: Any, *, location: str) -> Any:
         ]
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
-    raise TypeError(
-        f"{location} has unsupported capture type {type(value).__name__}"
-    )
+    raise TypeError(f"{location} has unsupported capture type {type(value).__name__}")
 
 
 def _model_identity(model: torch.nn.Module) -> dict[str, Any]:
@@ -253,9 +248,7 @@ def _parse_steps(raw: str | None) -> dict[str, int]:
     for item in raw.split(","):
         component, separator, step = item.strip().partition("=")
         if separator != "=" or component not in WAN_COMPONENT_NAMES:
-            raise ValueError(
-                f"{CAPTURE_STEPS_ENV} entries must use component=step"
-            )
+            raise ValueError(f"{CAPTURE_STEPS_ENV} entries must use component=step")
         if component in result:
             raise ValueError(f"{CAPTURE_STEPS_ENV} contains duplicate components")
         try:
@@ -267,6 +260,26 @@ def _parse_steps(raw: str | None) -> dict[str, int]:
         if step_index < 0:
             raise ValueError(f"{CAPTURE_STEPS_ENV} step values must be nonnegative")
         result[component] = step_index
+    return result
+
+
+def _parse_branches(raw: str | None) -> frozenset[int]:
+    if not raw:
+        return frozenset({0})
+    branches = []
+    for item in raw.split(","):
+        try:
+            branch_index = int(item.strip())
+        except ValueError as error:
+            raise ValueError(
+                f"{CAPTURE_BRANCH_ENV} entries must be integers"
+            ) from error
+        if branch_index < 0:
+            raise ValueError(f"{CAPTURE_BRANCH_ENV} entries must be nonnegative")
+        branches.append(branch_index)
+    result = frozenset(branches)
+    if not result or len(result) != len(branches):
+        raise ValueError(f"{CAPTURE_BRANCH_ENV} must contain unique branch indices")
     return result
 
 
@@ -305,9 +318,7 @@ def load_wan_transformer_input_capture(
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             raise ValueError("Wan transformer capture component file is invalid")
         config_path = component_path / item["path"]
-        if not config_path.is_file() or _sha256_file(config_path) != item.get(
-            "sha256"
-        ):
+        if not config_path.is_file() or _sha256_file(config_path) != item.get("sha256"):
             raise ValueError(
                 "Wan transformer captured component file SHA256 is inconsistent"
             )
@@ -358,8 +369,9 @@ class WanTransformerInputCapture:
     output_dir: Path
     request_id: str
     components: frozenset[str] = frozenset(WAN_COMPONENT_NAMES)
-    cfg_branch_index: int = 0
+    cfg_branch_indices: frozenset[int] = frozenset({0})
     selected_steps: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    capture_all_steps: bool = False
 
     @classmethod
     def from_environment(cls) -> "WanTransformerInputCapture | None":
@@ -375,20 +387,18 @@ class WanTransformerInputCapture:
         components = _parse_components(
             os.environ.get(CAPTURE_COMPONENTS_ENV, ",".join(WAN_COMPONENT_NAMES))
         )
-        try:
-            branch = int(os.environ.get(CAPTURE_BRANCH_ENV, "0"))
-        except ValueError as error:
-            raise ValueError(f"{CAPTURE_BRANCH_ENV} must be an integer") from error
-        if branch < 0:
-            raise ValueError(f"{CAPTURE_BRANCH_ENV} must be nonnegative")
-        selected_steps = _parse_steps(os.environ.get(CAPTURE_STEPS_ENV))
+        branches = _parse_branches(os.environ.get(CAPTURE_BRANCH_ENV))
+        raw_steps = os.environ.get(CAPTURE_STEPS_ENV)
+        capture_all_steps = raw_steps == "*"
+        selected_steps = {} if capture_all_steps else _parse_steps(raw_steps)
         output_dir.mkdir(parents=True, exist_ok=True)
         return cls(
             output_dir=output_dir,
             request_id=request_id,
             components=components,
-            cfg_branch_index=branch,
+            cfg_branch_indices=branches,
             selected_steps=selected_steps,
+            capture_all_steps=capture_all_steps,
         )
 
     def capture(
@@ -407,7 +417,8 @@ class WanTransformerInputCapture:
             raise RuntimeError(
                 "Wan transformer capture component does not match actual model identity"
             )
-        if forward_context.wan_cfg_branch_index != self.cfg_branch_index:
+        branch_index = forward_context.wan_cfg_branch_index
+        if branch_index not in self.cfg_branch_indices:
             return None
         step_index = forward_context.current_timestep
         selected_step = self.selected_steps.get(component_name)
@@ -426,11 +437,14 @@ class WanTransformerInputCapture:
             )
         if getattr(batch, "is_warmup", False):
             return None
-        captured = getattr(batch, "_wan_transformer_input_capture_components", None)
+        captured = getattr(batch, "_wan_transformer_input_capture_keys", None)
         if captured is None:
             captured = set()
-            batch._wan_transformer_input_capture_components = captured
-        if component_name in captured:
+            batch._wan_transformer_input_capture_keys = captured
+        capture_key: str | tuple[str, int, int] = component_name
+        if self.capture_all_steps:
+            capture_key = (component_name, step_index, branch_index)
+        if capture_key in captured:
             return None
 
         snapshot = _snapshot_value(call_kwargs, location="call_kwargs")
@@ -446,7 +460,7 @@ class WanTransformerInputCapture:
 
         stem = (
             f"{_safe_request_stem(request_id)}.{component_name}."
-            f"step{step_index}.branch{self.cfg_branch_index}"
+            f"step{step_index}.branch{branch_index}"
         )
         artifact_path = self.output_dir / f"{stem}.inputs.pt"
         manifest_path = self.output_dir / f"{stem}.manifest.json"
@@ -483,7 +497,7 @@ class WanTransformerInputCapture:
             "capture": {
                 "step_index": step_index,
                 "actual_timestep": actual_timestep,
-                "cfg_branch_index": self.cfg_branch_index,
+                "cfg_branch_index": branch_index,
             },
             "input": input_summary,
             "input_sha256": input_sha256,
@@ -508,5 +522,5 @@ class WanTransformerInputCapture:
             os.replace(temporary_manifest, manifest_path)
         finally:
             temporary_manifest.unlink(missing_ok=True)
-        captured.add(component_name)
+        captured.add(capture_key)
         return manifest_path

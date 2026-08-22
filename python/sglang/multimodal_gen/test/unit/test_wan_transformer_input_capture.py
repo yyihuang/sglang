@@ -17,6 +17,11 @@ from sglang.multimodal_gen.runtime.qualification import (
     wan_transformer_capture as capture_module,
 )
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
+    CAPTURE_BRANCH_ENV,
+    CAPTURE_COMPONENTS_ENV,
+    CAPTURE_DIR_ENV,
+    CAPTURE_REQUEST_ID_ENV,
+    CAPTURE_STEPS_ENV,
     WanTransformerInputCapture,
     _model_identity,
     load_wan_transformer_input_capture,
@@ -57,9 +62,10 @@ def test_model_identity_uses_order_independent_materialized_weights(monkeypatch)
     )
     reversed_identity = _model_identity(model)
     assert identity["parameter_count"] == 5
-    assert identity["parameter_manifest_sha256"] == reversed_identity[
-        "parameter_manifest_sha256"
-    ]
+    assert (
+        identity["parameter_manifest_sha256"]
+        == reversed_identity["parameter_manifest_sha256"]
+    )
     assert qualification_model_identity(model) == identity
 
 
@@ -86,9 +92,7 @@ def test_worker_capture_round_trips_exact_call_kwargs_and_manifest(tmp_path):
     request_id = "request-a"
     component_path = tmp_path / "model" / "transformer"
     component_path.mkdir(parents=True)
-    (component_path / "config.json").write_text(
-        '{"num_layers":40}', encoding="utf-8"
-    )
+    (component_path / "config.json").write_text('{"num_layers":40}', encoding="utf-8")
     capture = WanTransformerInputCapture(
         output_dir=tmp_path / "capture",
         request_id=request_id,
@@ -129,12 +133,80 @@ def test_worker_capture_round_trips_exact_call_kwargs_and_manifest(tmp_path):
         "actual_timestep": 750,
         "cfg_branch_index": 0,
     }
-    assert manifest["input"]["hidden_states"]["stride"] == list(
-        hidden_states.stride()
-    )
+    assert manifest["input"]["hidden_states"]["stride"] == list(hidden_states.stride())
     assert len(manifest["input"]["hidden_states"]["sha256"]) == 64
     assert len(manifest["artifact"]["sha256"]) == 64
     assert json.loads(manifest_path.read_text()) == manifest
+
+
+def test_worker_capture_records_every_selected_step_and_branch(tmp_path, monkeypatch):
+    request_id = "request-all-steps"
+    component_path = tmp_path / "model" / "transformer"
+    component_path.mkdir(parents=True)
+    (component_path / "config.json").write_text('{"num_layers":40}', encoding="utf-8")
+    capture_dir = tmp_path / "capture"
+    monkeypatch.setenv(CAPTURE_DIR_ENV, str(capture_dir))
+    monkeypatch.setenv(CAPTURE_REQUEST_ID_ENV, request_id)
+    monkeypatch.setenv(CAPTURE_COMPONENTS_ENV, "transformer")
+    monkeypatch.setenv(CAPTURE_BRANCH_ENV, "0,1")
+    monkeypatch.setenv(CAPTURE_STEPS_ENV, "*")
+    capture = WanTransformerInputCapture.from_environment()
+    assert capture is not None
+    assert capture.capture_all_steps is True
+    assert capture.cfg_branch_indices == frozenset({0, 1})
+    batch = _batch(request_id)
+
+    manifest_paths = []
+    for step_index in range(2):
+        for branch_index in range(2):
+            manifest_paths.append(
+                capture.capture(
+                    current_model=_Model(),
+                    call_kwargs={
+                        "hidden_states": torch.tensor(
+                            [step_index, branch_index], dtype=torch.bfloat16
+                        )
+                    },
+                    component_name="transformer",
+                    component_model_path=component_path,
+                    model_root=component_path.parent,
+                    forward_context=ForwardContext(
+                        current_timestep=step_index,
+                        attn_metadata=None,
+                        forward_batch=batch,
+                        wan_component_name="transformer",
+                        wan_actual_timestep=999 - step_index,
+                        wan_cfg_branch_index=branch_index,
+                    ),
+                )
+            )
+
+    assert all(path is not None for path in manifest_paths)
+    assert len(list(capture_dir.glob("*.manifest.json"))) == 4
+    coordinates = {
+        tuple(
+            load_wan_transformer_input_capture(path)[1]["capture"][name]
+            for name in ("step_index", "cfg_branch_index")
+        )
+        for path in manifest_paths
+    }
+    assert coordinates == {(0, 0), (0, 1), (1, 0), (1, 1)}
+    duplicate = capture.capture(
+        current_model=_Model(),
+        call_kwargs={"hidden_states": torch.ones(1)},
+        component_name="transformer",
+        component_model_path=component_path,
+        model_root=component_path.parent,
+        forward_context=ForwardContext(
+            current_timestep=1,
+            attn_metadata=None,
+            forward_batch=batch,
+            wan_component_name="transformer",
+            wan_actual_timestep=998,
+            wan_cfg_branch_index=1,
+        ),
+    )
+    assert duplicate is None
 
 
 def test_predict_noise_captures_complete_kwargs_before_actual_model_call(tmp_path):
