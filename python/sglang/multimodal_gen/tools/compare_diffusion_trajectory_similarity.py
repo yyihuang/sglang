@@ -77,6 +77,38 @@ def validate_qualification_protocol(
         raise ValueError("Invalid qualification protocol: " + "; ".join(failures))
 
 
+def validate_server_port_isolation(
+    *,
+    master_port: int | None,
+    reference_scheduler_port: int | None,
+    candidate_scheduler_port: int | None,
+    enforce_qualification: bool,
+) -> None:
+    ports = {
+        "master_port": master_port,
+        "reference_scheduler_port": reference_scheduler_port,
+        "candidate_scheduler_port": candidate_scheduler_port,
+    }
+    for name, port in ports.items():
+        if port is not None and (
+            isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError(f"{name} must be an integer within [1, 65535]")
+    if enforce_qualification:
+        missing = [name for name, port in ports.items() if port is None]
+        if missing:
+            raise ValueError(
+                "qualification requires explicit isolated ports: " + ", ".join(missing)
+            )
+    configured = [port for port in ports.values() if port is not None]
+    if len(configured) != len(set(configured)):
+        raise ValueError(
+            "master, reference scheduler, and candidate scheduler ports must be distinct"
+        )
+
+
 def parse_component_overrides(entries: Sequence[str] | None) -> dict[str, str]:
     overrides: dict[str, str] = {}
     for entry in entries or []:
@@ -994,6 +1026,13 @@ def build_qualification_provenance(
             "reference": reference_server_kwargs,
             "candidate": candidate_server_kwargs,
         },
+        "port_isolation": {
+            "master_port": reference_server_kwargs.get("master_port"),
+            "reference_scheduler_port": reference_server_kwargs.get("scheduler_port"),
+            "candidate_scheduler_port": candidate_server_kwargs.get("scheduler_port"),
+            "reference_strict_ports": reference_server_kwargs.get("strict_ports"),
+            "candidate_strict_ports": candidate_server_kwargs.get("strict_ports"),
+        },
     }
 
 
@@ -1025,6 +1064,10 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
     }
     if args.master_port is not None:
         kwargs["master_port"] = args.master_port
+    scheduler_port = getattr(args, f"{variant}_scheduler_port", None)
+    if scheduler_port is not None:
+        kwargs["scheduler_port"] = scheduler_port
+        kwargs["strict_ports"] = True
     if args.sp_degree is not None:
         kwargs["sp_degree"] = args.sp_degree
     if transformer_path is not None:
@@ -1348,6 +1391,16 @@ def main() -> None:
         type=int,
         help="Optional distributed master port used by both sequential variants.",
     )
+    parser.add_argument(
+        "--reference-scheduler-port",
+        type=int,
+        help="Explicit scheduler port for the reference variant.",
+    )
+    parser.add_argument(
+        "--candidate-scheduler-port",
+        type=int,
+        help="Explicit scheduler port for the candidate variant.",
+    )
     parser.add_argument("--ulysses-degree", type=int, default=1)
     parser.add_argument("--sp-degree", type=int)
     parser.add_argument("--trajectory-step-index", type=int, default=-1)
@@ -1490,6 +1543,12 @@ def main() -> None:
         run_order=args.run_order,
         warmup_runs=args.warmup_runs,
         measure_runs=args.measure_runs,
+    )
+    validate_server_port_isolation(
+        master_port=args.master_port,
+        reference_scheduler_port=args.reference_scheduler_port,
+        candidate_scheduler_port=args.candidate_scheduler_port,
+        enforce_qualification=args.enforce_qualification,
     )
 
     output_json = Path(args.output_json).expanduser().resolve()

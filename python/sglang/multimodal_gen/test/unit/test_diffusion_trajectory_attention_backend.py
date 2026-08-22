@@ -27,6 +27,7 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     summarize_result_output,
     summarize_run_repeatability,
     validate_qualification_protocol,
+    validate_server_port_isolation,
 )
 
 
@@ -37,6 +38,8 @@ def _args(**overrides):
         "backend": "sglang",
         "num_gpus": 1,
         "master_port": None,
+        "reference_scheduler_port": None,
+        "candidate_scheduler_port": None,
         "dit_cpu_offload": False,
         "dit_layerwise_offload": False,
         "text_encoder_cpu_offload": False,
@@ -77,6 +80,46 @@ def test_build_server_kwargs_forwards_master_port():
 
     assert build_server_kwargs(args, variant="reference")["master_port"] == 31005
     assert build_server_kwargs(args, variant="candidate")["master_port"] == 31005
+
+
+def test_build_server_kwargs_forwards_isolated_scheduler_ports():
+    args = _args(
+        master_port=31005,
+        reference_scheduler_port=56000,
+        candidate_scheduler_port=56001,
+    )
+
+    reference = build_server_kwargs(args, variant="reference")
+    candidate = build_server_kwargs(args, variant="candidate")
+
+    assert reference["scheduler_port"] == 56000
+    assert candidate["scheduler_port"] == 56001
+    assert reference["strict_ports"] is True
+    assert candidate["strict_ports"] is True
+
+
+def test_validate_server_port_isolation_requires_distinct_explicit_ports():
+    validate_server_port_isolation(
+        master_port=31005,
+        reference_scheduler_port=56000,
+        candidate_scheduler_port=56001,
+        enforce_qualification=True,
+    )
+
+    with pytest.raises(ValueError, match="requires explicit isolated ports"):
+        validate_server_port_isolation(
+            master_port=31005,
+            reference_scheduler_port=None,
+            candidate_scheduler_port=56001,
+            enforce_qualification=True,
+        )
+    with pytest.raises(ValueError, match="must be distinct"):
+        validate_server_port_isolation(
+            master_port=31005,
+            reference_scheduler_port=56000,
+            candidate_scheduler_port=56000,
+            enforce_qualification=True,
+        )
 
 
 def test_build_server_kwargs_omits_unspecified_attention_backend():
