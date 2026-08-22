@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -77,6 +78,44 @@ class _TinyWanTransformer(nn.Module):
         for block in blocks:
             hidden_states = block(hidden_states)
         return hidden_states + self.output_offset
+
+
+class _AutocastWanTransformer(_TinyWanTransformer):
+    def __init__(self):
+        super().__init__()
+        self.condition = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, hidden_states, encoder_hidden_states, timestep=None):
+        conditioned = self.condition(encoder_hidden_states)
+        return super().forward(hidden_states + conditioned, timestep=timestep)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA autocast")
+def test_direct_forward_replays_production_cuda_bf16_autocast():
+    model = _AutocastWanTransformer().cuda()
+    fixed_input = {
+        "hidden_states": torch.ones(1, 2, dtype=torch.bfloat16, device="cuda"),
+        "encoder_hidden_states": torch.ones(
+            1, 2, dtype=torch.float32, device="cuda"
+        ),
+        "timestep": torch.tensor([999], device="cuda"),
+    }
+
+    with pytest.raises(RuntimeError, match="same dtype"):
+        with torch.autocast(device_type="cuda", enabled=False):
+            model(**fixed_input)
+
+    trace = capture_wan_transformer_forward(
+        model,
+        fixed_input=fixed_input,
+        request_id="autocast-request",
+        component_name="transformer",
+        step_index=0,
+        actual_timestep=999,
+        cfg_branch_index=0,
+    )
+    assert len(trace.block_outputs) == 40
+    assert torch.isfinite(trace.output).all()
 
 
 def _component_path(tmp_path, component_name: str):

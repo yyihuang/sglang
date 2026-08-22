@@ -211,9 +211,20 @@ def capture_wan_transformer_forward(
 
     hooks = [block.register_forward_hook(record_block_output) for block in blocks]
     collector = WanHybridEvidenceCollector(request_id=request_id)
+    hidden_states = fixed_input.get("hidden_states")
+    cuda_bf16_autocast = (
+        isinstance(hidden_states, torch.Tensor)
+        and hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+    )
     try:
         with (
             torch.inference_mode(),
+            torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=cuda_bf16_autocast,
+            ),
             set_forward_context(
                 current_timestep=step_index,
                 attn_metadata=None,
