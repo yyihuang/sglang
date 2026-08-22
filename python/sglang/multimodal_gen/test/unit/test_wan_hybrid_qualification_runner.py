@@ -15,6 +15,7 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     _module_git_revision,
 )
 from sglang.multimodal_gen.tools.run_wan_hybrid_qualification import (
+    WAN_HYBRID_DEFAULT_LAYER_INDICES,
     WanQualificationConfig,
     _parse_args,
     build_qualification_plan,
@@ -60,8 +61,10 @@ def _coverage(
             if scenario == "generation" or (
                 scenario == "full-transformer" and component == "transformer"
             ):
-                eligible = expected_layers
-                fallback = []
+                eligible = WAN_HYBRID_DEFAULT_LAYER_INDICES
+                fallback = [
+                    index for index in expected_layers if index not in eligible
+                ]
                 control = []
             elif scenario == "single-block":
                 eligible = [0]
@@ -248,8 +251,8 @@ def _correctness_report(run_order: str, measure_runs: int = 5) -> dict:
                     "candidate_hit_count_equals_expected": True,
                     "expected_hit_count_min_exclusive": 0,
                 },
-                "expected_hit_counts": [960] * measure_runs,
-                "actual_hit_counts": [960] * measure_runs,
+                "expected_hit_counts": [24] * measure_runs,
+                "actual_hit_counts": [24] * measure_runs,
             },
         },
     }
@@ -415,7 +418,8 @@ def _full_transformer_forward_report(
     def direct_coverage(variant: str, request_id: str) -> dict:
         candidate = variant == "candidate"
         layers = list(range(40))
-        hits = 40 if candidate else 0
+        hybrid_layers = WAN_HYBRID_DEFAULT_LAYER_INDICES if candidate else []
+        hits = len(hybrid_layers)
         return {
             "schema_version": 2,
             "request_id": request_id,
@@ -441,16 +445,20 @@ def _full_transformer_forward_report(
                             ],
                             "num_layers": 40,
                             "layer_indices": layers,
-                            "eligible_layer_indices": layers if candidate else [],
-                            "planned_hybrid_layer_indices": (
-                                layers if candidate else []
-                            ),
-                            "successful_hybrid_layer_indices": (
-                                layers if candidate else []
-                            ),
+                            "eligible_layer_indices": hybrid_layers,
+                            "planned_hybrid_layer_indices": hybrid_layers,
+                            "successful_hybrid_layer_indices": hybrid_layers,
                             "eligible_hybrid_miss_layer_indices": [],
                             "unexpected_successful_hybrid_layer_indices": [],
-                            "configured_fallback_layer_indices": [],
+                            "configured_fallback_layer_indices": (
+                                [
+                                    index
+                                    for index in layers
+                                    if index not in hybrid_layers
+                                ]
+                                if candidate
+                                else []
+                            ),
                             "control_layer_indices": [] if candidate else layers,
                             "expected_hit_count": hits,
                             "actual_hit_count": hits,
@@ -469,8 +477,9 @@ def _full_transformer_forward_report(
         "evidence_binding": binding,
         "invocation_input_sha256": binding["fixed_input_sha256"],
         "num_blocks": 40,
-        "candidate_per_run_wan_hybrid_hit_count": [40] * measure_runs,
-        "candidate_per_run_wan_hybrid_expected_hit_count": [40] * measure_runs,
+        "candidate_wan_hybrid_layer_indices": WAN_HYBRID_DEFAULT_LAYER_INDICES,
+        "candidate_per_run_wan_hybrid_hit_count": [1] * measure_runs,
+        "candidate_per_run_wan_hybrid_expected_hit_count": [1] * measure_runs,
         "reference_per_run_request_id": request_ids["reference"],
         "candidate_per_run_request_id": request_ids["candidate"],
         "reference_per_run_wan_hybrid_coverage": [
@@ -510,8 +519,8 @@ def _full_transformer_forward_report(
                     "candidate_hit_count_equals_expected": True,
                     "expected_hit_count_min_exclusive": 0,
                 },
-                "expected_hit_counts": [40] * measure_runs,
-                "actual_hit_counts": [40] * measure_runs,
+                "expected_hit_counts": [1] * measure_runs,
+                "actual_hit_counts": [1] * measure_runs,
             },
             "request_local_backend_coverage": {
                 "passed": True,

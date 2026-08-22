@@ -32,6 +32,7 @@ from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
 QUALIFICATION_SCENARIOS = ("single-block", "full-transformer", "generation")
 QUALIFICATION_MODES = ("correctness", "performance")
 WAN_TRANSFORMER_COMPONENTS = ("transformer", "transformer_2")
+WAN_HYBRID_DEFAULT_LAYER_INDICES = [39]
 SCENARIO_EVIDENCE_SCOPES = {
     "single-block": "generation-trajectory-selected-transformer-block",
     "full-transformer": "generation-trajectory-primary-transformer-component",
@@ -551,8 +552,12 @@ def _validate_wan_hybrid_coverage(
             if scenario == "generation" or (
                 scenario == "full-transformer" and component == "transformer"
             ):
-                expected_eligible = expected_layers
-                expected_fallback = []
+                expected_eligible = WAN_HYBRID_DEFAULT_LAYER_INDICES
+                expected_fallback = [
+                    index
+                    for index in expected_layers
+                    if index not in expected_eligible
+                ]
                 expected_control = []
             elif scenario == "single-block":
                 expected_eligible = [0]

@@ -36,20 +36,27 @@ from sglang.multimodal_gen.tools.run_wan_transformer_forward_report import (
 
 
 class _AddBlock(nn.Module):
-    def __init__(self, value: float, layer_index: int, hybrid: bool):
+    def __init__(
+        self,
+        value: float,
+        layer_index: int,
+        hybrid_configured: bool,
+        eligible_for_hybrid: bool,
+    ):
         super().__init__()
         self.value = value
         self.layer_index = layer_index
-        self.hybrid = hybrid
+        self.hybrid_configured = hybrid_configured
+        self.eligible_for_hybrid = eligible_for_hybrid
 
     def forward(self, hidden_states):
         record_wan_attention_route(
             layer_index=self.layer_index,
-            hybrid_configured=self.hybrid,
-            eligible_for_hybrid=self.hybrid,
+            hybrid_configured=self.hybrid_configured,
+            eligible_for_hybrid=self.eligible_for_hybrid,
         )
         output = hidden_states + self.value
-        if self.hybrid:
+        if self.eligible_for_hybrid:
             output = _record_successful_wan_hybrid_forward(
                 output, layer_index=self.layer_index
             )
@@ -63,14 +70,31 @@ class _TinyWanTransformer(nn.Module):
         output_offset: float = 0.0,
         skip_last: bool = False,
         hybrid: bool = False,
+        hybrid_layer_indices: tuple[int, ...] | None = None,
     ):
         super().__init__()
+        selected_hybrid_layers = (
+            frozenset({39})
+            if hybrid and hybrid_layer_indices is None
+            else frozenset(hybrid_layer_indices or ())
+        )
         self.blocks = nn.ModuleList(
-            [_AddBlock(0.01, index, hybrid) for index in range(40)]
+            [
+                _AddBlock(
+                    0.01,
+                    index,
+                    hybrid_configured=hybrid,
+                    eligible_for_hybrid=index in selected_hybrid_layers,
+                )
+                for index in range(40)
+            ]
         )
         self.output_offset = output_offset
         self.skip_last = skip_last
         self.hybrid = hybrid
+        self.wan_hybrid_layer_indices = (
+            selected_hybrid_layers if hybrid else None
+        )
         self.config = {"num_layers": 40}
         self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
         self.input_ids = []
@@ -304,8 +328,9 @@ def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
         "fixed_input_sha256"
     ]
     assert report["num_blocks"] == 40
-    assert report["candidate_per_run_wan_hybrid_hit_count"] == [40] * 5
-    assert report["candidate_per_run_wan_hybrid_expected_hit_count"] == [40] * 5
+    assert report["candidate_wan_hybrid_layer_indices"] == [39]
+    assert report["candidate_per_run_wan_hybrid_hit_count"] == [1] * 5
+    assert report["candidate_per_run_wan_hybrid_expected_hit_count"] == [1] * 5
     assert len(set(report["reference_per_run_request_id"])) == 5
     assert len(set(report["candidate_per_run_request_id"])) == 5
     assert not set(report["reference_per_run_request_id"]) & set(
@@ -319,9 +344,9 @@ def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
         for coverage in report["reference_per_run_wan_hybrid_coverage"]
     )
     assert all(
-        coverage["expected_hit_count"] == 40
-        and coverage["actual_hit_count"] == 40
-        and coverage["attributed_actual_hit_count"] == 40
+        coverage["expected_hit_count"] == 1
+        and coverage["actual_hit_count"] == 1
+        and coverage["attributed_actual_hit_count"] == 1
         and coverage["unattributed_actual_hit_count"] == 0
         and coverage["eligible_hybrid_miss_count"] == 0
         for coverage in report["candidate_per_run_wan_hybrid_coverage"]
@@ -361,8 +386,30 @@ def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
     errors = validate_wan_transformer_forward_report(report)
 
     assert any("run-pair coverage" in error for error in errors)
-    assert "every measured candidate hit count must equal expected depth 40" in errors
+    assert (
+        "every measured candidate hit count must equal the configured depth" in errors
+    )
     assert any("capture coordinates" in error for error in errors)
+
+
+def test_full_transformer_forward_preserves_explicit_multi_layer_override(tmp_path):
+    reference = _TinyWanTransformer()
+    candidate = _TinyWanTransformer(
+        hybrid=True, hybrid_layer_indices=(35, 39)
+    )
+    hidden_states = torch.tensor([[1.0, 2.0]])
+    manifest = _capture_manifest(tmp_path, "transformer", hidden_states)
+
+    report = run_wan_transformer_forward_qualification(
+        reference_model=reference,
+        candidate_model=candidate,
+        capture_manifest_path=manifest,
+    )
+
+    assert report["candidate_wan_hybrid_layer_indices"] == [35, 39]
+    assert report["candidate_per_run_wan_hybrid_hit_count"] == [2] * 5
+    assert report["candidate_per_run_wan_hybrid_expected_hit_count"] == [2] * 5
+    assert validate_wan_transformer_forward_report(report) == []
 
 
 def test_full_transformer_report_cannot_be_relabelled(tmp_path):

@@ -8,6 +8,7 @@ from torch import nn
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanSelfAttention,
     WanTransformer3DModel,
+    _resolve_wan_hybrid_layer_indices,
     _use_wan_hybrid_for_timestep,
     _validate_wan_hybrid_layer_indices,
     _validate_wan_hybrid_min_timestep,
@@ -42,6 +43,42 @@ class TestWanAttentionBackendRole(unittest.TestCase):
         for invalid in (True, 1, "0", [False], [1.0], [-1], [40], [3, 3]):
             with self.subTest(invalid=invalid), pytest.raises(ValueError):
                 _validate_wan_hybrid_layer_indices(invalid, 40)
+
+    def test_wan_hybrid_layer_indices_default_and_explicit_override(self):
+        self.assertEqual(
+            _resolve_wan_hybrid_layer_indices(
+                None,
+                40,
+                explicitly_configured=False,
+                wan_hybrid_enabled=True,
+            ),
+            frozenset({39}),
+        )
+        self.assertEqual(
+            _resolve_wan_hybrid_layer_indices(
+                [35, 39],
+                40,
+                explicitly_configured=True,
+                wan_hybrid_enabled=True,
+            ),
+            frozenset({35, 39}),
+        )
+        self.assertIsNone(
+            _resolve_wan_hybrid_layer_indices(
+                None,
+                40,
+                explicitly_configured=True,
+                wan_hybrid_enabled=True,
+            )
+        )
+        self.assertIsNone(
+            _resolve_wan_hybrid_layer_indices(
+                None,
+                40,
+                explicitly_configured=False,
+                wan_hybrid_enabled=False,
+            )
+        )
 
     def test_wan_hybrid_is_admitted_for_wan_self_attention_only(self):
         self.assertIn(

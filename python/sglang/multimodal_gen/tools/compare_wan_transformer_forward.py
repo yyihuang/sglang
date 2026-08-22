@@ -428,11 +428,13 @@ def _direct_coverage_failure(
     trace: WanTransformerForwardTrace,
     *,
     variant: str,
+    candidate_layer_indices: Sequence[int],
 ) -> dict[str, Any] | None:
     coverage = trace.wan_hybrid_coverage
     expected_layers = list(range(len(trace.block_outputs)))
     candidate = variant == "candidate"
-    expected_hits = len(expected_layers) if candidate else 0
+    expected_hybrid_layers = list(candidate_layer_indices) if candidate else []
+    expected_hits = len(expected_hybrid_layers)
     expected_successes = expected_hits
     if coverage.get("request_id") != trace.request_id:
         return {"variant": variant, "reason": "request_id_mismatch"}
@@ -485,12 +487,16 @@ def _direct_coverage_failure(
         "cfg_branch_index": trace.cfg_branch_index,
         "num_layers": len(expected_layers),
         "layer_indices": expected_layers,
-        "eligible_layer_indices": expected_layers if candidate else [],
-        "planned_hybrid_layer_indices": expected_layers if candidate else [],
-        "successful_hybrid_layer_indices": expected_layers if candidate else [],
+        "eligible_layer_indices": expected_hybrid_layers,
+        "planned_hybrid_layer_indices": expected_hybrid_layers,
+        "successful_hybrid_layer_indices": expected_hybrid_layers,
         "eligible_hybrid_miss_layer_indices": [],
         "unexpected_successful_hybrid_layer_indices": [],
-        "configured_fallback_layer_indices": [],
+        "configured_fallback_layer_indices": (
+            [index for index in expected_layers if index not in expected_hybrid_layers]
+            if candidate
+            else []
+        ),
         "control_layer_indices": [] if candidate else expected_layers,
         "expected_hit_count": expected_hits,
         "actual_hit_count": expected_hits,
@@ -537,6 +543,8 @@ def _warmup_wan_transformer_forward(
 def evaluate_transformer_forward_correctness(
     reference_traces: Sequence[WanTransformerForwardTrace],
     candidate_traces: Sequence[WanTransformerForwardTrace],
+    *,
+    candidate_layer_indices: Sequence[int],
 ) -> dict[str, Any]:
     cross_variant = summarize_transformer_forward_cross_variant(
         reference_traces, candidate_traces
@@ -557,7 +565,7 @@ def evaluate_transformer_forward_correctness(
     }
     hit_qualification = evaluate_candidate_backend_hit_qualification(
         [trace.wan_hybrid_hit_count for trace in candidate_traces],
-        [len(trace.block_outputs) for trace in candidate_traces],
+        [len(candidate_layer_indices)] * len(candidate_traces),
     )
     qualification = qualification | {
         "passed": qualification["passed"] and hit_qualification["passed"],
@@ -575,8 +583,16 @@ def evaluate_transformer_forward_correctness(
             ("candidate", candidate_traces),
         )
         for trace in variant_traces
-        if (failure := _direct_coverage_failure(trace, variant=variant))
-        is not None
+        if (
+            (
+                failure := _direct_coverage_failure(
+                    trace,
+                    variant=variant,
+                    candidate_layer_indices=candidate_layer_indices,
+                )
+            )
+            is not None
+        )
     ]
     qualification = qualification | {
         "passed": qualification["passed"] and not coverage_failures,
@@ -811,8 +827,18 @@ def run_wan_transformer_forward_qualification(
     if evidence_binding["fixed_input_sha256"] != invocation_input_sha256:
         raise RuntimeError("full-transformer forward mutated the fixed input")
 
+    candidate_layer_indices_value = getattr(
+        candidate_model, "wan_hybrid_layer_indices", None
+    )
+    candidate_layer_indices = (
+        list(range(len(traces["candidate"][0].block_outputs)))
+        if candidate_layer_indices_value is None
+        else sorted(candidate_layer_indices_value)
+    )
     result = evaluate_transformer_forward_correctness(
-        traces["reference"], traces["candidate"]
+        traces["reference"],
+        traces["candidate"],
+        candidate_layer_indices=candidate_layer_indices,
     )
     return {
         "comparison_mode": "correctness",
@@ -824,6 +850,7 @@ def run_wan_transformer_forward_qualification(
         "evidence_binding": evidence_binding,
         "invocation_input_sha256": invocation_input_sha256,
         "num_blocks": len(traces["reference"][0].block_outputs),
+        "candidate_wan_hybrid_layer_indices": candidate_layer_indices,
         "candidate_per_run_wan_hybrid_expected_hit_count": [
             trace.wan_hybrid_coverage["expected_hit_count"]
             for trace in traces["candidate"]
@@ -989,6 +1016,20 @@ def validate_wan_transformer_forward_report(
         or num_blocks != 40
     ):
         errors.append("num_blocks must equal the Wan serving depth of 40")
+    candidate_layer_indices = report.get("candidate_wan_hybrid_layer_indices")
+    if (
+        not isinstance(candidate_layer_indices, list)
+        or not candidate_layer_indices
+        or any(
+            isinstance(index, bool) or not isinstance(index, int)
+            for index in candidate_layer_indices
+        )
+        or candidate_layer_indices != sorted(set(candidate_layer_indices))
+        or any(not 0 <= index < 40 for index in candidate_layer_indices)
+    ):
+        errors.append("candidate Wan hybrid layer indices are invalid")
+        candidate_layer_indices = []
+    candidate_expected_hits = len(candidate_layer_indices)
 
     expected_cross_pairs = set(
         itertools.product(
@@ -1083,10 +1124,15 @@ def validate_wan_transformer_forward_report(
         or len(hit_counts) != expected_measure_runs
         or not isinstance(expected_hit_counts, list)
         or len(expected_hit_counts) != expected_measure_runs
-        or any(hit_count != 40 for hit_count in hit_counts)
-        or any(expected_hit_count != 40 for expected_hit_count in expected_hit_counts)
+        or any(hit_count != candidate_expected_hits for hit_count in hit_counts)
+        or any(
+            expected_hit_count != candidate_expected_hits
+            for expected_hit_count in expected_hit_counts
+        )
     ):
-        errors.append("every measured candidate hit count must equal expected depth 40")
+        errors.append(
+            "every measured candidate hit count must equal the configured depth"
+        )
 
     request_ids_by_variant = {}
     coverages_by_variant = {}
@@ -1112,7 +1158,8 @@ def validate_wan_transformer_forward_report(
         errors.append("reference and candidate request IDs overlap")
     for variant, coverages in coverages_by_variant.items():
         candidate = variant == "candidate"
-        expected_hits = 40 if candidate else 0
+        expected_hybrid_layers = candidate_layer_indices if candidate else []
+        expected_hits = len(expected_hybrid_layers)
         for run_index, coverage in enumerate(coverages):
             location = f"{variant}_per_run_wan_hybrid_coverage[{run_index}]"
             if not isinstance(coverage, dict):
@@ -1174,16 +1221,20 @@ def validate_wan_transformer_forward_report(
                 ],
                 "num_layers": 40,
                 "layer_indices": expected_layers,
-                "eligible_layer_indices": expected_layers if candidate else [],
-                "planned_hybrid_layer_indices": (
-                    expected_layers if candidate else []
-                ),
-                "successful_hybrid_layer_indices": (
-                    expected_layers if candidate else []
-                ),
+                "eligible_layer_indices": expected_hybrid_layers,
+                "planned_hybrid_layer_indices": expected_hybrid_layers,
+                "successful_hybrid_layer_indices": expected_hybrid_layers,
                 "eligible_hybrid_miss_layer_indices": [],
                 "unexpected_successful_hybrid_layer_indices": [],
-                "configured_fallback_layer_indices": [],
+                "configured_fallback_layer_indices": (
+                    [
+                        index
+                        for index in expected_layers
+                        if index not in expected_hybrid_layers
+                    ]
+                    if candidate
+                    else []
+                ),
                 "control_layer_indices": [] if candidate else expected_layers,
                 "expected_hit_count": expected_hits,
                 "actual_hit_count": expected_hits,
@@ -1208,8 +1259,8 @@ def validate_wan_transformer_forward_report(
             "candidate_hit_count_equals_expected": True,
             "expected_hit_count_min_exclusive": 0,
         },
-        "expected_hit_counts": [40] * expected_measure_runs,
-        "actual_hit_counts": [40] * expected_measure_runs,
+        "expected_hit_counts": [candidate_expected_hits] * expected_measure_runs,
+        "actual_hit_counts": [candidate_expected_hits] * expected_measure_runs,
         "failures": [],
     }:
         errors.append("candidate backend-hit qualification is incomplete")

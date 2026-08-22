@@ -78,6 +78,7 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+WAN_HYBRID_DEFAULT_LAYER_INDICES = (39,)
 
 
 def _validate_wan_hybrid_min_timestep(value: Any) -> float | None:
@@ -113,6 +114,23 @@ def _validate_wan_hybrid_layer_indices(
     if len(indices) != len(set(indices)):
         raise ValueError("wan_hybrid_layer_indices must not contain duplicates")
     return frozenset(indices)
+
+
+def _resolve_wan_hybrid_layer_indices(
+    value: Any,
+    num_layers: int,
+    *,
+    explicitly_configured: bool,
+    wan_hybrid_enabled: bool,
+) -> frozenset[int] | None:
+    validated = _validate_wan_hybrid_layer_indices(value, num_layers)
+    if not wan_hybrid_enabled:
+        return None
+    if explicitly_configured:
+        return validated
+    return _validate_wan_hybrid_layer_indices(
+        WAN_HYBRID_DEFAULT_LAYER_INDICES, num_layers
+    )
 
 
 def _use_wan_hybrid_for_timestep(
@@ -1068,9 +1086,11 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.wan_hybrid_min_timestep = _validate_wan_hybrid_min_timestep(
             attention_backend_config.get("wan_hybrid_min_timestep")
         )
-        self.wan_hybrid_layer_indices = _validate_wan_hybrid_layer_indices(
-            attention_backend_config.get("wan_hybrid_layer_indices"),
-            config.num_layers,
+        wan_hybrid_layer_indices_explicit = (
+            "wan_hybrid_layer_indices" in attention_backend_config
+        )
+        configured_wan_hybrid_layer_indices = attention_backend_config.get(
+            "wan_hybrid_layer_indices"
         )
 
         # 1. Patch & position embedding
@@ -1121,11 +1141,16 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             == AttentionBackendEnum.WAN_HYBRID
             for block in self.blocks
         )
+        self.wan_hybrid_layer_indices = _resolve_wan_hybrid_layer_indices(
+            configured_wan_hybrid_layer_indices,
+            config.num_layers,
+            explicitly_configured=wan_hybrid_layer_indices_explicit,
+            wan_hybrid_enabled=uses_wan_hybrid,
+        )
         if not uses_wan_hybrid:
             # Component-scoped FA models share the server configuration with the
             # component. Avoid a needless timestep device synchronization.
             self.wan_hybrid_min_timestep = None
-            self.wan_hybrid_layer_indices = None
         else:
             route_parts = []
             if self.wan_hybrid_min_timestep is not None:
