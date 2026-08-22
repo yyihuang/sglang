@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import 
     WanTransformerInputCapture,
 )
 from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
+    _model_device,
+    _move_fixed_input_to_model,
+    _warmup_wan_transformer_forward,
     build_wan_transformer_evidence_binding,
     capture_wan_transformer_forward,
     run_wan_transformer_forward_qualification,
@@ -105,6 +108,15 @@ def test_direct_forward_replays_production_cuda_bf16_autocast():
         with torch.autocast(device_type="cuda", enabled=False):
             model(**fixed_input)
 
+    _warmup_wan_transformer_forward(
+        model,
+        fixed_input=fixed_input,
+        request_id="autocast-warmup-request",
+        component_name="transformer",
+        step_index=0,
+        actual_timestep=999,
+        cfg_branch_index=0,
+    )
     trace = capture_wan_transformer_forward(
         model,
         fixed_input=fixed_input,
@@ -116,6 +128,31 @@ def test_direct_forward_replays_production_cuda_bf16_autocast():
     )
     assert len(trace.block_outputs) == 40
     assert torch.isfinite(trace.output).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA input")
+def test_layerwise_offloaded_model_uses_local_execution_device(monkeypatch):
+    model = _TinyWanTransformer()
+    assert model._device_anchor.device.type == "cpu"
+    expected = torch.device("cuda", torch.cuda.current_device())
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.tools.compare_wan_transformer_forward."
+        "is_layerwise_offloaded_module",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.tools.compare_wan_transformer_forward."
+        "get_local_torch_device",
+        lambda: expected,
+    )
+
+    fixed_input = {"hidden_states": torch.ones(1, 2)}
+    moved_input = _move_fixed_input_to_model(
+        fixed_input, device=_model_device(model)
+    )
+
+    assert moved_input["hidden_states"].device == expected
+    assert fixed_input["hidden_states"].device.type == "cpu"
 
 
 def _component_path(tmp_path, component_name: str):

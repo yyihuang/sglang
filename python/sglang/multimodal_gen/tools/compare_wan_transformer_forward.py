@@ -19,14 +19,19 @@ import itertools
 import json
 import uuid
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
     WanHybridEvidenceCollector,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
@@ -183,6 +188,24 @@ def _snapshot_tensor(value: Any, *, location: str) -> torch.Tensor:
     return tensor.detach().cpu().clone()
 
 
+def _wan_transformer_autocast_context(
+    fixed_input: Mapping[str, Any],
+) -> AbstractContextManager:
+    """Replay the production BF16 denoising autocast for captured CUDA input."""
+
+    hidden_states = fixed_input.get("hidden_states")
+    enabled = (
+        isinstance(hidden_states, torch.Tensor)
+        and hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+    )
+    return torch.autocast(
+        device_type="cuda",
+        dtype=torch.bfloat16,
+        enabled=enabled,
+    )
+
+
 def capture_wan_transformer_forward(
     model: Any,
     *,
@@ -211,20 +234,10 @@ def capture_wan_transformer_forward(
 
     hooks = [block.register_forward_hook(record_block_output) for block in blocks]
     collector = WanHybridEvidenceCollector(request_id=request_id)
-    hidden_states = fixed_input.get("hidden_states")
-    cuda_bf16_autocast = (
-        isinstance(hidden_states, torch.Tensor)
-        and hidden_states.is_cuda
-        and hidden_states.dtype == torch.bfloat16
-    )
     try:
         with (
             torch.inference_mode(),
-            torch.autocast(
-                device_type="cuda",
-                dtype=torch.bfloat16,
-                enabled=cuda_bf16_autocast,
-            ),
+            _wan_transformer_autocast_context(fixed_input),
             set_forward_context(
                 current_timestep=step_index,
                 attn_metadata=None,
@@ -507,6 +520,7 @@ def _warmup_wan_transformer_forward(
     collector = WanHybridEvidenceCollector(request_id=request_id)
     with (
         torch.inference_mode(),
+        _wan_transformer_autocast_context(fixed_input),
         set_forward_context(
             current_timestep=step_index,
             attn_metadata=None,
@@ -659,6 +673,8 @@ def _move_fixed_input_to_model(
 
 
 def _model_device(model: Any) -> torch.device:
+    if is_layerwise_offloaded_module(model):
+        return get_local_torch_device()
     for tensor in itertools.chain(model.parameters(), model.buffers()):
         return tensor.device
     raise ValueError("Wan transformer model has neither parameters nor buffers")
