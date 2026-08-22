@@ -92,6 +92,17 @@ def _validate_wan_hybrid_min_timestep(value: Any) -> float | None:
     return value
 
 
+def _validate_wan_hybrid_max_timestep(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("wan_hybrid_max_timestep must be a finite number")
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1000.0:
+        raise ValueError("wan_hybrid_max_timestep must be within [0, 1000]")
+    return value
+
+
 def _validate_wan_hybrid_layer_indices(
     value: Any, num_layers: int
 ) -> frozenset[int] | None:
@@ -134,13 +145,17 @@ def _resolve_wan_hybrid_layer_indices(
 
 
 def _use_wan_hybrid_for_timestep(
-    timestep: torch.Tensor, min_timestep: float | None
+    timestep: torch.Tensor,
+    min_timestep: float | None,
+    max_timestep: float | None,
 ) -> bool:
-    if min_timestep is None:
+    if min_timestep is None and max_timestep is None:
         return True
     if timestep.numel() == 0:
         raise ValueError("Wan timestep tensor must not be empty")
-    return bool(torch.amin(timestep).item() >= min_timestep)
+    if min_timestep is not None and torch.amin(timestep).item() < min_timestep:
+        return False
+    return max_timestep is None or torch.amax(timestep).item() <= max_timestep
 
 
 def _wan_cross_attention_backends(
@@ -1088,6 +1103,17 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.wan_hybrid_min_timestep = _validate_wan_hybrid_min_timestep(
             attention_backend_config.get("wan_hybrid_min_timestep")
         )
+        self.wan_hybrid_max_timestep = _validate_wan_hybrid_max_timestep(
+            attention_backend_config.get("wan_hybrid_max_timestep")
+        )
+        if (
+            self.wan_hybrid_min_timestep is not None
+            and self.wan_hybrid_max_timestep is not None
+            and self.wan_hybrid_min_timestep > self.wan_hybrid_max_timestep
+        ):
+            raise ValueError(
+                "wan_hybrid_min_timestep must not exceed wan_hybrid_max_timestep"
+            )
         wan_hybrid_layer_indices_explicit = (
             "wan_hybrid_layer_indices" in attention_backend_config
         )
@@ -1153,10 +1179,13 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             # Component-scoped FA models share the server configuration with the
             # component. Avoid a needless timestep device synchronization.
             self.wan_hybrid_min_timestep = None
+            self.wan_hybrid_max_timestep = None
         else:
             route_parts = []
             if self.wan_hybrid_min_timestep is not None:
                 route_parts.append(f"at timestep >= {self.wan_hybrid_min_timestep:g}")
+            if self.wan_hybrid_max_timestep is not None:
+                route_parts.append(f"at timestep <= {self.wan_hybrid_max_timestep:g}")
             if self.wan_hybrid_layer_indices is not None:
                 route_parts.append(
                     f"for transformer blocks {sorted(self.wan_hybrid_layer_indices)}"
@@ -1258,7 +1287,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         orig_dtype = hidden_states.dtype
         use_wan_hybrid = _use_wan_hybrid_for_timestep(
-            timestep, self.wan_hybrid_min_timestep
+            timestep,
+            self.wan_hybrid_min_timestep,
+            self.wan_hybrid_max_timestep,
         )
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]

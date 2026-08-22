@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     _resolve_wan_hybrid_layer_indices,
     _use_wan_hybrid_for_timestep,
     _validate_wan_hybrid_layer_indices,
+    _validate_wan_hybrid_max_timestep,
     _validate_wan_hybrid_min_timestep,
     _wan_cross_attention_backends,
 )
@@ -21,17 +22,23 @@ _WAN = "sglang.multimodal_gen.runtime.models.dits.wanvideo"
 
 class TestWanAttentionBackendRole(unittest.TestCase):
     def test_wan_hybrid_timestep_threshold(self):
-        self.assertTrue(_use_wan_hybrid_for_timestep(torch.tensor([999]), 975.0))
-        self.assertTrue(_use_wan_hybrid_for_timestep(torch.tensor([975]), 975.0))
-        self.assertFalse(_use_wan_hybrid_for_timestep(torch.tensor([972]), 975.0))
-        self.assertTrue(_use_wan_hybrid_for_timestep(torch.tensor([0]), None))
+        self.assertTrue(_use_wan_hybrid_for_timestep(torch.tensor([999]), 975.0, None))
+        self.assertTrue(_use_wan_hybrid_for_timestep(torch.tensor([975]), 975.0, None))
+        self.assertFalse(_use_wan_hybrid_for_timestep(torch.tensor([972]), 975.0, None))
+        self.assertTrue(_use_wan_hybrid_for_timestep(torch.tensor([521]), None, 521.0))
+        self.assertFalse(_use_wan_hybrid_for_timestep(torch.tensor([705]), None, 521.0))
+        self.assertTrue(_use_wan_hybrid_for_timestep(torch.tensor([0]), None, None))
 
     def test_wan_hybrid_timestep_threshold_validation(self):
         self.assertEqual(_validate_wan_hybrid_min_timestep(975), 975.0)
         self.assertIsNone(_validate_wan_hybrid_min_timestep(None))
+        self.assertEqual(_validate_wan_hybrid_max_timestep(521), 521.0)
+        self.assertIsNone(_validate_wan_hybrid_max_timestep(None))
         for invalid in (True, "975", -1, 1001, float("inf")):
             with self.subTest(invalid=invalid), pytest.raises(ValueError):
                 _validate_wan_hybrid_min_timestep(invalid)
+            with self.subTest(invalid=invalid), pytest.raises(ValueError):
+                _validate_wan_hybrid_max_timestep(invalid)
 
     def test_wan_hybrid_layer_indices_validation(self):
         self.assertEqual(
