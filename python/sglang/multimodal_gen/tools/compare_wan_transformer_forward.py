@@ -77,6 +77,7 @@ class WanTransformerDirectRequest:
     request_id: str
     enable_sequence_shard: bool = False
     enable_teacache: bool = False
+    enable_spectrum: bool = False
 
 
 def _sha256_json(value: Any) -> str:

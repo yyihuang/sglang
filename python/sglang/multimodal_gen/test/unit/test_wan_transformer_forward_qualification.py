@@ -69,6 +69,7 @@ class _TinyWanTransformer(nn.Module):
     def forward(self, hidden_states, timestep=None):
         assert get_forward_context().forward_batch.enable_sequence_shard is False
         assert get_forward_context().forward_batch.enable_teacache is False
+        assert get_forward_context().forward_batch.enable_spectrum is False
         self.input_ids.append(id(hidden_states))
         self.timesteps.append(timestep)
         self.request_ids.append(get_forward_context().forward_batch.request_id)
