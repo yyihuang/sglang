@@ -41,7 +41,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-
 MODEL_QUALIFICATION_THRESHOLDS = {
     "atol": 1.0,
     "rtol": 0.1,
@@ -65,13 +64,9 @@ def validate_qualification_protocol(
 ) -> None:
     failures = []
     if warmup_runs < MIN_QUALIFICATION_WARMUP_RUNS:
-        failures.append(
-            f"warmup_runs must be >= {MIN_QUALIFICATION_WARMUP_RUNS}"
-        )
+        failures.append(f"warmup_runs must be >= {MIN_QUALIFICATION_WARMUP_RUNS}")
     if measure_runs < MIN_QUALIFICATION_MEASURE_RUNS:
-        failures.append(
-            f"measure_runs must be >= {MIN_QUALIFICATION_MEASURE_RUNS}"
-        )
+        failures.append(f"measure_runs must be >= {MIN_QUALIFICATION_MEASURE_RUNS}")
     if comparison_mode == "performance" and run_order != "both":
         failures.append("performance qualification requires run_order=both")
     if comparison_mode == "correctness" and run_order not in QUALIFICATION_RUN_ORDERS:
@@ -327,8 +322,7 @@ def _summarize_comparison_envelope(
         for metrics in comparison["trajectory_metrics"]["per_step_metrics"]
     ]
     all_frames = [
-        comparison["output_metrics"]["all_frames_metrics"]
-        for comparison in comparisons
+        comparison["output_metrics"]["all_frames_metrics"] for comparison in comparisons
     ]
     return {
         "min_selected_trajectory_cosine": min(
@@ -469,9 +463,10 @@ def _comparison_failures(
                         "max_abs": metrics["max_abs"],
                     }
                 )
-            if metrics["cosine_similarity"] < MODEL_QUALIFICATION_THRESHOLDS[
-                "cosine_min"
-            ]:
+            if (
+                metrics["cosine_similarity"]
+                < MODEL_QUALIFICATION_THRESHOLDS["cosine_min"]
+            ):
                 failures.append(
                     location
                     | {
@@ -513,9 +508,7 @@ def evaluate_correctness_qualification(
         require_exact=False,
     )
     if not cross_variant_metrics.get("comparisons"):
-        failures.append(
-            {"scope": "cross_variant", "reason": "missing_comparisons"}
-        )
+        failures.append({"scope": "cross_variant", "reason": "missing_comparisons"})
 
     for variant in ("reference", "candidate"):
         summary = repeatability.get(variant)
@@ -567,9 +560,7 @@ def evaluate_performance_qualification(
         )
     return {
         "passed": not failures,
-        "thresholds": {
-            "speedup_min": MODEL_QUALIFICATION_THRESHOLDS["speedup_min"]
-        },
+        "thresholds": {"speedup_min": MODEL_QUALIFICATION_THRESHOLDS["speedup_min"]},
         "failures": failures,
     }
 
@@ -933,9 +924,7 @@ def build_qualification_provenance(
     ):
         path = model_root / relative_path
         if path.is_file():
-            model_configs.append(
-                {"path": relative_path, "sha256": _sha256_file(path)}
-            )
+            model_configs.append({"path": relative_path, "sha256": _sha256_file(path)})
 
     fixed_input = {
         "model_path": str(model_root),
@@ -1204,6 +1193,7 @@ def _positive_ratio(numerator: float | None, denominator: float | None) -> float
 
 def run_variant(
     *,
+    variant_name: str,
     server_kwargs: dict[str, Any],
     sampling_kwargs: dict[str, Any],
     fp4_gemm_backend: str | None,
@@ -1223,18 +1213,32 @@ def run_variant(
         with DiffGenerator.from_pretrained(
             local_mode=True, **server_kwargs
         ) as generator:
-            for _ in range(warmup_runs):
+            for run_index in range(warmup_runs):
                 _normalize_single_result(
-                    generator.generate(sampling_params_kwargs=sampling_kwargs)
+                    generator.generate(
+                        sampling_params_kwargs=_request_sampling_kwargs(
+                            sampling_kwargs,
+                            variant_name=variant_name,
+                            phase="warmup",
+                            run_index=run_index,
+                        )
+                    )
                 )
 
             measured_results = []
             generation_times = []
-            for _ in range(measure_runs):
+            for run_index in range(measure_runs):
                 start_time = time.perf_counter()
                 measured_results.append(
                     _normalize_single_result(
-                        generator.generate(sampling_params_kwargs=sampling_kwargs)
+                        generator.generate(
+                            sampling_params_kwargs=_request_sampling_kwargs(
+                                sampling_kwargs,
+                                variant_name=variant_name,
+                                phase="measure",
+                                run_index=run_index,
+                            )
+                        )
                     )
                 )
                 generation_times.append(time.perf_counter() - start_time)
@@ -1260,13 +1264,9 @@ def run_variant(
         for coverage in wan_hybrid_coverages
     ]
     valid_wan_hybrid_hit_counts = [
-        hit_count
-        for hit_count in wan_hybrid_hit_counts
-        if hit_count is not None
+        hit_count for hit_count in wan_hybrid_hit_counts if hit_count is not None
     ]
-    output_summaries = [
-        summarize_result_output(result) for result in measured_results
-    ]
+    output_summaries = [summarize_result_output(result) for result in measured_results]
 
     return {
         "result": final_result,
@@ -1302,6 +1302,18 @@ def run_variant(
         "per_run_wan_hybrid_coverage": wan_hybrid_coverages,
         "per_run_request_id": request_ids,
         "per_run_output_summaries": output_summaries,
+    }
+
+
+def _request_sampling_kwargs(
+    sampling_kwargs: dict[str, Any],
+    *,
+    variant_name: str,
+    phase: str,
+    run_index: int,
+) -> dict[str, Any]:
+    return sampling_kwargs | {
+        "request_id": f"wan-hybrid-qualification-{variant_name}-{phase}-{run_index}"
     }
 
 
@@ -1502,11 +1514,13 @@ def main() -> None:
 
     variant_calls = {
         "reference": {
+            "variant_name": "reference",
             "server_kwargs": ref_server_kwargs,
             "sampling_kwargs": ref_sampling_kwargs,
             "fp4_gemm_backend": args.reference_fp4_gemm_backend,
         },
         "candidate": {
+            "variant_name": "candidate",
             "server_kwargs": cand_server_kwargs,
             "sampling_kwargs": cand_sampling_kwargs,
             "fp4_gemm_backend": args.candidate_fp4_gemm_backend,
@@ -1572,10 +1586,8 @@ def main() -> None:
             or "default",
             "candidate_attention_backend": args.candidate_attention_backend
             or "default",
-            "reference_fp4_gemm_backend": args.reference_fp4_gemm_backend
-            or "default",
-            "candidate_fp4_gemm_backend": args.candidate_fp4_gemm_backend
-            or "default",
+            "reference_fp4_gemm_backend": args.reference_fp4_gemm_backend or "default",
+            "candidate_fp4_gemm_backend": args.candidate_fp4_gemm_backend or "default",
         },
         "sampling_kwargs": {
             "width": args.width,
@@ -1623,9 +1635,7 @@ def main() -> None:
         result["qualification"] = _with_candidate_backend_hit_qualification(
             result["qualification"],
             result["candidate_generation"]["per_run_wan_hybrid_hit_count"],
-            result["candidate_generation"][
-                "per_run_wan_hybrid_expected_hit_count"
-            ],
+            result["candidate_generation"]["per_run_wan_hybrid_expected_hit_count"],
         )
     else:
         order_results = {}
@@ -1671,24 +1681,22 @@ def main() -> None:
     if args.comparison_mode == "correctness":
         summary.update(
             {
-                "reference_median_generation_time_s": result[
-                    "reference_generation"
-                ]["median_generation_time_s"],
-                "candidate_median_generation_time_s": result[
-                    "candidate_generation"
-                ]["median_generation_time_s"],
-                "candidate_wan_hybrid_hit_count": result[
-                    "candidate_generation"
-                ]["wan_hybrid_hit_count"],
+                "reference_median_generation_time_s": result["reference_generation"][
+                    "median_generation_time_s"
+                ],
+                "candidate_median_generation_time_s": result["candidate_generation"][
+                    "median_generation_time_s"
+                ],
+                "candidate_wan_hybrid_hit_count": result["candidate_generation"][
+                    "wan_hybrid_hit_count"
+                ],
                 "candidate_per_run_wan_hybrid_hit_count": result[
                     "candidate_generation"
                 ]["per_run_wan_hybrid_hit_count"],
                 **result["performance"],
             }
         )
-        summary["cross_variant_envelope"] = result["cross_variant_metrics"][
-            "envelope"
-        ]
+        summary["cross_variant_envelope"] = result["cross_variant_metrics"]["envelope"]
     else:
         summary["performance"] = result["performance"]
         summary["order_results"] = {

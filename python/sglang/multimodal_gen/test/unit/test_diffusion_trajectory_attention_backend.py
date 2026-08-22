@@ -6,14 +6,15 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MODEL_QUALIFICATION_THRESHOLDS,
     _cosine_similarity,
+    _extract_generation_time_s,
     _extract_wan_hybrid_coverage,
     _extract_wan_hybrid_hit_count,
-    _extract_generation_time_s,
+    _request_sampling_kwargs,
     _with_candidate_backend_hit_qualification,
     build_sampling_kwargs,
     build_server_kwargs,
@@ -21,6 +22,7 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     evaluate_correctness_qualification,
     evaluate_dual_order_performance_qualification,
     evaluate_performance_qualification,
+    run_variant,
     summarize_cross_variant_metrics,
     summarize_result_output,
     summarize_run_repeatability,
@@ -84,6 +86,86 @@ def test_build_server_kwargs_omits_unspecified_attention_backend():
     assert "attention_backend" not in build_server_kwargs(args, variant="candidate")
 
 
+def test_request_sampling_kwargs_are_unique_and_do_not_mutate_fixed_input():
+    fixed = {"prompt": "A curious raccoon", "seed": 4254}
+
+    reference = _request_sampling_kwargs(
+        fixed, variant_name="reference", phase="measure", run_index=0
+    )
+    candidate = _request_sampling_kwargs(
+        fixed, variant_name="candidate", phase="measure", run_index=0
+    )
+    next_candidate = _request_sampling_kwargs(
+        fixed, variant_name="candidate", phase="measure", run_index=1
+    )
+
+    assert "request_id" not in fixed
+    assert reference["request_id"] != candidate["request_id"]
+    assert candidate["request_id"] != next_candidate["request_id"]
+    assert {
+        key: value for key, value in reference.items() if key != "request_id"
+    } == fixed
+
+
+def test_run_variant_propagates_unique_request_ids_in_local_mode(monkeypatch):
+    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+        DiffGenerator,
+    )
+
+    generated_request_ids = []
+    from_pretrained_calls = []
+
+    class _FakeGenerator:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def generate(self, *, sampling_params_kwargs):
+            request_id = sampling_params_kwargs["request_id"]
+            generated_request_ids.append(request_id)
+            return SimpleNamespace(
+                frames=[np.zeros((2, 2, 3), dtype=np.uint8)],
+                samples=None,
+                output_file_path=None,
+                peak_memory_mb=0.0,
+                metrics={
+                    "request_id": request_id,
+                    "total_duration_ms": 1.0,
+                    "wan_hybrid_hit_count": 0,
+                    "wan_hybrid_coverage": {
+                        "request_id": request_id,
+                        "expected_hit_count": 0,
+                    },
+                },
+            )
+
+    def fake_from_pretrained(**kwargs):
+        from_pretrained_calls.append(kwargs)
+        return _FakeGenerator()
+
+    monkeypatch.setattr(
+        DiffGenerator, "from_pretrained", staticmethod(fake_from_pretrained)
+    )
+    fixed = {"prompt": "A curious raccoon", "seed": 4254}
+
+    result = run_variant(
+        variant_name="candidate",
+        server_kwargs={},
+        sampling_kwargs=fixed,
+        fp4_gemm_backend=None,
+        warmup_runs=2,
+        measure_runs=5,
+    )
+
+    assert from_pretrained_calls == [{"local_mode": True}]
+    assert len(generated_request_ids) == 7
+    assert len(set(generated_request_ids)) == 7
+    assert result["per_run_request_id"] == generated_request_ids[2:]
+    assert fixed == {"prompt": "A curious raccoon", "seed": 4254}
+
+
 def test_build_server_kwargs_forwards_component_attention_backends():
     args = _args(
         candidate_attention_backend="fa",
@@ -105,16 +187,12 @@ def test_build_server_kwargs_forwards_component_attention_backends():
 def test_build_server_kwargs_forwards_attention_backend_config():
     args = _args(
         candidate_attention_backend="fa",
-        candidate_attention_backend_config=(
-            '{"wan_hybrid_min_timestep": 975}'
-        ),
+        candidate_attention_backend_config=('{"wan_hybrid_min_timestep": 975}'),
     )
 
     candidate = build_server_kwargs(args, variant="candidate")
 
-    assert candidate["attention_backend_config"] == (
-        '{"wan_hybrid_min_timestep":975}'
-    )
+    assert candidate["attention_backend_config"] == ('{"wan_hybrid_min_timestep":975}')
 
 
 def test_build_server_kwargs_rejects_non_object_attention_backend_config():
@@ -200,9 +278,7 @@ def test_output_summary_hashes_materialized_frame_bytes():
 
 def _generation_result(latent_offset=0.0, frame_offset=0):
     return SimpleNamespace(
-        trajectory_latents=torch.tensor(
-            [[[[1.0 + latent_offset, 2.0], [3.0, 4.0]]]]
-        ),
+        trajectory_latents=torch.tensor([[[[1.0 + latent_offset, 2.0], [3.0, 4.0]]]]),
         trajectory_timesteps=torch.tensor([1.0]),
         frames=[np.full((2, 2, 3), 10 + frame_offset, dtype=np.uint8)],
         samples=None,
@@ -241,15 +317,13 @@ def test_summarize_run_repeatability_uses_every_pair_and_every_step():
     for result in (run0, run1, run2):
         result.trajectory_timesteps = torch.tensor([2.0, 1.0])
 
-    repeatability = summarize_run_repeatability(
-        [run0, run1, run2], step_index=-1
-    )
+    repeatability = summarize_run_repeatability([run0, run1, run2], step_index=-1)
 
     assert repeatability["num_pairs"] == 3
     assert repeatability["envelope"]["max_selected_trajectory_mae"] == 0.0
-    assert repeatability["envelope"][
-        "max_all_steps_trajectory_mae"
-    ] == pytest.approx(0.5)
+    assert repeatability["envelope"]["max_all_steps_trajectory_mae"] == pytest.approx(
+        0.5
+    )
     assert repeatability["envelope"]["max_all_frames_mae"] == pytest.approx(4.0)
 
 
@@ -292,9 +366,7 @@ def test_correctness_qualification_passes_all_pairs_and_exact_repeatability():
     reference_results = [_generation_result(), _generation_result()]
     candidate_results = [_generation_result(0.08), _generation_result(0.08)]
 
-    qualification = _correctness_qualification(
-        reference_results, candidate_results
-    )
+    qualification = _correctness_qualification(reference_results, candidate_results)
 
     assert qualification["passed"] is True
     assert qualification["failures"] == []
@@ -305,9 +377,7 @@ def test_correctness_qualification_fails_closed_on_quality_and_repeatability():
     reference_results = [_generation_result(), _generation_result()]
     candidate_results = [_generation_result(0.25), _generation_result(0.5)]
 
-    qualification = _correctness_qualification(
-        reference_results, candidate_results
-    )
+    qualification = _correctness_qualification(reference_results, candidate_results)
 
     assert qualification["passed"] is False
     reasons = {failure["reason"] for failure in qualification["failures"]}
@@ -320,9 +390,7 @@ def test_correctness_qualification_fails_closed_on_non_finite_trajectory():
     candidate_results = [_generation_result(), _generation_result()]
     candidate_results[0].trajectory_latents[0, 0, 0, 0] = float("nan")
 
-    qualification = _correctness_qualification(
-        reference_results, candidate_results
-    )
+    qualification = _correctness_qualification(reference_results, candidate_results)
 
     assert qualification["passed"] is False
     assert any(
@@ -342,9 +410,10 @@ def test_correctness_qualification_requires_same_instance_repeatability():
     )
 
     assert qualification["passed"] is False
-    assert {
-        failure["scope"] for failure in qualification["failures"]
-    } == {"reference_repeatability", "candidate_repeatability"}
+    assert {failure["scope"] for failure in qualification["failures"]} == {
+        "reference_repeatability",
+        "candidate_repeatability",
+    }
 
 
 @pytest.mark.parametrize(
@@ -359,9 +428,7 @@ def test_correctness_qualification_requires_same_instance_repeatability():
     ],
 )
 def test_performance_qualification_enforces_finite_speedup_floor(speedup, passed):
-    qualification = evaluate_performance_qualification(
-        {"wall_median_speedup": speedup}
-    )
+    qualification = evaluate_performance_qualification({"wall_median_speedup": speedup})
 
     assert qualification["passed"] is passed
 
@@ -409,9 +476,7 @@ def test_qualification_protocol_requires_two_five_and_dual_performance_order():
     )
     for protocol in invalid_protocols:
         with pytest.raises(ValueError, match="Invalid qualification protocol"):
-            validate_qualification_protocol(
-                comparison_mode="performance", **protocol
-            )
+            validate_qualification_protocol(comparison_mode="performance", **protocol)
 
     validate_qualification_protocol(
         comparison_mode="correctness",
@@ -478,9 +543,7 @@ def test_candidate_backend_hit_qualification_requires_exact_expected_hits(
     expected_hit_counts = (
         list(hit_counts)
         if isinstance(hit_counts, list) and all(hit_count for hit_count in hit_counts)
-        else [1] * len(hit_counts)
-        if isinstance(hit_counts, list)
-        else None
+        else [1] * len(hit_counts) if isinstance(hit_counts, list) else None
     )
     qualification = evaluate_candidate_backend_hit_qualification(
         hit_counts, expected_hit_counts
@@ -547,9 +610,7 @@ def test_build_sampling_kwargs_captures_trajectory_for_correctness():
 
 def test_build_sampling_kwargs_disables_trajectory_for_performance():
     kwargs = build_sampling_kwargs(
-        _sampling_args(
-            comparison_mode="performance", return_trajectory_decoded=True
-        )
+        _sampling_args(comparison_mode="performance", return_trajectory_decoded=True)
     )
 
     assert kwargs["return_frames"] is True
