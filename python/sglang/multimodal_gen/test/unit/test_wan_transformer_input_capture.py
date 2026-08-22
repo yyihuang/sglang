@@ -13,9 +13,16 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.qualification import (
+    wan_transformer_capture as capture_module,
+)
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
     WanTransformerInputCapture,
+    _model_identity,
     load_wan_transformer_input_capture,
+)
+from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
+    _model_identity as qualification_model_identity,
 )
 
 
@@ -27,6 +34,33 @@ class _Model(nn.Module):
 
     def forward(self, hidden_states, timestep=None, guidance=None):
         return hidden_states + 1
+
+
+def test_model_identity_uses_order_independent_materialized_weights(monkeypatch):
+    model = _Model()
+    model.register_parameter("placeholder", nn.Parameter(torch.empty(1)))
+    materialized = [
+        ("weight_b", torch.empty(2, dtype=torch.bfloat16)),
+        ("weight_a", torch.empty(3, dtype=torch.float32)),
+    ]
+    monkeypatch.setattr(
+        capture_module,
+        "iter_materialized_weights",
+        lambda _model: iter(materialized),
+    )
+
+    identity = _model_identity(model)
+    monkeypatch.setattr(
+        capture_module,
+        "iter_materialized_weights",
+        lambda _model: iter(reversed(materialized)),
+    )
+    reversed_identity = _model_identity(model)
+    assert identity["parameter_count"] == 5
+    assert identity["parameter_manifest_sha256"] == reversed_identity[
+        "parameter_manifest_sha256"
+    ]
+    assert qualification_model_identity(model) == identity
 
 
 def _batch(request_id: str):

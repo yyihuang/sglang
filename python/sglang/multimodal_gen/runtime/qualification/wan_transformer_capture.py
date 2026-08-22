@@ -23,6 +23,10 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    iter_materialized_weights,
+)
+
 
 CAPTURE_DIR_ENV = "SGLANG_WAN_TRANSFORMER_INPUT_CAPTURE_DIR"
 CAPTURE_COMPONENTS_ENV = "SGLANG_WAN_TRANSFORMER_INPUT_CAPTURE_COMPONENTS"
@@ -121,15 +125,18 @@ def _snapshot_value(value: Any, *, location: str) -> Any:
 
 
 def _model_identity(model: torch.nn.Module) -> dict[str, Any]:
-    parameters = [
-        {
-            "name": name,
-            "shape": list(parameter.shape),
-            "dtype": str(parameter.dtype),
-            "numel": parameter.numel(),
-        }
-        for name, parameter in model.named_parameters()
-    ]
+    parameters = sorted(
+        (
+            {
+                "name": name,
+                "shape": list(parameter.shape),
+                "dtype": str(parameter.dtype),
+                "numel": parameter.numel(),
+            }
+            for name, parameter in iter_materialized_weights(model)
+        ),
+        key=lambda item: item["name"],
+    )
     buffers = [
         {
             "name": name,

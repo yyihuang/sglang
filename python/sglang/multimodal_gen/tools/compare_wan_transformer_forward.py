@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
+    _model_identity,
     load_wan_transformer_input_capture,
 )
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
@@ -120,65 +121,6 @@ def _summarize_fixed_input(value: Any, *, location: str = "input") -> Any:
     raise TypeError(
         f"{location} has unsupported provenance type {type(value).__name__}"
     )
-
-
-def _model_identity(model: Any) -> dict[str, Any]:
-    blocks = tuple(getattr(model, "blocks", ()))
-    config_values = {}
-    for attribute in ("config", "hf_config"):
-        value = getattr(model, attribute, None)
-        if value is None:
-            continue
-        to_dict = getattr(value, "to_dict", None)
-        if callable(to_dict):
-            value = to_dict()
-        elif not isinstance(value, Mapping) and hasattr(value, "__dict__"):
-            value = vars(value)
-        config_values[attribute] = _stable_config_value(value)
-
-    parameter_manifest = [
-        {
-            "name": name,
-            "shape": list(parameter.shape),
-            "dtype": str(parameter.dtype),
-            "numel": parameter.numel(),
-        }
-        for name, parameter in model.named_parameters()
-    ]
-    buffer_manifest = [
-        {
-            "name": name,
-            "shape": list(buffer.shape),
-            "dtype": str(buffer.dtype),
-            "numel": buffer.numel(),
-        }
-        for name, buffer in model.named_buffers()
-    ]
-    identity = {
-        "class": f"{type(model).__module__}.{type(model).__qualname__}",
-        "num_blocks": len(blocks),
-        "config_sha256": _sha256_json(config_values),
-        "parameter_manifest_sha256": _sha256_json(parameter_manifest),
-        "buffer_manifest_sha256": _sha256_json(buffer_manifest),
-        "parameter_count": sum(item["numel"] for item in parameter_manifest),
-        "buffer_count": sum(item["numel"] for item in buffer_manifest),
-    }
-    return identity | {"identity_sha256": _sha256_json(identity)}
-
-
-def _stable_config_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            str(key): _stable_config_value(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
-    if isinstance(value, (tuple, list)):
-        return [_stable_config_value(item) for item in value]
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, (Path, torch.dtype, torch.device)):
-        return str(value)
-    return {"type": f"{type(value).__module__}.{type(value).__qualname__}"}
 
 
 def build_wan_transformer_evidence_binding(
