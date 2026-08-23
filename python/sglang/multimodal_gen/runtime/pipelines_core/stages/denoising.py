@@ -82,6 +82,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     world_group_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    WanHybridEvidenceCollector,
+)
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
     LocalAttention,
     UlyssesAttention,
@@ -93,9 +96,6 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_bac
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
-    WanHybridEvidenceCollector,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
@@ -112,9 +112,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
-    WanTransformerInputCapture,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
@@ -138,6 +135,12 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
     RolloutDenoisingMixin,
+)
+from sglang.multimodal_gen.runtime.qualification.attention_backend_identity import (
+    collect_runtime_attention_backend_identity,
+)
+from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
+    WanTransformerInputCapture,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.component_load import (
@@ -1532,9 +1535,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 latents=ctx.latents,
                 wan_component_name=self._component_name_for_stage_module(
                     step.current_model,
-                    "transformer"
-                    if step.current_model is self.transformer
-                    else "transformer_2",
+                    (
+                        "transformer"
+                        if step.current_model is self.transformer
+                        else "transformer_2"
+                    ),
                 ),
                 wan_actual_timestep=step.t_int,
             )
@@ -1914,6 +1919,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if collector is not None and result.metrics is not None:
             result.metrics.wan_hybrid_hit_count = collector.hit_count()
             result.metrics.wan_hybrid_coverage = collector.coverage()
+        if result.metrics is not None and batch.request_id.startswith(
+            "wan-hybrid-qualification-"
+        ):
+            result.metrics.attention_backend_identity = (
+                collect_runtime_attention_backend_identity(
+                    (self.transformer, self.transformer_2),
+                    requested_backend=server_args.attention_backend,
+                )
+            )
         return result
 
     @torch.no_grad()

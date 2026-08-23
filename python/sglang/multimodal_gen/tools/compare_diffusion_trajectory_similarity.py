@@ -51,6 +51,14 @@ MODEL_QUALIFICATION_THRESHOLDS = {
     "speedup_min": 1.0,
 }
 QUALIFICATION_RUN_ORDERS = ("reference-first", "candidate-first")
+PRODUCTION_FA4_BACKEND_CLASS = (
+    "sglang.multimodal_gen.runtime.layers.attention.backends."
+    "flash_attn.FlashAttentionBackend"
+)
+PRODUCTION_FA4_IMPL_CLASS = (
+    "sglang.multimodal_gen.runtime.layers.attention.backends."
+    "flash_attn.FlashAttentionImpl"
+)
 MIN_QUALIFICATION_WARMUP_RUNS = 2
 MIN_QUALIFICATION_MEASURE_RUNS = 5
 
@@ -1147,6 +1155,71 @@ def _extract_wan_hybrid_coverage(result: Any) -> dict[str, Any] | None:
     return coverage
 
 
+def _extract_attention_backend_identity(result: Any) -> dict[str, Any] | None:
+    metrics = getattr(result, "metrics", None)
+    if not isinstance(metrics, dict):
+        return None
+    identity = metrics.get("attention_backend_identity")
+    if not isinstance(identity, dict):
+        return None
+    return identity
+
+
+def validate_reference_attention_backend_identity(identity: Any) -> list[str]:
+    """Validate identity emitted by actually executed FA backend instances."""
+
+    if not isinstance(identity, dict):
+        return ["reference runtime attention backend identity is missing"]
+    errors = []
+    expected_fields = {
+        "requested_backend": "fa",
+        "resolved_backend_class": PRODUCTION_FA4_BACKEND_CLASS,
+        "resolved_impl_class": PRODUCTION_FA4_IMPL_CLASS,
+        "implementation": "FA4",
+        "flash_attention_version": 4,
+        "runtime_observed": True,
+    }
+    for field_name, expected_value in expected_fields.items():
+        if identity.get(field_name) != expected_value:
+            errors.append(
+                f"reference runtime attention backend identity has invalid "
+                f"{field_name}"
+            )
+    expected_count = identity.get("expected_instance_count")
+    observed_count = identity.get("observed_instance_count")
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count <= 0
+        or observed_count != expected_count
+    ):
+        errors.append(
+            "reference runtime attention backend identity has incomplete "
+            "instance coverage"
+        )
+    return errors
+
+
+def _collapse_reference_attention_backend_identities(
+    identities: list[dict[str, Any] | None], *, location: str
+) -> dict[str, Any]:
+    errors = [
+        error
+        for identity in identities
+        for error in validate_reference_attention_backend_identity(identity)
+    ]
+    if errors:
+        raise RuntimeError(f"{location}: {'; '.join(errors)}")
+    first = identities[0]
+    if any(identity != first for identity in identities[1:]):
+        raise RuntimeError(
+            f"{location}: reference runtime attention backend identity changed "
+            "between measured executions"
+        )
+    assert isinstance(first, dict)
+    return first
+
+
 def _extract_request_id(result: Any) -> str | None:
     metrics = getattr(result, "metrics", None)
     if not isinstance(metrics, dict):
@@ -1259,6 +1332,15 @@ def run_variant(
         _extract_wan_hybrid_coverage(result) for result in measured_results
     ]
     request_ids = [_extract_request_id(result) for result in measured_results]
+    attention_backend_identities = [
+        _extract_attention_backend_identity(result) for result in measured_results
+    ]
+    attention_backend_identity = None
+    if variant_name == "reference" and server_kwargs.get("attention_backend") == "fa":
+        attention_backend_identity = _collapse_reference_attention_backend_identities(
+            attention_backend_identities,
+            location="reference measured runs",
+        )
     wan_hybrid_expected_hit_counts = [
         coverage.get("expected_hit_count") if coverage is not None else None
         for coverage in wan_hybrid_coverages
@@ -1302,6 +1384,7 @@ def run_variant(
         "per_run_wan_hybrid_coverage": wan_hybrid_coverages,
         "per_run_request_id": request_ids,
         "per_run_output_summaries": output_summaries,
+        "attention_backend_identity": attention_backend_identity,
     }
 
 
@@ -1614,6 +1697,9 @@ def main() -> None:
     if args.comparison_mode == "correctness":
         reference_run, candidate_run = run_one_order(args.run_order)
         result.update(order_summary(reference_run, candidate_run))
+        result["reference_attention_backend_identity"] = reference_run[
+            "attention_backend_identity"
+        ]
         result["repeatability"] = {
             "reference": summarize_run_repeatability(
                 reference_run["_measured_results"],
@@ -1639,9 +1725,19 @@ def main() -> None:
         )
     else:
         order_results = {}
+        reference_attention_backend_identities = []
         for run_order in QUALIFICATION_RUN_ORDERS:
             reference_run, candidate_run = run_one_order(run_order)
             order_results[run_order] = order_summary(reference_run, candidate_run)
+            reference_attention_backend_identities.append(
+                reference_run["attention_backend_identity"]
+            )
+        result["reference_attention_backend_identity"] = (
+            _collapse_reference_attention_backend_identities(
+                reference_attention_backend_identities,
+                location="reference performance run orders",
+            )
+        )
         wall_speedups = [
             order_results[run_order]["performance"]["wall_median_speedup"]
             for run_order in QUALIFICATION_RUN_ORDERS

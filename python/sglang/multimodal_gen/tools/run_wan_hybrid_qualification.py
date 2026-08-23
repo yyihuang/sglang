@@ -23,6 +23,7 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     MIN_QUALIFICATION_WARMUP_RUNS,
     MODEL_QUALIFICATION_THRESHOLDS,
     QUALIFICATION_RUN_ORDERS,
+    validate_reference_attention_backend_identity,
 )
 from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
     validate_wan_transformer_forward_report,
@@ -737,6 +738,11 @@ def validate_qualification_report(
         return ["report is not a JSON object"]
     errors = []
     errors.extend(_validate_report_provenance(report, config))
+    errors.extend(
+        validate_reference_attention_backend_identity(
+            report.get("reference_attention_backend_identity")
+        )
+    )
     if report.get("model_id") != config.model_id:
         errors.append("model_id does not match the qualification config")
     if report.get("prompt") != config.prompt or report.get("seed") != config.seed:

@@ -367,6 +367,7 @@ class UlyssesAttention(nn.Module):
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
+        self._resolved_attn_backend_cls = attn_backend
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -631,6 +632,7 @@ class LocalAttention(nn.Module):
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
+        self._resolved_attn_backend_cls = attn_backend
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -796,6 +798,7 @@ class USPAttention(nn.Module):
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
+        self._resolved_attn_backend_cls = attn_backend
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
