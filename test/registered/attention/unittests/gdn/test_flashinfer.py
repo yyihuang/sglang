@@ -395,6 +395,9 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         def unexpected_non_cp(*_args, **_kwargs):
             raise AssertionError("SGLang FlashInfer prefill left the Cake CP route")
 
+        def unexpected_external_cp(*_args, **_kwargs):
+            raise AssertionError("SGLang FlashInfer prefill used the external CP fallback")
+
         with (
             patch.object(
                 flashinfer_gdn_prefill,
@@ -405,6 +408,11 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                 flashinfer_gdn_prefill,
                 "chunk_gated_delta_rule_sm100",
                 unexpected_non_cp,
+            ),
+            patch.object(
+                flashinfer_gdn_prefill,
+                "cp_delta_rule_dsl_sm100",
+                unexpected_external_cp,
             ),
         ):
             cake_output = run_gdn_fixture_eager(fixture)
