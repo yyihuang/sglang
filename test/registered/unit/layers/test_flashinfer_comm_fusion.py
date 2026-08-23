@@ -90,6 +90,63 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(CustomTestCase):
+    def test_trtllm_moe_finalize_requires_explicit_backend_opt_in(self):
+        def legacy_api(
+            *,
+            allreduce_in,
+            residual_in,
+            norm_weight,
+            expanded_idx_to_permuted_idx,
+            norm_out,
+            residual_out,
+            quant_out,
+            scale_out,
+            workspace_ptrs,
+            launch_with_pdl,
+            world_rank,
+            world_size,
+            eps,
+            shared_expert_output,
+            expert_scale_factor,
+            routed_scaling_factor,
+            weight_bias,
+        ):
+            pass
+
+        comm = types.SimpleNamespace(
+            trtllm_moe_finalize_allreduce_fusion=legacy_api
+        )
+        self.assertIsNone(fusion._get_flashinfer_trtllm_moe_finalize_api(comm))
+
+        def opted_in_api(
+            *,
+            allreduce_in,
+            residual_in,
+            norm_weight,
+            expanded_idx_to_permuted_idx,
+            norm_out,
+            residual_out,
+            quant_out,
+            scale_out,
+            workspace_ptrs,
+            launch_with_pdl,
+            world_rank,
+            world_size,
+            eps,
+            shared_expert_output,
+            expert_scale_factor,
+            routed_scaling_factor,
+            weight_bias,
+            backend,
+        ):
+            pass
+
+        comm.trtllm_moe_finalize_allreduce_fusion = opted_in_api
+        self.assertIs(
+            fusion._get_flashinfer_trtllm_moe_finalize_api(comm), opted_in_api
+        )
+        self.assertEqual(fusion._TRTLLM_MOE_FINALIZE_BACKEND, "cake")
+
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="auto", nnodes=1

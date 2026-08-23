@@ -1019,8 +1019,33 @@ class DeepseekV2MoE(nn.Module):
 
         if deferred_finalize:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                FlashInferTrtllmDeferredFinalizeAllReduceOutput,
                 finalize_flashinfer_trtllm_deferred_output,
             )
+
+            if (
+                get_forward().fuse_mlp_allreduce
+                and not get_attn_tp_context().input_scattered
+            ):
+                from sglang.srt.layers.flashinfer_comm_fusion import (
+                    can_use_flashinfer_trtllm_moe_finalize_allreduce,
+                )
+
+                if can_use_flashinfer_trtllm_moe_finalize_allreduce(
+                    final_hidden_states.gemm2_out,
+                    final_hidden_states.expert_weights,
+                    final_hidden_states.expanded_idx_to_permuted_idx,
+                    shared_output,
+                    final_hidden_states.top_k,
+                ):
+                    # Carry the permuted producer output to the next layer's
+                    # input RMSNorm.  That is where residual and norm_weight
+                    # become available, so the collective is fused exactly
+                    # where the ordinary deferred all-reduce would run.
+                    return FlashInferTrtllmDeferredFinalizeAllReduceOutput(
+                        deferred_output=final_hidden_states,
+                        shared_expert_output=shared_output,
+                    )
 
             final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
                 final_hidden_states,
@@ -2455,6 +2480,52 @@ class DeepseekV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmDeferredFinalizeAllReduceOutput,
+        )
+
+        pre_normalized = False
+        if isinstance(
+            hidden_states, FlashInferTrtllmDeferredFinalizeAllReduceOutput
+        ):
+            pending_finalize = hidden_states
+            from sglang.srt.layers.flashinfer_comm_fusion import (
+                try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm,
+            )
+
+            fused_result = (
+                try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
+                    gemm2_out=pending_finalize.deferred_output.gemm2_out,
+                    expert_weights=pending_finalize.deferred_output.expert_weights,
+                    expanded_idx_to_permuted_idx=(
+                        pending_finalize.deferred_output.expanded_idx_to_permuted_idx
+                    ),
+                    shared_expert_output=pending_finalize.shared_expert_output,
+                    residual=residual,
+                    norm_weight=self.input_layernorm.weight.data,
+                    top_k=pending_finalize.deferred_output.top_k,
+                    eps=self.input_layernorm.variance_epsilon,
+                )
+                if residual is not None
+                else None
+            )
+            if fused_result is not None:
+                hidden_states, residual = fused_result
+                pre_normalized = True
+            else:
+                # Rank-invariant capability checks normally decide this before
+                # the value crosses the layer boundary.  Keep a correctness
+                # fallback for workspace loss or an unsupported norm tensor.
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    finalize_flashinfer_trtllm_deferred_output,
+                )
+
+                hidden_states = finalize_flashinfer_trtllm_deferred_output(
+                    pending_finalize.deferred_output,
+                    pending_finalize.shared_expert_output,
+                )
+                hidden_states._sglang_needs_allreduce_fusion = True
+
         hidden_states_orig = hidden_states
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -2463,6 +2534,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
                 quant_format=self._resolve_gfx95_quant_format(),
+                pre_normalized=pre_normalized,
             )
         )
 
@@ -2529,6 +2601,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         if (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
             and fuse_mlp_allreduce
+            and not isinstance(
+                hidden_states, FlashInferTrtllmDeferredFinalizeAllReduceOutput
+            )
         ):
             hidden_states._sglang_needs_allreduce_fusion = True
 

@@ -65,6 +65,14 @@ class FlashInferTrtllmDeferredFinalizeOutput:
     top_k: int
 
 
+@dataclass
+class FlashInferTrtllmDeferredFinalizeAllReduceOutput:
+    """Deferred triple plus the shared branch, consumed at the next RMSNorm."""
+
+    deferred_output: FlashInferTrtllmDeferredFinalizeOutput
+    shared_expert_output: torch.Tensor
+
+
 @contextmanager
 def flashinfer_trtllm_deferred_finalize_context(
     enabled: bool = True,

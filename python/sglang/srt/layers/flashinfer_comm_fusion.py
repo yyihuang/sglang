@@ -34,6 +34,53 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
+_flashinfer_trtllm_moe_finalize = None
+
+# Keep the provisional FlashInfer entry point in one place.  The exported
+# kernel is expected to preserve the existing TRTLLM workspace ABI; if its
+# public name or signature changes, only this adapter should need updating.
+_TRTLLM_MOE_FINALIZE_API_NAME = "trtllm_moe_finalize_allreduce_fusion"
+# Explicit opt-in for the exported implementation.  Keep the spelling isolated
+# here alongside the API name so the call site cannot accidentally select the
+# legacy TRTLLM baseline on an older FlashInfer installation.
+_TRTLLM_MOE_FINALIZE_BACKEND = "cake"
+_TRTLLM_MOE_FINALIZE_REQUIRED_PARAMS = frozenset(
+    {
+        "allreduce_in",
+        "residual_in",
+        "norm_weight",
+        "expanded_idx_to_permuted_idx",
+        "norm_out",
+        "residual_out",
+        "quant_out",
+        "scale_out",
+        "workspace_ptrs",
+        "launch_with_pdl",
+        "world_rank",
+        "world_size",
+        "eps",
+        "shared_expert_output",
+        "expert_scale_factor",
+        "routed_scaling_factor",
+        "weight_bias",
+        "backend",
+    }
+)
+
+
+def _get_flashinfer_trtllm_moe_finalize_api(comm):
+    """Return the opted-in finalize API, or ``None`` for legacy signatures."""
+
+    candidate = getattr(comm, _TRTLLM_MOE_FINALIZE_API_NAME, None)
+    if not callable(candidate):
+        return None
+    try:
+        candidate_params = inspect.signature(candidate).parameters
+    except (TypeError, ValueError):
+        return None
+    if not _TRTLLM_MOE_FINALIZE_REQUIRED_PARAMS.issubset(candidate_params):
+        return None
+    return candidate
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
@@ -86,6 +133,10 @@ def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
 if is_flashinfer_available():
     try:
         import flashinfer.comm as comm
+
+        _flashinfer_trtllm_moe_finalize = (
+            _get_flashinfer_trtllm_moe_finalize_api(comm)
+        )
 
         if hasattr(comm, "allreduce_fusion") and hasattr(
             comm, "create_allreduce_fusion_workspace"
@@ -750,6 +801,163 @@ def ensure_workspace_initialized(
         _sync_allreduce_unavailable_across_tp()
 
     return workspace_manager.initialized
+
+
+def can_use_flashinfer_trtllm_moe_finalize_allreduce(
+    gemm2_out: torch.Tensor,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    shared_expert_output: torch.Tensor,
+    top_k: int,
+) -> bool:
+    """Whether the deferred TRTLLM MoE triple fits the guarded TP4 route.
+
+    This is intentionally narrower than the FlashInfer operator.  It describes
+    the DeepSeek-V3 configuration validated by the exported H=7168 kernel and
+    keeps older FlashInfer installations on the existing finalize path.
+    """
+
+    if _flashinfer_trtllm_moe_finalize is None or not is_sm100_supported():
+        return False
+    if (
+        getattr(get_server_args(), "flashinfer_allreduce_fusion_backend", None)
+        != "trtllm"
+    ):
+        # Do not silently divert an auto-selected MNNVL workspace into a TRTLLM
+        # pointer-table kernel.
+        return False
+
+    from sglang.srt.layers.moe import get_moe_runner_backend
+
+    if not get_moe_runner_backend().is_flashinfer_trtllm():
+        return False
+    parallel = get_parallel()
+    if (
+        parallel.tp_size != 4
+        or parallel.moe_tp_size != 4
+        or parallel.moe_ep_size != 1
+        or parallel.attn_dp_size != 1
+        or parallel.pp_size != 1
+        or parallel.attn_cp_size != 1
+        or parallel.dcp_size != 1
+    ):
+        return False
+
+    if (
+        gemm2_out.ndim != 2
+        or expert_weights.ndim != 2
+        or expanded_idx_to_permuted_idx.ndim != 2
+        or shared_expert_output.ndim != 2
+    ):
+        return False
+    tokens = expert_weights.shape[0]
+    if (
+        not 0 < tokens <= 2048
+        or top_k != 8
+        or expert_weights.shape != (tokens, top_k)
+        or expanded_idx_to_permuted_idx.shape != (tokens, top_k)
+        or gemm2_out.shape[1] != 7168
+        or shared_expert_output.shape != (tokens, 7168)
+    ):
+        return False
+    if gemm2_out.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if (
+        expert_weights.dtype != gemm2_out.dtype
+        or shared_expert_output.dtype != gemm2_out.dtype
+        or expanded_idx_to_permuted_idx.dtype != torch.int32
+    ):
+        return False
+    tensors = (
+        gemm2_out,
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        shared_expert_output,
+    )
+    return all(t.is_cuda and t.is_contiguous() for t in tensors)
+
+
+def try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
+    *,
+    gemm2_out: torch.Tensor,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    shared_expert_output: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    top_k: int,
+    eps: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Finalize deferred MoE and fuse TP4 AR + residual + RMSNorm.
+
+    Returns ``(norm_out, residual_out)`` when the provisional FlashInfer API is
+    available, otherwise ``None`` so the caller can retain the established
+    finalize/all-reduce path.  The deferred producer already folds the routed
+    scaling factor into ``expert_weights``; passing it again would double-scale.
+    """
+
+    if not can_use_flashinfer_trtllm_moe_finalize_allreduce(
+        gemm2_out,
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        shared_expert_output,
+        top_k,
+    ):
+        return None
+    tokens = expert_weights.shape[0]
+    if (
+        residual.shape != (tokens, 7168)
+        or norm_weight.shape != (7168,)
+        or residual.dtype != gemm2_out.dtype
+        or norm_weight.dtype != gemm2_out.dtype
+        or not residual.is_cuda
+        or not norm_weight.is_cuda
+        or not residual.is_contiguous()
+        or not norm_weight.is_contiguous()
+    ):
+        return None
+
+    if not ensure_workspace_initialized(
+        max_token_num=2048,
+        hidden_dim=7168,
+        dtype=gemm2_out.dtype,
+        token_num=tokens,
+        use_oneshot=True,
+        use_attn_tp_group=False,
+    ):
+        return None
+    workspace_manager = _get_workspace_manager(use_attn_tp_group=False)
+    workspace = workspace_manager.workspace
+    if (
+        workspace is None
+        or workspace_manager.backend != "trtllm"
+        or not hasattr(workspace, "workspace_tensor")
+    ):
+        return None
+
+    residual_out = torch.empty_like(residual)
+    norm_out = torch.empty_like(residual)
+    _flashinfer_trtllm_moe_finalize(
+        allreduce_in=gemm2_out,
+        residual_in=residual,
+        norm_weight=norm_weight,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        norm_out=norm_out,
+        residual_out=residual_out,
+        quant_out=None,
+        scale_out=None,
+        workspace_ptrs=workspace.workspace_tensor,
+        launch_with_pdl=True,
+        world_rank=workspace_manager.rank,
+        world_size=workspace_manager.world_size,
+        eps=eps,
+        shared_expert_output=shared_expert_output,
+        expert_scale_factor=expert_weights,
+        routed_scaling_factor=None,
+        weight_bias=0.0,
+        backend=_TRTLLM_MOE_FINALIZE_BACKEND,
+    )
+    return norm_out, residual_out
 
 
 def fake_flashinfer_allreduce_residual_rmsnorm(
