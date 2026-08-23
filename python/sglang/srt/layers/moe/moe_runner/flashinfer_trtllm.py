@@ -50,6 +50,11 @@ _deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVa
 
 _TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.flashinfer_comm_fusion import (
+        FlashInferTrtllmMoeFinalizeWorkspaceState,
+    )
+
 
 def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
     from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -71,6 +76,7 @@ class FlashInferTrtllmDeferredFinalizeAllReduceOutput:
 
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput
     shared_expert_output: torch.Tensor
+    workspace_state: FlashInferTrtllmMoeFinalizeWorkspaceState
 
 
 @contextmanager

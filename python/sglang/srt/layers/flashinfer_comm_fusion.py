@@ -1,5 +1,6 @@
 import inspect
 import logging
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -803,6 +804,174 @@ def ensure_workspace_initialized(
     return workspace_manager.initialized
 
 
+@dataclass(frozen=True)
+class FlashInferTrtllmMoeFinalizeWorkspaceState:
+    """Immutable workspace identity carried with a deferred MoE payload.
+
+    The workspace must already exist before the producer publishes the
+    payload.  Keeping both the workspace object and its device pointer table in
+    this snapshot lets the consumer reject cleanup/reinitialization between
+    adjacent layers instead of silently choosing a different collective.
+    """
+
+    workspace: object
+    workspace_ptrs: torch.Tensor
+    group_key: Tuple[ProcessGroup, ProcessGroup]
+    world_rank: int
+    world_size: int
+    dtype: torch.dtype
+    max_token_num: int
+    hidden_dim: int
+
+
+def _is_flashinfer_trtllm_moe_finalize_execution_route_supported() -> bool:
+    """Exclude execution modes whose schemas cannot carry the S2 payload."""
+
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+        is_in_breakable_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        is_in_tc_piecewise_cuda_graph,
+    )
+
+    # TBO decomposes the layer into tensor-only ops.  The piecewise dual-stream
+    # custom op likewise declares a single Tensor output.  Neither route can
+    # transport the Python dataclass across layers yet.
+    return not (
+        getattr(get_server_args(), "enable_two_batch_overlap", False)
+        or is_in_tc_piecewise_cuda_graph()
+        or is_in_breakable_cuda_graph()
+    )
+
+
+def get_flashinfer_trtllm_moe_finalize_workspace_state(
+    gemm2_out: torch.Tensor,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    shared_expert_output: torch.Tensor,
+    top_k: int,
+) -> Optional[FlashInferTrtllmMoeFinalizeWorkspaceState]:
+    """Return the already-created TP4 workspace state for this payload.
+
+    This function is deliberately read-only: workspace creation and resizing
+    are warmup responsibilities and must never happen while publishing an S2
+    payload or while capturing/replaying a CUDA graph.
+    """
+
+    if (
+        _flashinfer_allreduce_unavailable
+        or _flashinfer_trtllm_moe_finalize is None
+        or not is_sm100_supported()
+        or not _is_flashinfer_trtllm_moe_finalize_execution_route_supported()
+    ):
+        return None
+    if (
+        getattr(get_server_args(), "flashinfer_allreduce_fusion_backend", None)
+        != "trtllm"
+    ):
+        # Do not silently divert an auto-selected MNNVL workspace into a TRTLLM
+        # pointer-table kernel.
+        return None
+
+    from sglang.srt.layers.moe import get_moe_runner_backend
+
+    if not get_moe_runner_backend().is_flashinfer_trtllm():
+        return None
+    parallel = get_parallel()
+    if (
+        parallel.tp_size != 4
+        or parallel.moe_tp_size != 4
+        or parallel.moe_ep_size != 1
+        or parallel.attn_dp_size != 1
+        or parallel.pp_size != 1
+        or parallel.attn_cp_size != 1
+        or parallel.dcp_size != 1
+    ):
+        return None
+
+    if (
+        gemm2_out.ndim != 2
+        or expert_weights.ndim != 2
+        or expanded_idx_to_permuted_idx.ndim != 2
+        or shared_expert_output.ndim != 2
+    ):
+        return None
+    tokens = expert_weights.shape[0]
+    if (
+        not 0 < tokens <= 2048
+        or top_k != 8
+        or expert_weights.shape != (tokens, top_k)
+        or expanded_idx_to_permuted_idx.shape != (tokens, top_k)
+        or gemm2_out.shape[1] != 7168
+        or shared_expert_output.shape != (tokens, 7168)
+    ):
+        return None
+    if gemm2_out.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    if (
+        expert_weights.dtype != gemm2_out.dtype
+        or shared_expert_output.dtype != gemm2_out.dtype
+        or expanded_idx_to_permuted_idx.dtype != torch.int32
+    ):
+        return None
+    tensors = (
+        gemm2_out,
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        shared_expert_output,
+    )
+    if not all(t.is_cuda and t.is_contiguous() for t in tensors):
+        return None
+
+    coordinator = get_moe_tp_group()
+    expected_group_key = (coordinator.device_group, coordinator.cpu_group)
+    workspace_manager = _get_workspace_manager(use_attn_tp_group=False)
+    workspace = workspace_manager.workspace
+    if (
+        not workspace_manager.initialized
+        or workspace is None
+        or workspace_manager.backend != "trtllm"
+        or getattr(workspace, "backend", None) != "trtllm"
+        or workspace_manager.group != expected_group_key
+        or workspace_manager.rank != parallel.moe_tp_rank
+        or workspace_manager.world_size != parallel.moe_tp_size
+        or workspace_manager.dtype != gemm2_out.dtype
+        or workspace_manager.max_token_num is None
+        or workspace_manager.max_token_num < tokens
+        or workspace_manager.hidden_dim is None
+        or workspace_manager.hidden_dim < 7168
+    ):
+        return None
+
+    workspace_ptrs = getattr(workspace, "workspace_tensor", None)
+    if (
+        not isinstance(workspace_ptrs, torch.Tensor)
+        or not workspace_ptrs.is_cuda
+        or not workspace_ptrs.is_contiguous()
+        or workspace_ptrs.numel() == 0
+        or workspace_ptrs.device != gemm2_out.device
+    ):
+        return None
+    if not workspace_manager.is_buffer_size_sufficient(
+        token_num=tokens,
+        hidden_dim=7168,
+        dtype=gemm2_out.dtype,
+        use_oneshot=True,
+    ):
+        return None
+
+    return FlashInferTrtllmMoeFinalizeWorkspaceState(
+        workspace=workspace,
+        workspace_ptrs=workspace_ptrs,
+        group_key=expected_group_key,
+        world_rank=workspace_manager.rank,
+        world_size=workspace_manager.world_size,
+        dtype=workspace_manager.dtype,
+        max_token_num=workspace_manager.max_token_num,
+        hidden_dim=workspace_manager.hidden_dim,
+    )
+
+
 def can_use_flashinfer_trtllm_moe_finalize_allreduce(
     gemm2_out: torch.Tensor,
     expert_weights: torch.Tensor,
@@ -817,64 +986,30 @@ def can_use_flashinfer_trtllm_moe_finalize_allreduce(
     keeps older FlashInfer installations on the existing finalize path.
     """
 
-    if _flashinfer_trtllm_moe_finalize is None or not is_sm100_supported():
-        return False
-    if (
-        getattr(get_server_args(), "flashinfer_allreduce_fusion_backend", None)
-        != "trtllm"
-    ):
-        # Do not silently divert an auto-selected MNNVL workspace into a TRTLLM
-        # pointer-table kernel.
-        return False
-
-    from sglang.srt.layers.moe import get_moe_runner_backend
-
-    if not get_moe_runner_backend().is_flashinfer_trtllm():
-        return False
-    parallel = get_parallel()
-    if (
-        parallel.tp_size != 4
-        or parallel.moe_tp_size != 4
-        or parallel.moe_ep_size != 1
-        or parallel.attn_dp_size != 1
-        or parallel.pp_size != 1
-        or parallel.attn_cp_size != 1
-        or parallel.dcp_size != 1
-    ):
-        return False
-
-    if (
-        gemm2_out.ndim != 2
-        or expert_weights.ndim != 2
-        or expanded_idx_to_permuted_idx.ndim != 2
-        or shared_expert_output.ndim != 2
-    ):
-        return False
-    tokens = expert_weights.shape[0]
-    if (
-        not 0 < tokens <= 2048
-        or top_k != 8
-        or expert_weights.shape != (tokens, top_k)
-        or expanded_idx_to_permuted_idx.shape != (tokens, top_k)
-        or gemm2_out.shape[1] != 7168
-        or shared_expert_output.shape != (tokens, 7168)
-    ):
-        return False
-    if gemm2_out.dtype not in (torch.float16, torch.bfloat16):
-        return False
-    if (
-        expert_weights.dtype != gemm2_out.dtype
-        or shared_expert_output.dtype != gemm2_out.dtype
-        or expanded_idx_to_permuted_idx.dtype != torch.int32
-    ):
-        return False
-    tensors = (
+    return get_flashinfer_trtllm_moe_finalize_workspace_state(
         gemm2_out,
         expert_weights,
         expanded_idx_to_permuted_idx,
         shared_expert_output,
+        top_k,
+    ) is not None
+
+
+def _flashinfer_trtllm_moe_finalize_workspace_drifted(
+    published: FlashInferTrtllmMoeFinalizeWorkspaceState,
+    current: FlashInferTrtllmMoeFinalizeWorkspaceState,
+) -> bool:
+    return (
+        current.workspace is not published.workspace
+        or current.workspace_ptrs.data_ptr() != published.workspace_ptrs.data_ptr()
+        or current.workspace_ptrs.device != published.workspace_ptrs.device
+        or current.group_key != published.group_key
+        or current.world_rank != published.world_rank
+        or current.world_size != published.world_size
+        or current.dtype != published.dtype
+        or current.max_token_num != published.max_token_num
+        or current.hidden_dim != published.hidden_dim
     )
-    return all(t.is_cuda and t.is_contiguous() for t in tensors)
 
 
 def try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
@@ -887,23 +1022,39 @@ def try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
     norm_weight: torch.Tensor,
     top_k: int,
     eps: float,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    workspace_state: FlashInferTrtllmMoeFinalizeWorkspaceState,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Finalize deferred MoE and fuse TP4 AR + residual + RMSNorm.
 
-    Returns ``(norm_out, residual_out)`` when the provisional FlashInfer API is
-    available, otherwise ``None`` so the caller can retain the established
-    finalize/all-reduce path.  The deferred producer already folds the routed
-    scaling factor into ``expert_weights``; passing it again would double-scale.
+    The producer already committed every rank to this collective when it
+    published S2.  Any invariant or workspace drift therefore fails before
+    launch rather than silently falling back to a mismatched collective.  The
+    deferred producer already folds the routed scaling factor into
+    ``expert_weights``; passing it again would double-scale.
     """
 
-    if not can_use_flashinfer_trtllm_moe_finalize_allreduce(
+    assert residual is not None, "Deferred MoE finalize requires a residual tensor"
+
+    current_workspace_state = get_flashinfer_trtllm_moe_finalize_workspace_state(
         gemm2_out,
         expert_weights,
         expanded_idx_to_permuted_idx,
         shared_expert_output,
         top_k,
+    )
+    if current_workspace_state is None:
+        raise RuntimeError(
+            "FlashInfer TRTLLM MoE finalize workspace became unavailable after "
+            "the deferred payload was published"
+        )
+    if _flashinfer_trtllm_moe_finalize_workspace_drifted(
+        workspace_state, current_workspace_state
     ):
-        return None
+        raise RuntimeError(
+            "FlashInfer TRTLLM MoE finalize workspace changed after the "
+            "deferred payload was published"
+        )
+
     tokens = expert_weights.shape[0]
     if (
         residual.shape != (tokens, 7168)
@@ -915,25 +1066,10 @@ def try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
         or not residual.is_contiguous()
         or not norm_weight.is_contiguous()
     ):
-        return None
-
-    if not ensure_workspace_initialized(
-        max_token_num=2048,
-        hidden_dim=7168,
-        dtype=gemm2_out.dtype,
-        token_num=tokens,
-        use_oneshot=True,
-        use_attn_tp_group=False,
-    ):
-        return None
-    workspace_manager = _get_workspace_manager(use_attn_tp_group=False)
-    workspace = workspace_manager.workspace
-    if (
-        workspace is None
-        or workspace_manager.backend != "trtllm"
-        or not hasattr(workspace, "workspace_tensor")
-    ):
-        return None
+        raise RuntimeError(
+            "Deferred MoE finalize residual/RMSNorm tensors no longer match "
+            "the guarded TP4 H7168 contract"
+        )
 
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(residual)
@@ -946,10 +1082,10 @@ def try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
         residual_out=residual_out,
         quant_out=None,
         scale_out=None,
-        workspace_ptrs=workspace.workspace_tensor,
+        workspace_ptrs=current_workspace_state.workspace_ptrs,
         launch_with_pdl=True,
-        world_rank=workspace_manager.rank,
-        world_size=workspace_manager.world_size,
+        world_rank=current_workspace_state.world_rank,
+        world_size=current_workspace_state.world_size,
         eps=eps,
         shared_expert_output=shared_expert_output,
         expert_scale_factor=expert_weights,

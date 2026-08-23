@@ -16,10 +16,18 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeWorkspace:
-    def __init__(self, backend, world_size, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        backend,
+        world_size,
+        dtype=torch.bfloat16,
+        workspace_tensor=None,
+    ):
         self.backend = backend
         self.world_size = world_size
         self.metadata = {"use_fp32_lamport": dtype == torch.float32}
+        if workspace_tensor is not None:
+            self.workspace_tensor = workspace_tensor
 
     def is_buffer_size_sufficient(self, **_kwargs):
         return True
@@ -313,6 +321,190 @@ class TestFlashInferCommFusion(CustomTestCase):
             else:
                 buffers[manager_key] = original_manager
             fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+
+class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
+    @staticmethod
+    def _tensors():
+        tokens = 2
+        dtype = torch.bfloat16
+        return dict(
+            gemm2_out=torch.randn(tokens * 8, 7168, dtype=dtype, device="cuda"),
+            expert_weights=torch.randn(tokens, 8, dtype=dtype, device="cuda"),
+            expanded_idx_to_permuted_idx=torch.zeros(
+                tokens, 8, dtype=torch.int32, device="cuda"
+            ),
+            shared_expert_output=torch.randn(
+                tokens, 7168, dtype=dtype, device="cuda"
+            ),
+            top_k=8,
+        )
+
+    @staticmethod
+    def _manager(group_key, *, workspace_tensor=None):
+        if workspace_tensor is None:
+            workspace_tensor = torch.zeros(32, dtype=torch.int64, device="cuda")
+        manager = fusion.FlashInferWorkspaceManager()
+        manager.workspace = _FakeWorkspace(
+            "trtllm", 4, workspace_tensor=workspace_tensor
+        )
+        manager.initialized = True
+        manager.world_size = 4
+        manager.rank = 1
+        manager.group = group_key
+        manager.max_token_num = 2048
+        manager.hidden_dim = 7168
+        manager.dtype = torch.bfloat16
+        manager.backend = "trtllm"
+        manager.use_fp32_lamport = False
+        return manager
+
+    @contextlib.contextmanager
+    def _patched_moe_workspace(self, manager, group_key):
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        manager_key = "flashinfer_fusion_moe_tp_workspace"
+        original_manager = buffers.get(manager_key)
+        parallel = types.SimpleNamespace(
+            tp_size=4,
+            moe_tp_size=4,
+            moe_tp_rank=1,
+            moe_ep_size=1,
+            attn_dp_size=1,
+            pp_size=1,
+            attn_cp_size=1,
+            dcp_size=1,
+        )
+        coordinator = types.SimpleNamespace(
+            device_group=group_key[0], cpu_group=group_key[1]
+        )
+        runner_backend = types.SimpleNamespace(
+            is_flashinfer_trtllm=lambda: True
+        )
+        server_args = types.SimpleNamespace(
+            flashinfer_allreduce_fusion_backend="trtllm"
+        )
+
+        buffers[manager_key] = manager
+        with (
+            patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
+            patch.object(fusion, "_flashinfer_trtllm_moe_finalize", MagicMock()),
+            patch.object(fusion, "is_sm100_supported", return_value=True),
+            patch.object(
+                fusion,
+                "_is_flashinfer_trtllm_moe_finalize_execution_route_supported",
+                return_value=True,
+            ),
+            patch.object(fusion, "get_server_args", return_value=server_args),
+            patch.object(fusion, "get_parallel", return_value=parallel),
+            patch.object(fusion, "get_moe_tp_group", return_value=coordinator),
+            patch(
+                "sglang.srt.layers.moe.get_moe_runner_backend",
+                return_value=runner_backend,
+            ),
+        ):
+            try:
+                yield
+            finally:
+                if original_manager is None:
+                    buffers.pop(manager_key, None)
+                else:
+                    buffers[manager_key] = original_manager
+
+    def setUp(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for device pointer-table validation")
+
+    def test_ready_workspace_is_captured_without_initialization(self):
+        group_key = (object(), object())
+        manager = self._manager(group_key)
+        tensors = self._tensors()
+        with self._patched_moe_workspace(manager, group_key), patch.object(
+            fusion,
+            "ensure_workspace_initialized",
+            side_effect=AssertionError("must not initialize on the S2 path"),
+        ) as ensure:
+            state = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
+                **tensors
+            )
+
+        self.assertIsNotNone(state)
+        self.assertIs(state.workspace, manager.workspace)
+        self.assertIs(state.workspace_ptrs, manager.workspace.workspace_tensor)
+        ensure.assert_not_called()
+
+    def test_workspace_metadata_mismatch_fails_closed(self):
+        group_key = (object(), object())
+        tensors = self._tensors()
+        mutations = {
+            "backend": lambda manager: setattr(manager, "backend", "mnnvl"),
+            "group": lambda manager: setattr(manager, "group", (object(), object())),
+            "rank": lambda manager: setattr(manager, "rank", 0),
+            "world_size": lambda manager: setattr(manager, "world_size", 2),
+            "dtype": lambda manager: setattr(manager, "dtype", torch.float16),
+            "token_capacity": lambda manager: setattr(manager, "max_token_num", 1),
+            "hidden_capacity": lambda manager: setattr(manager, "hidden_dim", 4096),
+            "pointer_table": lambda manager: setattr(
+                manager.workspace, "workspace_tensor", torch.zeros(8)
+            ),
+        }
+
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                manager = self._manager(group_key)
+                mutate(manager)
+                with self._patched_moe_workspace(manager, group_key):
+                    self.assertIsNone(
+                        fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
+                            **tensors
+                        )
+                    )
+
+    def test_workspace_replacement_after_publication_fails_fast(self):
+        group_key = (object(), object())
+        manager = self._manager(group_key)
+        tensors = self._tensors()
+        residual = torch.randn(2, 7168, dtype=torch.bfloat16, device="cuda")
+        norm_weight = torch.randn(7168, dtype=torch.bfloat16, device="cuda")
+
+        with self._patched_moe_workspace(manager, group_key):
+            published = (
+                fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
+            )
+            self.assertIsNotNone(published)
+            manager.workspace = _FakeWorkspace(
+                "trtllm",
+                4,
+                workspace_tensor=torch.zeros(32, dtype=torch.int64, device="cuda"),
+            )
+            with self.assertRaisesRegex(RuntimeError, "workspace changed"):
+                fusion.try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
+                    **tensors,
+                    residual=residual,
+                    norm_weight=norm_weight,
+                    eps=1e-6,
+                    workspace_state=published,
+                )
+
+    def test_none_residual_fails_before_workspace_access(self):
+        with patch.object(
+            fusion,
+            "get_flashinfer_trtllm_moe_finalize_workspace_state",
+            side_effect=AssertionError("workspace must not be read"),
+        ):
+            with self.assertRaisesRegex(AssertionError, "requires a residual"):
+                fusion.try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
+                    gemm2_out=None,
+                    expert_weights=None,
+                    expanded_idx_to_permuted_idx=None,
+                    shared_expert_output=None,
+                    residual=None,
+                    norm_weight=None,
+                    top_k=8,
+                    eps=1e-6,
+                    workspace_state=None,
+                )
 
 
 _GROUP_KEY = ("device_group", "cpu_group")

@@ -1028,16 +1028,17 @@ class DeepseekV2MoE(nn.Module):
                 and not get_attn_tp_context().input_scattered
             ):
                 from sglang.srt.layers.flashinfer_comm_fusion import (
-                    can_use_flashinfer_trtllm_moe_finalize_allreduce,
+                    get_flashinfer_trtllm_moe_finalize_workspace_state,
                 )
 
-                if can_use_flashinfer_trtllm_moe_finalize_allreduce(
+                workspace_state = get_flashinfer_trtllm_moe_finalize_workspace_state(
                     final_hidden_states.gemm2_out,
                     final_hidden_states.expert_weights,
                     final_hidden_states.expanded_idx_to_permuted_idx,
                     shared_output,
                     final_hidden_states.top_k,
-                ):
+                )
+                if workspace_state is not None:
                     # Carry the permuted producer output to the next layer's
                     # input RMSNorm.  That is where residual and norm_weight
                     # become available, so the collective is fused exactly
@@ -1045,6 +1046,7 @@ class DeepseekV2MoE(nn.Module):
                     return FlashInferTrtllmDeferredFinalizeAllReduceOutput(
                         deferred_output=final_hidden_states,
                         shared_expert_output=shared_output,
+                        workspace_state=workspace_state,
                     )
 
             final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
@@ -2493,7 +2495,11 @@ class DeepseekV2DecoderLayer(nn.Module):
                 try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm,
             )
 
-            fused_result = (
+            assert residual is not None, (
+                "A deferred MoE finalize payload must be consumed by a layer "
+                "with an existing residual"
+            )
+            hidden_states, residual = (
                 try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
                     gemm2_out=pending_finalize.deferred_output.gemm2_out,
                     expert_weights=pending_finalize.deferred_output.expert_weights,
@@ -2505,26 +2511,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                     norm_weight=self.input_layernorm.weight.data,
                     top_k=pending_finalize.deferred_output.top_k,
                     eps=self.input_layernorm.variance_epsilon,
+                    workspace_state=pending_finalize.workspace_state,
                 )
-                if residual is not None
-                else None
             )
-            if fused_result is not None:
-                hidden_states, residual = fused_result
-                pre_normalized = True
-            else:
-                # Rank-invariant capability checks normally decide this before
-                # the value crosses the layer boundary.  Keep a correctness
-                # fallback for workspace loss or an unsupported norm tensor.
-                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                    finalize_flashinfer_trtllm_deferred_output,
-                )
-
-                hidden_states = finalize_flashinfer_trtllm_deferred_output(
-                    pending_finalize.deferred_output,
-                    pending_finalize.shared_expert_output,
-                )
-                hidden_states._sglang_needs_allreduce_fusion = True
+            pre_normalized = True
 
         hidden_states_orig = hidden_states
         hidden_states, residual = (
