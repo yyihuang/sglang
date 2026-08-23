@@ -511,6 +511,8 @@ def test_qualification_protocol_requires_two_five_and_dual_performance_order():
     invalid_protocols = (
         {"run_order": "both", "warmup_runs": 1, "measure_runs": 5},
         {"run_order": "both", "warmup_runs": 2, "measure_runs": 4},
+        {"run_order": "both", "warmup_runs": 3, "measure_runs": 5},
+        {"run_order": "both", "warmup_runs": 2, "measure_runs": 6},
         {
             "run_order": "reference-first",
             "warmup_runs": 2,
@@ -566,6 +568,21 @@ def test_dual_order_performance_qualification_fails_closed():
         "candidate_hit_count_not_positive",
         "candidate_hit_count_mismatch",
         "missing_run_order_result",
+    }
+
+
+def test_dual_order_performance_qualification_rejects_nonfixed_counts():
+    qualification = evaluate_dual_order_performance_qualification(
+        {
+            run_order: _performance_order_result(warmup_runs=3, measure_runs=6)
+            for run_order in ("reference-first", "candidate-first")
+        }
+    )
+
+    assert qualification["passed"] is False
+    assert {failure["reason"] for failure in qualification["failures"]} == {
+        "unexpected_warmup_runs",
+        "unexpected_measure_runs",
     }
 
 

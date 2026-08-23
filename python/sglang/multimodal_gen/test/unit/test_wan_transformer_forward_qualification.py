@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -28,12 +29,15 @@ from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
     _warmup_wan_transformer_forward,
     build_wan_transformer_evidence_binding,
     capture_wan_transformer_forward,
+    run_wan_transformer_forward_performance_qualification,
     run_wan_transformer_forward_qualification,
+    validate_wan_transformer_forward_performance_report,
     validate_wan_transformer_forward_report,
 )
 from sglang.multimodal_gen.tools.run_wan_transformer_forward_report import (
     _configure_standalone_layerwise_offload,
     build_direct_port_provenance,
+    select_direct_qualification_runner,
 )
 
 
@@ -73,6 +77,200 @@ def test_direct_port_provenance_requires_variant_isolation():
     ):
         with pytest.raises(ValueError):
             build_direct_port_provenance(**kwargs)
+
+
+def test_direct_cli_mode_dispatches_to_trajectory_free_performance_runner():
+    assert select_direct_qualification_runner("performance") is (
+        run_wan_transformer_forward_performance_qualification
+    )
+    assert select_direct_qualification_runner("correctness") is (
+        run_wan_transformer_forward_qualification
+    )
+    with pytest.raises(ValueError, match="unsupported direct comparison mode"):
+        select_direct_qualification_runner("other")
+
+
+def test_direct_performance_report_requires_tail5_hits_and_process_stream_proof():
+    binding = {
+        "schema_version": 1,
+        "component_name": "transformer_2",
+        "resolved_component_path": "/models/wan/transformer_2",
+        "fixed_input": {"hidden_states": {"sha256": "a" * 64}},
+        "reference_model": {"num_blocks": 40},
+        "candidate_model": {"num_blocks": 40},
+        "capture_manifest_sha256": "b" * 64,
+        "capture_request_id": "capture-request",
+        "capture_sampling_sha256": "c" * 64,
+        "capture_coordinates": {
+            "step_index": 11,
+            "actual_timestep": 521,
+            "cfg_branch_index": 0,
+        },
+    }
+    binding["fixed_input_sha256"] = hashlib.sha256(
+        json.dumps(
+            binding["fixed_input"], sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    binding["binding_sha256"] = hashlib.sha256(
+        json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    def variant_summary(variant: str) -> dict:
+        hits = 5 if variant == "candidate" else 0
+        request_ids = [f"{variant}-{index}" for index in range(5)]
+        all_layers = list(range(40))
+        hybrid_layers = [35, 36, 37, 38, 39] if variant == "candidate" else []
+
+        def coverage(request_id: str) -> dict:
+            return {
+                "schema_version": 2,
+                "request_id": request_id,
+                "expected_hit_count": hits,
+                "actual_hit_count": hits,
+                "attributed_actual_hit_count": hits,
+                "unattributed_actual_hit_count": 0,
+                "eligible_hybrid_miss_count": 0,
+                "num_route_events": 40,
+                "num_success_events": hits,
+                "steps": [
+                    {
+                        "step_index": 11,
+                        "actual_timestep": 521,
+                        "active_component": "transformer_2",
+                        "executed_cfg_branch_indices": [0],
+                        "branches": [
+                            {
+                                "cfg_branch_index": 0,
+                                "num_layers": 40,
+                                "layer_indices": all_layers,
+                                "eligible_layer_indices": hybrid_layers,
+                                "planned_hybrid_layer_indices": hybrid_layers,
+                                "successful_hybrid_layer_indices": hybrid_layers,
+                                "eligible_hybrid_miss_layer_indices": [],
+                                "unexpected_successful_hybrid_layer_indices": [],
+                                "configured_fallback_layer_indices": (
+                                    [
+                                        index
+                                        for index in all_layers
+                                        if index not in hybrid_layers
+                                    ]
+                                    if variant == "candidate"
+                                    else []
+                                ),
+                                "control_layer_indices": (
+                                    [] if variant == "candidate" else all_layers
+                                ),
+                                "expected_hit_count": hits,
+                                "actual_hit_count": hits,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        return {
+            "warmup_runs": 2,
+            "measure_runs": 5,
+            "per_run_duration_ms": [1.0] * 5,
+            "median_duration_ms": 1.0,
+            "per_run_request_id": request_ids,
+            "per_run_controller_pid": [1234] * 5,
+            "per_run_cuda_stream_handle": [5678] * 5,
+            "per_run_wan_hybrid_expected_hit_count": [hits] * 5,
+            "per_run_wan_hybrid_hit_count": [hits] * 5,
+            "per_run_wan_hybrid_coverage": [
+                coverage(request_id) for request_id in request_ids
+            ],
+            "per_run_output_summary": [{"finite": True} for _ in range(5)],
+            "coverage_failures": [],
+        }
+
+    port_provenance = {
+        "master_port": 32000,
+        "reference_scheduler_port": 56000,
+        "candidate_scheduler_port": 56001,
+        "reference_strict_ports": True,
+        "candidate_strict_ports": True,
+    }
+    report = {
+        "comparison_mode": "performance",
+        "run_order": "both",
+        "warmup_runs": 2,
+        "measure_runs": 5,
+        "trajectory_capture": False,
+        "correctness_evidence_scope": "separate direct correctness reports required",
+        "timing_scope": (
+            "synchronized complete Wan transformer forward with output materialized"
+        ),
+        "timing_method": (
+            "time.perf_counter wall clock around a CUDA-synchronized model call; "
+            "not bench_gpu_time kernel latency"
+        ),
+        "component_name": "transformer_2",
+        "evidence_binding": binding,
+        "invocation_input_sha256": binding["fixed_input_sha256"],
+        "candidate_wan_hybrid_layer_indices": [35, 36, 37, 38, 39],
+        "candidate_wan_hybrid_eligible_layer_indices": [35, 36, 37, 38, 39],
+        "candidate_wan_hybrid_max_timestep": 521,
+        "candidate_backend_exercised": True,
+        "execution_topology": {
+            "controller_pid": 1234,
+            "same_python_process": True,
+            "reference_model_reused_across_orders": True,
+            "candidate_model_reused_across_orders": True,
+            "same_cuda_device": True,
+            "same_fixed_input_object": True,
+            "cuda_device": "cuda:0",
+            "same_cuda_stream_proven": True,
+            "cuda_stream_handle": 5678,
+            "direct_in_process_models": 2,
+            "scheduler_worker_processes": 0,
+            "scheduler_ports_reserved_for_variant_configuration_only": True,
+            "port_topology": port_provenance,
+        },
+        "port_provenance": port_provenance,
+        "order_results": {
+            run_order: {
+                "execution_order": (
+                    ["reference", "candidate"]
+                    if run_order == "reference-first"
+                    else ["candidate", "reference"]
+                ),
+                "reference_forward": variant_summary("reference"),
+                "candidate_forward": variant_summary("candidate"),
+                "performance": {
+                    "reference_median_duration_ms": 1.0,
+                    "candidate_median_duration_ms": 1.0,
+                    "median_speedup": 1.0,
+                },
+            }
+            for run_order in ("reference-first", "candidate-first")
+        },
+        "qualification": {
+            "passed": True,
+            "thresholds": {
+                "required_run_orders": ["reference-first", "candidate-first"],
+                "warmup_runs_equals": 2,
+                "measure_runs_equals": 5,
+                "candidate_hit_count_equals": 5,
+                "speedup_min": 1.0,
+            },
+            "failures": [],
+        },
+    }
+
+    assert validate_wan_transformer_forward_performance_report(report) == []
+
+    report["order_results"]["candidate-first"]["candidate_forward"][
+        "per_run_wan_hybrid_hit_count"
+    ][0] = 4
+    report["execution_topology"]["same_cuda_stream_proven"] = False
+    report["port_provenance"]["candidate_scheduler_port"] = 56000
+    errors = validate_wan_transformer_forward_performance_report(report)
+    assert any("candidate: forward evidence" in error for error in errors)
+    assert "performance process/stream topology is not proven" in errors
+    assert "performance ports are not explicit, strict, and distinct" in errors
 
 
 class _AddBlock(nn.Module):

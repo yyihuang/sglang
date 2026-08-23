@@ -12,6 +12,9 @@ import pytest
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MODEL_QUALIFICATION_THRESHOLDS,
     QUALIFICATION_RUN_ORDERS,
+    WAN_HYBRID_PROMOTION_GENERATION_HITS,
+    WAN_HYBRID_PROMOTION_LAYER_INDICES,
+    WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
     _module_git_revision,
 )
 from sglang.multimodal_gen.tools.run_wan_hybrid_qualification import (
@@ -56,11 +59,22 @@ def _coverage(
     route_events = 0
     for step_index in range(num_steps):
         component = "transformer" if step_index < num_steps // 2 else "transformer_2"
+        actual_timestep = (
+            WAN_HYBRID_PROMOTION_MAX_TIMESTEP
+            if step_index == num_steps - 1
+            else 999 - step_index
+        )
         branches = []
         for branch_index in range(2):
-            if scenario == "generation" or (
-                scenario == "full-transformer" and component == "transformer"
-            ):
+            if scenario == "generation":
+                eligible = (
+                    list(WAN_HYBRID_PROMOTION_LAYER_INDICES)
+                    if actual_timestep <= WAN_HYBRID_PROMOTION_MAX_TIMESTEP
+                    else []
+                )
+                fallback = [index for index in expected_layers if index not in eligible]
+                control = []
+            elif scenario == "full-transformer" and component == "transformer":
                 eligible = WAN_HYBRID_DEFAULT_LAYER_INDICES
                 fallback = [index for index in expected_layers if index not in eligible]
                 control = []
@@ -93,7 +107,7 @@ def _coverage(
         steps.append(
             {
                 "step_index": step_index,
-                "actual_timestep": 999 - step_index,
+                "actual_timestep": actual_timestep,
                 "active_component": component,
                 "executed_cfg_branch_indices": [0, 1],
                 "branches": branches,
@@ -190,6 +204,13 @@ def _provenance(server_kwargs: dict) -> dict:
             "gpu": {"name": "test GPU"},
         },
         "normalized_backend_request": server_kwargs,
+        "port_isolation": {
+            "master_port": 30000,
+            "reference_scheduler_port": 30001,
+            "candidate_scheduler_port": 30002,
+            "reference_strict_ports": True,
+            "candidate_strict_ports": True,
+        },
     }
 
 
@@ -197,8 +218,26 @@ def _correctness_report(run_order: str, measure_runs: int = 5) -> dict:
     cross_pairs = itertools.product(range(measure_runs), range(measure_runs))
     repeat_pairs = list(itertools.combinations(range(measure_runs), 2))
     server_kwargs = {
-        "reference": {"attention_backend": "fa"},
-        "candidate": {"attention_backend": "wan_hybrid"},
+        "reference": {
+            "attention_backend": "fa",
+            "master_port": 30000,
+            "scheduler_port": 30001,
+            "strict_ports": True,
+        },
+        "candidate": {
+            "attention_backend": "wan_hybrid",
+            "attention_backend_config": json.dumps(
+                {
+                    "wan_hybrid_layer_indices": WAN_HYBRID_PROMOTION_LAYER_INDICES,
+                    "wan_hybrid_max_timestep": WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "master_port": 30000,
+            "scheduler_port": 30002,
+            "strict_ports": True,
+        },
     }
     report = {
         "model_id": "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
@@ -250,19 +289,51 @@ def _correctness_report(run_order: str, measure_runs: int = 5) -> dict:
                     "candidate_hit_count_equals_expected": True,
                     "expected_hit_count_min_exclusive": 0,
                 },
-                "expected_hit_counts": [24] * measure_runs,
-                "actual_hit_counts": [24] * measure_runs,
+                "expected_hit_counts": [WAN_HYBRID_PROMOTION_GENERATION_HITS]
+                * measure_runs,
+                "actual_hit_counts": [WAN_HYBRID_PROMOTION_GENERATION_HITS]
+                * measure_runs,
             },
         },
     }
     report["provenance"] = _provenance(server_kwargs)
+    report["execution_topology"] = {
+        "controller_pid": 1234,
+        "controller_process_reused": True,
+        "variant_worker_process_sets": 2,
+        "variant_worker_process_reused": False,
+        "variant_worker_lifecycle": (
+            "fresh local DiffGenerator scheduler process set per variant and run order"
+        ),
+        "same_gpu_worker_process": False,
+        "same_cuda_stream_proven": False,
+        "port_isolation": report["provenance"]["port_isolation"],
+    }
     return report
 
 
 def _performance_report(measure_runs: int = 5) -> dict:
     server_kwargs = {
-        "reference": {"attention_backend": "fa"},
-        "candidate": {"attention_backend": "wan_hybrid"},
+        "reference": {
+            "attention_backend": "fa",
+            "master_port": 30000,
+            "scheduler_port": 30001,
+            "strict_ports": True,
+        },
+        "candidate": {
+            "attention_backend": "wan_hybrid",
+            "attention_backend_config": json.dumps(
+                {
+                    "wan_hybrid_layer_indices": WAN_HYBRID_PROMOTION_LAYER_INDICES,
+                    "wan_hybrid_max_timestep": WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "master_port": 30000,
+            "scheduler_port": 30002,
+            "strict_ports": True,
+        },
     }
     report = {
         "model_id": "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
@@ -296,8 +367,8 @@ def _performance_report(measure_runs: int = 5) -> dict:
             "failures": [],
             "thresholds": {
                 "required_run_orders": list(QUALIFICATION_RUN_ORDERS),
-                "warmup_runs_min": 2,
-                "measure_runs_min": 5,
+                "warmup_runs_equals": 2,
+                "measure_runs_equals": 5,
                 "speedup_min": 1.0,
                 "candidate_hit_count_equals_expected": True,
                 "expected_hit_count_min_exclusive": 0,
@@ -312,6 +383,18 @@ def _performance_report(measure_runs: int = 5) -> dict:
         ).encode()
     ).hexdigest()
     report["provenance"] = provenance
+    report["execution_topology"] = {
+        "controller_pid": 1234,
+        "controller_process_reused": True,
+        "variant_worker_process_sets": 4,
+        "variant_worker_process_reused": False,
+        "variant_worker_lifecycle": (
+            "fresh local DiffGenerator scheduler process set per variant and run order"
+        ),
+        "same_gpu_worker_process": False,
+        "same_cuda_stream_proven": False,
+        "port_isolation": provenance["port_isolation"],
+    }
     return report
 
 
@@ -469,6 +552,13 @@ def _full_transformer_forward_report(
         "invocation_input_sha256": binding["fixed_input_sha256"],
         "num_blocks": 40,
         "candidate_wan_hybrid_layer_indices": WAN_HYBRID_DEFAULT_LAYER_INDICES,
+        "candidate_wan_hybrid_eligible_layer_indices": (
+            WAN_HYBRID_DEFAULT_LAYER_INDICES
+        ),
+        "candidate_backend_exercised": True,
+        "candidate_backend_expectation": "exercised",
+        "candidate_wan_hybrid_min_timestep": None,
+        "candidate_wan_hybrid_max_timestep": None,
         "candidate_per_run_wan_hybrid_hit_count": [1] * measure_runs,
         "candidate_per_run_wan_hybrid_expected_hit_count": [1] * measure_runs,
         "reference_per_run_request_id": request_ids["reference"],
@@ -512,6 +602,7 @@ def _full_transformer_forward_report(
                 },
                 "expected_hit_counts": [1] * measure_runs,
                 "actual_hit_counts": [1] * measure_runs,
+                "candidate_backend_exercised": True,
             },
             "request_local_backend_coverage": {
                 "passed": True,
@@ -521,13 +612,15 @@ def _full_transformer_forward_report(
     }
 
 
-def test_plan_uses_two_correctness_orders_and_one_dual_order_performance(tmp_path):
+def test_plan_uses_generation_invocations_and_direct_full_transformer_evidence(
+    tmp_path,
+):
     config = _config(tmp_path)
 
     plan = build_qualification_plan(config)
 
-    assert len(plan) == 9
-    for scenario in ("single-block", "full-transformer", "generation"):
+    assert len(plan) == 6
+    for scenario in ("single-block", "generation"):
         scenario_plan = [item for item in plan if item.scenario == scenario]
         assert [item.run_order for item in scenario_plan] == [
             "reference-first",
@@ -539,20 +632,47 @@ def test_plan_uses_two_correctness_orders_and_one_dual_order_performance(tmp_pat
             "correctness",
             "performance",
         ]
-    ports = {item.command[item.command.index("--master-port") + 1] for item in plan}
-    assert len(ports) == 9
+    port_triples = {
+        (
+            item.command[item.command.index("--master-port") + 1],
+            item.command[item.command.index("--reference-scheduler-port") + 1],
+            item.command[item.command.index("--candidate-scheduler-port") + 1],
+        )
+        for item in plan
+    }
+    assert len(port_triples) == 6
+    assert len({port for triple in port_triples for port in triple}) == 18
     assert all("--reference-attention-backend" in item.command for item in plan)
 
     single_block = next(item for item in plan if item.scenario == "single-block")
     assert '{"wan_hybrid_layer_indices":[0]}' in single_block.command
-    full_transformer = next(
-        item for item in plan if item.scenario == "full-transformer"
+    assert not any(item.scenario == "full-transformer" for item in plan)
+    generation = next(item for item in plan if item.scenario == "generation")
+    assert (
+        json.dumps(
+            {
+                "wan_hybrid_layer_indices": WAN_HYBRID_PROMOTION_LAYER_INDICES,
+                "wan_hybrid_max_timestep": WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        in generation.command
     )
-    assert "transformer=wan_hybrid" in full_transformer.command
-    assert "transformer_2=fa" in full_transformer.command
-    assert full_transformer.evidence_scope == (
-        "generation-trajectory-primary-transformer-component"
-    )
+
+
+def test_plan_rejects_variant_model_overrides_and_nonfixed_performance_counts(
+    tmp_path,
+):
+    with pytest.raises(ValueError, match="model overrides"):
+        build_qualification_plan(
+            _config(
+                tmp_path,
+                extra_compare_args=("--candidate-transformer-path=/tmp/other",),
+            )
+        )
+    with pytest.raises(ValueError, match="exactly warmup=2/measure=5"):
+        build_qualification_plan(_config(tmp_path, warmup_runs=3))
 
 
 def test_dry_run_records_neutral_staging_revisions(tmp_path):
@@ -564,13 +684,14 @@ def test_dry_run_records_neutral_staging_revisions(tmp_path):
         "sglang_revision": "sglang-revision",
         "flashinfer_revision": "flashinfer-revision",
     }
-    assert len(manifest["invocations"]) == 9
+    assert len(manifest["invocations"]) == 6
     assert manifest["full_transformer_forward_evidence"] == {
         "required": True,
-        "scope": "independent-single-forward-all-blocks-for-both-transformers",
+        "scope": "independent-direct-correctness-and-trajectory-off-performance",
         "expected_run_orders": ["reference-first", "candidate-first"],
         "expected_components": ["transformer", "transformer_2"],
         "report_paths": [],
+        "performance_report_paths": [],
         "validation_status": "deferred",
         "validation_errors": [],
     }
@@ -659,10 +780,12 @@ def test_full_transformer_plan_fails_before_generation_without_forward_evidence(
     evidence = manifest["full_transformer_forward_evidence"]
     assert evidence["validation_status"] == "failed"
     assert evidence["observed_component_run_orders"] == []
-    assert all(
-        invocation["status"] == "not-run-invalid-forward-evidence"
-        for invocation in manifest["invocations"]
+    assert evidence["observed_performance_reports"] == 0
+    assert any(
+        "trajectory-off dual-order report" in error
+        for error in evidence["validation_errors"]
     )
+    assert manifest["invocations"] == []
 
 
 def test_correctness_gate_requires_new_hit_field_and_complete_pair_step_coverage(
@@ -687,6 +810,32 @@ def test_correctness_gate_requires_new_hit_field_and_complete_pair_step_coverage
 
     assert any("wan_hybrid hit evidence" in error for error in errors)
     assert any("all-step coverage" in error for error in errors)
+
+
+def test_generation_promotion_rejects_route_port_and_topology_tampering(tmp_path):
+    config = _config(
+        tmp_path,
+        scenarios=("generation",),
+        modes=("correctness",),
+    )
+    invocation = build_qualification_plan(config)[0]
+    report = _correctness_report(invocation.run_order)
+    assert validate_qualification_report(report, invocation, config) == []
+
+    report["server_kwargs"]["candidate"][
+        "attention_backend_config"
+    ] = '{"wan_hybrid_layer_indices":[39],"wan_hybrid_max_timestep":521}'
+    report["server_kwargs"]["reference"]["transformer_weights_path"] = "/tmp/other"
+    report["execution_topology"]["same_cuda_stream_proven"] = True
+    report["provenance"]["port_isolation"]["candidate_scheduler_port"] = 30001
+    report["candidate_generation"]["per_run_wan_hybrid_hit_count"][0] = 5
+    errors = validate_qualification_report(report, invocation, config)
+
+    assert "generation candidate is not locked to tail5 at t521" in errors
+    assert "reference model override is forbidden" in errors
+    assert "execution topology does not match isolated worker semantics" in errors
+    assert "port provenance does not match the invocation" in errors
+    assert any("requires exactly 10 candidate hits" in error for error in errors)
 
 
 def test_report_provenance_binds_revision_model_and_sampling(tmp_path):
@@ -750,7 +899,9 @@ def test_runtime_revision_is_read_from_module_git_checkout(tmp_path):
 def test_cli_and_readme_require_four_component_order_reports(capsys):
     with pytest.raises(SystemExit):
         _parse_args(["--help"])
-    assert "pass exactly four" in " ".join(capsys.readouterr().out.split())
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "pass exactly four" in help_text
+    assert "pass exactly one" in help_text
 
     readme = Path(__file__).resolve().parents[2] / "README.md"
     documentation = readme.read_text(encoding="utf-8")

@@ -17,6 +17,10 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
+import os
+import statistics
+import time
 import uuid
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
@@ -43,6 +47,8 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     MIN_QUALIFICATION_WARMUP_RUNS,
     MODEL_QUALIFICATION_THRESHOLDS,
     QUALIFICATION_RUN_ORDERS,
+    WAN_HYBRID_PROMOTION_LAYER_INDICES,
+    WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
     compute_tensor_metrics,
     evaluate_candidate_backend_hit_qualification,
     evaluate_correctness_qualification,
@@ -83,6 +89,25 @@ class WanTransformerDirectRequest:
     enable_sequence_shard: bool = False
     enable_teacache: bool = False
     enable_spectrum: bool = False
+
+
+@dataclass(frozen=True)
+class WanTransformerForwardTiming:
+    duration_ms: float
+    request_id: str
+    component_name: str
+    step_index: int
+    actual_timestep: int
+    cfg_branch_index: int
+    num_blocks: int
+    controller_pid: int
+    cuda_stream_handle: int
+    wan_hybrid_coverage: dict[str, Any]
+    output_summary: dict[str, Any]
+
+    @property
+    def wan_hybrid_hit_count(self) -> int:
+        return self.wan_hybrid_coverage["actual_hit_count"]
 
 
 def _sha256_json(value: Any) -> str:
@@ -418,13 +443,16 @@ def _cross_variant_output_quality_failures(
 
 
 def _direct_coverage_failure(
-    trace: WanTransformerForwardTrace,
+    trace: Any,
     *,
     variant: str,
     candidate_layer_indices: Sequence[int],
+    num_blocks: int | None = None,
 ) -> dict[str, Any] | None:
     coverage = trace.wan_hybrid_coverage
-    expected_layers = list(range(len(trace.block_outputs)))
+    expected_layers = list(
+        range(num_blocks if num_blocks is not None else len(trace.block_outputs))
+    )
     candidate = variant == "candidate"
     expected_hybrid_layers = list(candidate_layer_indices) if candidate else []
     expected_hits = len(expected_hybrid_layers)
@@ -432,6 +460,7 @@ def _direct_coverage_failure(
     if coverage.get("request_id") != trace.request_id:
         return {"variant": variant, "reason": "request_id_mismatch"}
     expected_scalars = {
+        "schema_version": 2,
         "expected_hit_count": expected_hits,
         "actual_hit_count": expected_hits,
         "attributed_actual_hit_count": expected_hits,
@@ -529,6 +558,107 @@ def _warmup_wan_transformer_forward(
         ),
     ):
         model(**fixed_input)
+
+
+def _timed_wan_transformer_forward(
+    model: Any,
+    *,
+    fixed_input: Mapping[str, Any],
+    request_id: str,
+    component_name: str,
+    step_index: int,
+    actual_timestep: int,
+    cfg_branch_index: int,
+    device: torch.device,
+) -> WanTransformerForwardTiming:
+    """Time one synchronized forward without hooks or trajectory snapshots."""
+
+    collector = WanHybridEvidenceCollector(request_id=request_id)
+    controller_pid = os.getpid()
+    cuda_stream_handle = int(torch.cuda.current_stream(device).cuda_stream)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    with (
+        torch.inference_mode(),
+        _wan_transformer_autocast_context(fixed_input),
+        set_forward_context(
+            current_timestep=step_index,
+            attn_metadata=None,
+            forward_batch=WanTransformerDirectRequest(request_id=request_id),
+            wan_component_name=component_name,
+            wan_actual_timestep=actual_timestep,
+            wan_cfg_branch_index=cfg_branch_index,
+            wan_hybrid_evidence_collector=collector,
+        ),
+    ):
+        output = model(**fixed_input)
+    torch.cuda.synchronize(device)
+    if int(torch.cuda.current_stream(device).cuda_stream) != cuda_stream_handle:
+        raise RuntimeError("current CUDA stream changed during direct forward timing")
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    output_tensor = _extract_tensor(output, location="transformer output")
+    output_summary = {
+        "shape": list(output_tensor.shape),
+        "dtype": str(output_tensor.dtype),
+        "device": str(output_tensor.device),
+        "finite": bool(torch.isfinite(output_tensor).all().item()),
+    }
+    return WanTransformerForwardTiming(
+        duration_ms=duration_ms,
+        request_id=request_id,
+        component_name=component_name,
+        step_index=step_index,
+        actual_timestep=actual_timestep,
+        cfg_branch_index=cfg_branch_index,
+        num_blocks=len(model.blocks),
+        controller_pid=controller_pid,
+        cuda_stream_handle=cuda_stream_handle,
+        wan_hybrid_coverage=collector.coverage(),
+        output_summary=output_summary,
+    )
+
+
+def _run_timed_variant(
+    model: Any,
+    *,
+    fixed_input: Mapping[str, Any],
+    variant: str,
+    component_name: str,
+    step_index: int,
+    actual_timestep: int,
+    cfg_branch_index: int,
+    warmup_runs: int,
+    measure_runs: int,
+    device: torch.device,
+) -> list[WanTransformerForwardTiming]:
+    server_args = getattr(model, "_wan_qualification_server_args", None)
+    if server_args is not None:
+        from sglang.multimodal_gen.runtime.server_args import set_global_server_args
+
+        set_global_server_args(server_args)
+    for _ in range(warmup_runs):
+        _warmup_wan_transformer_forward(
+            model,
+            fixed_input=fixed_input,
+            request_id=f"wan-transformer-{variant}-perf-warmup-{uuid.uuid4()}",
+            component_name=component_name,
+            step_index=step_index,
+            actual_timestep=actual_timestep,
+            cfg_branch_index=cfg_branch_index,
+        )
+    return [
+        _timed_wan_transformer_forward(
+            model,
+            fixed_input=fixed_input,
+            request_id=f"wan-transformer-{variant}-perf-measure-{uuid.uuid4()}",
+            component_name=component_name,
+            step_index=step_index,
+            actual_timestep=actual_timestep,
+            cfg_branch_index=cfg_branch_index,
+            device=device,
+        )
+        for _ in range(measure_runs)
+    ]
 
 
 def evaluate_transformer_forward_correctness(
@@ -928,6 +1058,576 @@ def run_wan_transformer_forward_qualification(
         ],
         **result,
     }
+
+
+def run_wan_transformer_forward_performance_qualification(
+    *,
+    reference_model: Any,
+    candidate_model: Any,
+    capture_manifest_path: str | Path,
+    warmup_runs: int = MIN_QUALIFICATION_WARMUP_RUNS,
+    measure_runs: int = MIN_QUALIFICATION_MEASURE_RUNS,
+) -> dict[str, Any]:
+    """Time a real transformer_2@t521 forward in both orders without capture."""
+
+    validate_qualification_protocol(
+        comparison_mode="performance",
+        run_order="both",
+        warmup_runs=warmup_runs,
+        measure_runs=measure_runs,
+    )
+    fixed_input_cpu, capture_manifest = load_wan_transformer_input_capture(
+        capture_manifest_path
+    )
+    component = capture_manifest.get("component")
+    coordinates = capture_manifest.get("capture")
+    if not isinstance(component, dict) or not isinstance(coordinates, dict):
+        raise ValueError("Wan capture component or coordinates are missing")
+    component_name = component.get("name")
+    component_model_path = component.get("resolved_path")
+    step_index = coordinates.get("step_index")
+    actual_timestep = coordinates.get("actual_timestep")
+    cfg_branch_index = coordinates.get("cfg_branch_index")
+    if component_name != "transformer_2" or actual_timestep != (
+        WAN_HYBRID_PROMOTION_MAX_TIMESTEP
+    ):
+        raise ValueError(
+            "performance requires the production transformer_2@t521 capture"
+        )
+    if not isinstance(component_model_path, str) or not component_model_path:
+        raise ValueError("captured component path is missing")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (step_index, actual_timestep, cfg_branch_index)
+    ):
+        raise ValueError("captured step, timestep, and CFG branch must be integers")
+    _validate_loaded_model_against_capture(
+        reference_model, capture_manifest.get("model"), variant="reference"
+    )
+    _validate_loaded_model_against_capture(
+        candidate_model, capture_manifest.get("model"), variant="candidate"
+    )
+    reference_device = _model_device(reference_model)
+    candidate_device = _model_device(candidate_model)
+    if (
+        reference_device.type != "cuda"
+        or candidate_device.type != "cuda"
+        or reference_device != candidate_device
+    ):
+        raise ValueError("performance requires both models on the same CUDA device")
+    configured_layers = getattr(candidate_model, "wan_hybrid_layer_indices", None)
+    configured_layers = (
+        sorted(configured_layers) if configured_layers is not None else None
+    )
+    if configured_layers != list(WAN_HYBRID_PROMOTION_LAYER_INDICES):
+        raise ValueError("performance candidate must configure Wan tail5 layers 35..39")
+    if getattr(candidate_model, "wan_hybrid_max_timestep", None) != (
+        WAN_HYBRID_PROMOTION_MAX_TIMESTEP
+    ):
+        raise ValueError("performance candidate must configure max_timestep=521")
+    eligible_layers = _eligible_wan_hybrid_layer_indices(
+        candidate_model,
+        configured_layer_indices=configured_layers,
+        actual_timestep=actual_timestep,
+    )
+    if eligible_layers != list(WAN_HYBRID_PROMOTION_LAYER_INDICES):
+        raise ValueError("performance candidate tail5 route is not eligible at t521")
+
+    fixed_input_device = _move_fixed_input_to_model(
+        fixed_input_cpu, device=reference_device
+    )
+    reference_input = fixed_input_device
+    candidate_input = fixed_input_device
+    evidence_binding = build_wan_transformer_evidence_binding(
+        component_name=component_name,
+        component_model_path=component_model_path,
+        fixed_input=fixed_input_cpu,
+        reference_model=reference_model,
+        candidate_model=candidate_model,
+    )
+    evidence_binding = evidence_binding | {
+        "capture_manifest_sha256": capture_manifest["manifest_sha256"],
+        "capture_request_id": capture_manifest["request_id"],
+        "capture_coordinates": dict(coordinates),
+        "capture_sampling_sha256": capture_manifest["sampling"]["sampling_sha256"],
+    }
+    evidence_binding["binding_sha256"] = _sha256_json(
+        {
+            key: value
+            for key, value in evidence_binding.items()
+            if key != "binding_sha256"
+        }
+    )
+    stream_handle = int(torch.cuda.current_stream(reference_device).cuda_stream)
+    variant_calls = {
+        "reference": lambda: _run_timed_variant(
+            reference_model,
+            fixed_input=reference_input,
+            variant="reference",
+            component_name=component_name,
+            step_index=step_index,
+            actual_timestep=actual_timestep,
+            cfg_branch_index=cfg_branch_index,
+            warmup_runs=warmup_runs,
+            measure_runs=measure_runs,
+            device=reference_device,
+        ),
+        "candidate": lambda: _run_timed_variant(
+            candidate_model,
+            fixed_input=candidate_input,
+            variant="candidate",
+            component_name=component_name,
+            step_index=step_index,
+            actual_timestep=actual_timestep,
+            cfg_branch_index=cfg_branch_index,
+            warmup_runs=warmup_runs,
+            measure_runs=measure_runs,
+            device=candidate_device,
+        ),
+    }
+
+    def summarize_variant(
+        timings: Sequence[WanTransformerForwardTiming], *, variant: str
+    ) -> dict[str, Any]:
+        expected_layers = eligible_layers if variant == "candidate" else []
+        coverage_failures = [
+            failure
+            for timing in timings
+            if (
+                failure := _direct_coverage_failure(
+                    timing,
+                    variant=variant,
+                    candidate_layer_indices=eligible_layers,
+                    num_blocks=timing.num_blocks,
+                )
+            )
+            is not None
+        ]
+        return {
+            "warmup_runs": warmup_runs,
+            "measure_runs": measure_runs,
+            "per_run_duration_ms": [timing.duration_ms for timing in timings],
+            "median_duration_ms": statistics.median(
+                timing.duration_ms for timing in timings
+            ),
+            "per_run_request_id": [timing.request_id for timing in timings],
+            "per_run_controller_pid": [timing.controller_pid for timing in timings],
+            "per_run_cuda_stream_handle": [
+                timing.cuda_stream_handle for timing in timings
+            ],
+            "per_run_wan_hybrid_expected_hit_count": [len(expected_layers)]
+            * len(timings),
+            "per_run_wan_hybrid_hit_count": [
+                timing.wan_hybrid_hit_count for timing in timings
+            ],
+            "per_run_wan_hybrid_coverage": [
+                timing.wan_hybrid_coverage for timing in timings
+            ],
+            "per_run_output_summary": [timing.output_summary for timing in timings],
+            "coverage_failures": coverage_failures,
+        }
+
+    order_results: dict[str, Any] = {}
+    failures = []
+    for run_order in QUALIFICATION_RUN_ORDERS:
+        execution_order = (
+            ("reference", "candidate")
+            if run_order == "reference-first"
+            else ("candidate", "reference")
+        )
+        timings = {variant: variant_calls[variant]() for variant in execution_order}
+        reference_summary = summarize_variant(timings["reference"], variant="reference")
+        candidate_summary = summarize_variant(timings["candidate"], variant="candidate")
+        speedup = (
+            reference_summary["median_duration_ms"]
+            / candidate_summary["median_duration_ms"]
+        )
+        order_results[run_order] = {
+            "execution_order": list(execution_order),
+            "reference_forward": reference_summary,
+            "candidate_forward": candidate_summary,
+            "performance": {
+                "reference_median_duration_ms": reference_summary["median_duration_ms"],
+                "candidate_median_duration_ms": candidate_summary["median_duration_ms"],
+                "median_speedup": speedup,
+            },
+        }
+        if speedup < MODEL_QUALIFICATION_THRESHOLDS["speedup_min"]:
+            failures.append(
+                {
+                    "run_order": run_order,
+                    "reason": "median_speedup_below_minimum",
+                    "median_speedup": speedup,
+                }
+            )
+        for variant, summary in (
+            ("reference", reference_summary),
+            ("candidate", candidate_summary),
+        ):
+            if summary["coverage_failures"]:
+                failures.append(
+                    {
+                        "run_order": run_order,
+                        "variant": variant,
+                        "reason": "request_local_coverage_failure",
+                        "failures": summary["coverage_failures"],
+                    }
+                )
+            if (
+                any(
+                    not math.isfinite(duration) or duration <= 0
+                    for duration in summary["per_run_duration_ms"]
+                )
+                or any(
+                    output.get("finite") is not True
+                    for output in summary["per_run_output_summary"]
+                )
+                or summary["per_run_controller_pid"] != [os.getpid()] * measure_runs
+                or summary["per_run_cuda_stream_handle"]
+                != [stream_handle] * measure_runs
+            ):
+                failures.append(
+                    {
+                        "run_order": run_order,
+                        "variant": variant,
+                        "reason": "invalid_duration_or_nonfinite_output",
+                    }
+                )
+
+    invocation_input_sha256 = _sha256_json(_summarize_fixed_input(fixed_input_cpu))
+    if evidence_binding["fixed_input_sha256"] != invocation_input_sha256:
+        raise RuntimeError("full-transformer performance mutated the fixed input")
+    return {
+        "comparison_mode": "performance",
+        "run_order": "both",
+        "warmup_runs": warmup_runs,
+        "measure_runs": measure_runs,
+        "trajectory_capture": False,
+        "correctness_evidence_scope": "separate direct correctness reports required",
+        "timing_scope": (
+            "synchronized complete Wan transformer forward with output materialized"
+        ),
+        "timing_method": (
+            "time.perf_counter wall clock around a CUDA-synchronized model call; "
+            "not bench_gpu_time kernel latency"
+        ),
+        "component_name": component_name,
+        "capture_manifest_path": str(Path(capture_manifest_path).resolve()),
+        "evidence_binding": evidence_binding,
+        "invocation_input_sha256": invocation_input_sha256,
+        "candidate_wan_hybrid_layer_indices": configured_layers,
+        "candidate_wan_hybrid_eligible_layer_indices": eligible_layers,
+        "candidate_wan_hybrid_max_timestep": getattr(
+            candidate_model, "wan_hybrid_max_timestep", None
+        ),
+        "candidate_backend_exercised": True,
+        "execution_topology": {
+            "controller_pid": os.getpid(),
+            "same_python_process": True,
+            "reference_model_reused_across_orders": True,
+            "candidate_model_reused_across_orders": True,
+            "same_cuda_device": True,
+            "same_fixed_input_object": True,
+            "cuda_device": str(reference_device),
+            "same_cuda_stream_proven": True,
+            "cuda_stream_handle": stream_handle,
+        },
+        "order_results": order_results,
+        "qualification": {
+            "passed": not failures,
+            "thresholds": {
+                "required_run_orders": list(QUALIFICATION_RUN_ORDERS),
+                "warmup_runs_equals": MIN_QUALIFICATION_WARMUP_RUNS,
+                "measure_runs_equals": MIN_QUALIFICATION_MEASURE_RUNS,
+                "candidate_hit_count_equals": len(WAN_HYBRID_PROMOTION_LAYER_INDICES),
+                "speedup_min": MODEL_QUALIFICATION_THRESHOLDS["speedup_min"],
+            },
+            "failures": failures,
+        },
+    }
+
+
+def validate_wan_transformer_forward_performance_report(
+    report: Any,
+) -> list[str]:
+    """Fail closed on the independent trajectory-off direct timing report."""
+
+    if not isinstance(report, dict):
+        return ["performance report is not a JSON object"]
+    errors = []
+    expected_layers = list(WAN_HYBRID_PROMOTION_LAYER_INDICES)
+    expected_hits = len(expected_layers)
+    expected_scalars = {
+        "comparison_mode": "performance",
+        "run_order": "both",
+        "warmup_runs": MIN_QUALIFICATION_WARMUP_RUNS,
+        "measure_runs": MIN_QUALIFICATION_MEASURE_RUNS,
+        "trajectory_capture": False,
+        "correctness_evidence_scope": "separate direct correctness reports required",
+        "component_name": "transformer_2",
+        "candidate_wan_hybrid_layer_indices": expected_layers,
+        "candidate_wan_hybrid_eligible_layer_indices": expected_layers,
+        "candidate_wan_hybrid_max_timestep": WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+        "candidate_backend_exercised": True,
+    }
+    if any(report.get(name) != value for name, value in expected_scalars.items()):
+        errors.append("performance report does not match tail5 transformer_2@t521")
+    if report.get("timing_scope") != (
+        "synchronized complete Wan transformer forward with output materialized"
+    ):
+        errors.append("performance timing scope is incomplete")
+    if report.get("timing_method") != (
+        "time.perf_counter wall clock around a CUDA-synchronized model call; "
+        "not bench_gpu_time kernel latency"
+    ):
+        errors.append("performance timing method is missing or mislabelled")
+    binding = report.get("evidence_binding")
+    coordinates = (
+        binding.get("capture_coordinates") if isinstance(binding, dict) else None
+    )
+    if not isinstance(binding, dict) or binding.get("binding_sha256") != _sha256_json(
+        {key: value for key, value in binding.items() if key != "binding_sha256"}
+    ):
+        errors.append("performance evidence binding is invalid")
+    elif (
+        binding.get("schema_version") != 1
+        or binding.get("component_name") != "transformer_2"
+        or binding.get("fixed_input_sha256") != _sha256_json(binding.get("fixed_input"))
+        or report.get("invocation_input_sha256") != binding.get("fixed_input_sha256")
+        or not isinstance(binding.get("capture_manifest_sha256"), str)
+        or len(binding["capture_manifest_sha256"]) != 64
+        or not isinstance(binding.get("capture_request_id"), str)
+        or not binding["capture_request_id"]
+        or not isinstance(binding.get("capture_sampling_sha256"), str)
+        or len(binding["capture_sampling_sha256"]) != 64
+    ):
+        errors.append("performance real-input provenance is incomplete")
+    elif any(
+        not isinstance(binding.get(variant), dict)
+        or binding[variant].get("num_blocks") != 40
+        for variant in ("reference_model", "candidate_model")
+    ):
+        errors.append("performance model identity does not contain all 40 blocks")
+    valid_coordinates = isinstance(coordinates, dict) and all(
+        not isinstance(coordinates.get(name), bool)
+        and isinstance(coordinates.get(name), int)
+        for name in ("step_index", "actual_timestep", "cfg_branch_index")
+    )
+    if not valid_coordinates or coordinates.get("actual_timestep") != (
+        WAN_HYBRID_PROMOTION_MAX_TIMESTEP
+    ):
+        errors.append("performance capture is not the real t521 input")
+    topology = report.get("execution_topology")
+    if not isinstance(topology, dict) or any(
+        topology.get(name) is not True
+        for name in (
+            "same_python_process",
+            "reference_model_reused_across_orders",
+            "candidate_model_reused_across_orders",
+            "same_cuda_device",
+            "same_fixed_input_object",
+            "same_cuda_stream_proven",
+        )
+    ):
+        errors.append("performance process/stream topology is not proven")
+    elif (
+        isinstance(topology.get("controller_pid"), bool)
+        or not isinstance(topology.get("controller_pid"), int)
+        or isinstance(topology.get("cuda_stream_handle"), bool)
+        or not isinstance(topology.get("cuda_stream_handle"), int)
+    ):
+        errors.append("performance process/stream identity is missing")
+    elif (
+        topology.get("direct_in_process_models") != 2
+        or topology.get("scheduler_worker_processes") != 0
+        or topology.get("scheduler_ports_reserved_for_variant_configuration_only")
+        is not True
+    ):
+        errors.append("performance direct-process topology is incomplete")
+
+    order_results = report.get("order_results")
+    if not isinstance(order_results, dict):
+        errors.append("performance dual-order results are missing")
+    else:
+        for run_order in QUALIFICATION_RUN_ORDERS:
+            order = order_results.get(run_order)
+            if not isinstance(order, dict):
+                errors.append(f"{run_order}: performance result is missing")
+                continue
+            expected_order = (
+                ["reference", "candidate"]
+                if run_order == "reference-first"
+                else ["candidate", "reference"]
+            )
+            if order.get("execution_order") != expected_order:
+                errors.append(f"{run_order}: execution order is invalid")
+            for variant in ("reference", "candidate"):
+                summary = order.get(f"{variant}_forward")
+                if not isinstance(summary, dict):
+                    errors.append(f"{run_order}.{variant}: forward summary is missing")
+                    continue
+                durations = summary.get("per_run_duration_ms")
+                request_ids = summary.get("per_run_request_id")
+                output_summaries = summary.get("per_run_output_summary")
+                coverages = summary.get("per_run_wan_hybrid_coverage")
+                expected_variant_hits = expected_hits if variant == "candidate" else 0
+                expected_pid = (
+                    topology.get("controller_pid")
+                    if isinstance(topology, dict)
+                    else None
+                )
+                expected_stream = (
+                    topology.get("cuda_stream_handle")
+                    if isinstance(topology, dict)
+                    else None
+                )
+                if (
+                    summary.get("warmup_runs") != MIN_QUALIFICATION_WARMUP_RUNS
+                    or summary.get("measure_runs") != MIN_QUALIFICATION_MEASURE_RUNS
+                    or not isinstance(durations, list)
+                    or len(durations) != MIN_QUALIFICATION_MEASURE_RUNS
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(value)
+                        or value <= 0
+                        for value in durations
+                    )
+                    or not isinstance(request_ids, list)
+                    or len(request_ids) != MIN_QUALIFICATION_MEASURE_RUNS
+                    or len(set(request_ids)) != MIN_QUALIFICATION_MEASURE_RUNS
+                    or summary.get("per_run_controller_pid")
+                    != [expected_pid] * MIN_QUALIFICATION_MEASURE_RUNS
+                    or summary.get("per_run_cuda_stream_handle")
+                    != [expected_stream] * MIN_QUALIFICATION_MEASURE_RUNS
+                    or summary.get("per_run_wan_hybrid_expected_hit_count")
+                    != [expected_variant_hits] * MIN_QUALIFICATION_MEASURE_RUNS
+                    or summary.get("per_run_wan_hybrid_hit_count")
+                    != [expected_variant_hits] * MIN_QUALIFICATION_MEASURE_RUNS
+                    or summary.get("coverage_failures") != []
+                    or not isinstance(coverages, list)
+                    or len(coverages) != MIN_QUALIFICATION_MEASURE_RUNS
+                    or not isinstance(output_summaries, list)
+                    or len(output_summaries) != MIN_QUALIFICATION_MEASURE_RUNS
+                    or any(
+                        not isinstance(output, dict) or output.get("finite") is not True
+                        for output in output_summaries or []
+                    )
+                ):
+                    errors.append(f"{run_order}.{variant}: forward evidence is invalid")
+                elif valid_coordinates:
+                    if summary.get("median_duration_ms") != statistics.median(
+                        durations
+                    ):
+                        errors.append(
+                            f"{run_order}.{variant}: median duration is inconsistent"
+                        )
+                    for run_index, (request_id, coverage, output_summary) in enumerate(
+                        zip(request_ids, coverages, output_summaries)
+                    ):
+                        timing = WanTransformerForwardTiming(
+                            duration_ms=durations[run_index],
+                            request_id=request_id,
+                            component_name="transformer_2",
+                            step_index=coordinates["step_index"],
+                            actual_timestep=coordinates["actual_timestep"],
+                            cfg_branch_index=coordinates["cfg_branch_index"],
+                            num_blocks=40,
+                            controller_pid=expected_pid,
+                            cuda_stream_handle=expected_stream,
+                            wan_hybrid_coverage=coverage,
+                            output_summary=output_summary,
+                        )
+                        failure = _direct_coverage_failure(
+                            timing,
+                            variant=variant,
+                            candidate_layer_indices=expected_layers,
+                            num_blocks=40,
+                        )
+                        if failure is not None:
+                            errors.append(
+                                f"{run_order}.{variant}[{run_index}]: serialized "
+                                "coverage is invalid"
+                            )
+            speedup = order.get("performance", {}).get("median_speedup")
+            if (
+                isinstance(speedup, bool)
+                or not isinstance(speedup, (int, float))
+                or not math.isfinite(speedup)
+                or speedup < MODEL_QUALIFICATION_THRESHOLDS["speedup_min"]
+            ):
+                errors.append(f"{run_order}: median speedup is below 1.0")
+            else:
+                reference_summary = order.get("reference_forward")
+                candidate_summary = order.get("candidate_forward")
+                if isinstance(reference_summary, dict) and isinstance(
+                    candidate_summary, dict
+                ):
+                    reference_median = reference_summary.get("median_duration_ms")
+                    candidate_median = candidate_summary.get("median_duration_ms")
+                    performance = order.get("performance")
+                    if (
+                        not isinstance(performance, dict)
+                        or performance.get("reference_median_duration_ms")
+                        != reference_median
+                        or performance.get("candidate_median_duration_ms")
+                        != candidate_median
+                        or isinstance(reference_median, bool)
+                        or not isinstance(reference_median, (int, float))
+                        or isinstance(candidate_median, bool)
+                        or not isinstance(candidate_median, (int, float))
+                        or candidate_median <= 0
+                        or not math.isclose(
+                            speedup,
+                            reference_median / candidate_median,
+                            rel_tol=1e-12,
+                            abs_tol=0.0,
+                        )
+                    ):
+                        errors.append(f"{run_order}: timing comparison is inconsistent")
+    qualification = report.get("qualification")
+    expected_thresholds = {
+        "required_run_orders": list(QUALIFICATION_RUN_ORDERS),
+        "warmup_runs_equals": MIN_QUALIFICATION_WARMUP_RUNS,
+        "measure_runs_equals": MIN_QUALIFICATION_MEASURE_RUNS,
+        "candidate_hit_count_equals": expected_hits,
+        "speedup_min": MODEL_QUALIFICATION_THRESHOLDS["speedup_min"],
+    }
+    if (
+        not isinstance(qualification, dict)
+        or qualification.get("passed") is not True
+        or qualification.get("failures") != []
+        or qualification.get("thresholds") != expected_thresholds
+    ):
+        errors.append("performance qualification is incomplete")
+    if "cross_variant_metrics" in report or "repeatability" in report:
+        errors.append("performance report contains correctness trajectory data")
+    port_provenance = report.get("port_provenance")
+    if not isinstance(port_provenance, dict):
+        errors.append("performance port provenance is missing")
+    else:
+        ports = [
+            port_provenance.get("master_port"),
+            port_provenance.get("reference_scheduler_port"),
+            port_provenance.get("candidate_scheduler_port"),
+        ]
+        if (
+            any(
+                isinstance(port, bool)
+                or not isinstance(port, int)
+                or not 1 <= port <= 65535
+                for port in ports
+            )
+            or len(set(ports)) != 3
+            or port_provenance.get("reference_strict_ports") is not True
+            or port_provenance.get("candidate_strict_ports") is not True
+        ):
+            errors.append("performance ports are not explicit, strict, and distinct")
+        if isinstance(topology, dict) and topology.get("port_topology") != (
+            port_provenance
+        ):
+            errors.append("performance topology is not bound to port provenance")
+    return errors
 
 
 def validate_wan_transformer_forward_report(

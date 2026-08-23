@@ -23,8 +23,12 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     MIN_QUALIFICATION_WARMUP_RUNS,
     MODEL_QUALIFICATION_THRESHOLDS,
     QUALIFICATION_RUN_ORDERS,
+    WAN_HYBRID_PROMOTION_GENERATION_HITS,
+    WAN_HYBRID_PROMOTION_LAYER_INDICES,
+    WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
 )
 from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
+    validate_wan_transformer_forward_performance_report,
     validate_wan_transformer_forward_report,
 )
 
@@ -32,13 +36,21 @@ QUALIFICATION_SCENARIOS = ("single-block", "full-transformer", "generation")
 QUALIFICATION_MODES = ("correctness", "performance")
 WAN_TRANSFORMER_COMPONENTS = ("transformer", "transformer_2")
 WAN_HYBRID_DEFAULT_LAYER_INDICES = [39]
+FORBIDDEN_VARIANT_MODEL_OVERRIDE_OPTIONS = frozenset(
+    {
+        "--reference-transformer-path",
+        "--candidate-transformer-path",
+        "--reference-component-path",
+        "--candidate-component-path",
+    }
+)
 SCENARIO_EVIDENCE_SCOPES = {
     "single-block": "generation-trajectory-selected-transformer-block",
-    "full-transformer": "generation-trajectory-primary-transformer-component",
+    "full-transformer": "independent-direct-correctness-and-trajectory-off-performance",
     "generation": "generation-trajectory-all-eligible-transformer-components",
 }
 FULL_TRANSFORMER_FORWARD_EVIDENCE_SCOPE = (
-    "independent-single-forward-all-blocks-for-both-transformers"
+    "independent-direct-correctness-and-trajectory-off-performance"
 )
 
 
@@ -69,6 +81,7 @@ class WanQualificationConfig:
     python_executable: str = sys.executable
     extra_compare_args: tuple[str, ...] = ()
     full_transformer_forward_reports: tuple[Path, ...] = ()
+    full_transformer_performance_reports: tuple[Path, ...] = ()
 
     def validate(self) -> None:
         if not self.model_path:
@@ -86,6 +99,13 @@ class WanQualificationConfig:
         invalid_modes = set(self.modes) - set(QUALIFICATION_MODES)
         if invalid_modes:
             raise ValueError(f"unsupported modes: {sorted(invalid_modes)}")
+        if "performance" in self.modes and (
+            self.warmup_runs != MIN_QUALIFICATION_WARMUP_RUNS
+            or self.measure_runs != MIN_QUALIFICATION_MEASURE_RUNS
+        ):
+            raise ValueError(
+                "performance qualification requires exactly warmup=2/measure=5"
+            )
         if self.warmup_runs < MIN_QUALIFICATION_WARMUP_RUNS:
             raise ValueError(f"warmup_runs must be >= {MIN_QUALIFICATION_WARMUP_RUNS}")
         if self.measure_runs < MIN_QUALIFICATION_MEASURE_RUNS:
@@ -94,6 +114,17 @@ class WanQualificationConfig:
             )
         if self.master_port <= 0:
             raise ValueError("master_port must be positive")
+        override_options = {
+            argument.split("=", 1)[0]
+            for argument in self.extra_compare_args
+            if argument.startswith("--")
+        }
+        forbidden = sorted(override_options & FORBIDDEN_VARIANT_MODEL_OVERRIDE_OPTIONS)
+        if forbidden:
+            raise ValueError(
+                "qualification forbids reference/candidate model overrides: "
+                + ", ".join(forbidden)
+            )
 
 
 @dataclass(frozen=True)
@@ -115,16 +146,24 @@ def _scenario_candidate_args(scenario: str) -> tuple[str, ...]:
             '{"wan_hybrid_layer_indices":[0]}',
         )
     if scenario == "full-transformer":
-        return (
-            "--candidate-attention-backend",
-            "fa",
-            "--candidate-component-attention-backend",
-            "transformer=wan_hybrid",
-            "--candidate-component-attention-backend",
-            "transformer_2=fa",
+        raise ValueError(
+            "full-transformer promotion uses independent direct evidence, not a "
+            "generation-trajectory routing surrogate"
         )
     if scenario == "generation":
-        return ("--candidate-attention-backend", "wan_hybrid")
+        return (
+            "--candidate-attention-backend",
+            "wan_hybrid",
+            "--candidate-attention-backend-config",
+            json.dumps(
+                {
+                    "wan_hybrid_layer_indices": WAN_HYBRID_PROMOTION_LAYER_INDICES,
+                    "wan_hybrid_max_timestep": WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
     raise ValueError(f"unsupported scenario: {scenario}")
 
 
@@ -175,6 +214,8 @@ def build_qualification_plan(
     invocations: list[QualificationInvocation] = []
     next_port = config.master_port
     for scenario in config.scenarios:
+        if scenario == "full-transformer":
+            continue
         candidate_args = _scenario_candidate_args(scenario)
         for comparison_mode in config.modes:
             run_orders = (
@@ -199,6 +240,10 @@ def build_qualification_plan(
                         run_order,
                         "--master-port",
                         str(next_port),
+                        "--reference-scheduler-port",
+                        str(next_port + 1),
+                        "--candidate-scheduler-port",
+                        str(next_port + 2),
                         "--output-json",
                         str(output_path),
                     ]
@@ -213,7 +258,9 @@ def build_qualification_plan(
                         command=command,
                     )
                 )
-                next_port += 1
+                next_port += 3
+    if next_port - 1 > 65535:
+        raise ValueError("qualification port range exceeds 65535")
     return invocations
 
 
@@ -292,6 +339,9 @@ def _full_transformer_forward_evidence(
         "expected_run_orders": list(QUALIFICATION_RUN_ORDERS),
         "expected_components": list(WAN_TRANSFORMER_COMPONENTS),
         "report_paths": [str(path) for path in config.full_transformer_forward_reports],
+        "performance_report_paths": [
+            str(path) for path in config.full_transformer_performance_reports
+        ],
     }
     if not required:
         evidence["validation_status"] = "not-required"
@@ -338,6 +388,46 @@ def _full_transformer_forward_evidence(
         errors.append(
             "independent full-transformer evidence requires exactly four reports"
         )
+    performance_reports = []
+    if "performance" in config.modes:
+        if len(config.full_transformer_performance_reports) != 1:
+            errors.append(
+                "independent full-transformer performance requires exactly one "
+                "trajectory-off dual-order report"
+            )
+        else:
+            path = config.full_transformer_performance_reports[0]
+            try:
+                performance_report = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                errors.append(
+                    "full_transformer_performance_reports[0] is unreadable: " f"{exc}"
+                )
+            else:
+                performance_reports.append(performance_report)
+                errors.extend(
+                    f"full_transformer_performance_reports[0]: {error}"
+                    for error in validate_wan_transformer_forward_performance_report(
+                        performance_report
+                    )
+                )
+                binding = (
+                    performance_report.get("evidence_binding")
+                    if isinstance(performance_report, dict)
+                    else None
+                )
+                expected_component_path = str(
+                    (Path(config.model_path).expanduser().resolve() / "transformer_2")
+                )
+                if (
+                    not isinstance(binding, dict)
+                    or binding.get("resolved_component_path") != expected_component_path
+                ):
+                    errors.append(
+                        "full_transformer_performance_reports[0]: resolved component "
+                        "path does not match model/transformer_2"
+                    )
+    evidence["observed_performance_reports"] = len(performance_reports)
     evidence["validation_status"] = "passed" if not errors else "failed"
     evidence["validation_errors"] = errors
     return evidence
@@ -476,6 +566,14 @@ def _validate_generation_summary(
                         f"{coverage_location}: actual hit count does not equal "
                         "the route-derived expected hit count"
                     )
+                if scenario == "generation" and (
+                    hit_count != WAN_HYBRID_PROMOTION_GENERATION_HITS
+                    or expected_hit_count != WAN_HYBRID_PROMOTION_GENERATION_HITS
+                ):
+                    errors.append(
+                        f"{coverage_location}: generation promotion requires exactly "
+                        f"{WAN_HYBRID_PROMOTION_GENERATION_HITS} candidate hits"
+                    )
     return errors
 
 
@@ -543,9 +641,20 @@ def _validate_wan_hybrid_coverage(
                 or branch.get("layer_indices") != expected_layers
             ):
                 errors.append(f"{branch_location}: 40-layer coverage is incomplete")
-            if scenario == "generation" or (
-                scenario == "full-transformer" and component == "transformer"
-            ):
+            if scenario == "generation":
+                if (
+                    isinstance(actual_timestep, int)
+                    and not isinstance(actual_timestep, bool)
+                    and actual_timestep <= WAN_HYBRID_PROMOTION_MAX_TIMESTEP
+                ):
+                    expected_eligible = list(WAN_HYBRID_PROMOTION_LAYER_INDICES)
+                else:
+                    expected_eligible = []
+                expected_fallback = [
+                    index for index in expected_layers if index not in expected_eligible
+                ]
+                expected_control = []
+            elif scenario == "full-transformer" and component == "transformer":
                 expected_eligible = WAN_HYBRID_DEFAULT_LAYER_INDICES
                 expected_fallback = [
                     index for index in expected_layers if index not in expected_eligible
@@ -586,6 +695,14 @@ def _validate_wan_hybrid_coverage(
 
     if observed_components != set(WAN_TRANSFORMER_COMPONENTS):
         errors.append(f"{location}: both Wan transformer components were not exercised")
+    if (
+        scenario == "generation"
+        and expected_hit_count != WAN_HYBRID_PROMOTION_GENERATION_HITS
+    ):
+        errors.append(
+            f"{location}: generation promotion route must derive exactly "
+            f"{WAN_HYBRID_PROMOTION_GENERATION_HITS} hits"
+        )
     if (
         coverage.get("expected_hit_count") != expected_hit_count
         or coverage.get("actual_hit_count") != actual_hit_count
@@ -728,6 +845,66 @@ def _validate_candidate_hit_qualification(
     return []
 
 
+def _invocation_integer_option(
+    invocation: QualificationInvocation, option: str
+) -> int | None:
+    try:
+        index = invocation.command.index(option)
+        return int(invocation.command[index + 1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _validate_execution_topology(
+    report: dict[str, Any], invocation: QualificationInvocation
+) -> list[str]:
+    topology = report.get("execution_topology")
+    if not isinstance(topology, dict):
+        return ["missing execution topology"]
+    expected_process_sets = 4 if invocation.comparison_mode == "performance" else 2
+    expected_ports = {
+        "master_port": _invocation_integer_option(invocation, "--master-port"),
+        "reference_scheduler_port": _invocation_integer_option(
+            invocation, "--reference-scheduler-port"
+        ),
+        "candidate_scheduler_port": _invocation_integer_option(
+            invocation, "--candidate-scheduler-port"
+        ),
+        "reference_strict_ports": True,
+        "candidate_strict_ports": True,
+    }
+    errors = []
+    if (
+        isinstance(topology.get("controller_pid"), bool)
+        or not isinstance(topology.get("controller_pid"), int)
+        or topology["controller_pid"] <= 0
+    ):
+        errors.append("execution topology has no controller process identity")
+    expected_scalars = {
+        "controller_process_reused": True,
+        "variant_worker_process_sets": expected_process_sets,
+        "variant_worker_process_reused": False,
+        "same_gpu_worker_process": False,
+        "same_cuda_stream_proven": False,
+        "port_isolation": expected_ports,
+    }
+    if any(topology.get(name) != value for name, value in expected_scalars.items()):
+        errors.append("execution topology does not match isolated worker semantics")
+    if topology.get("variant_worker_lifecycle") != (
+        "fresh local DiffGenerator scheduler process set per variant and run order"
+    ):
+        errors.append("execution topology does not describe the worker lifecycle")
+    ports = [expected_ports[name] for name in expected_ports if name.endswith("port")]
+    if any(port is None for port in ports) or len(set(ports)) != 3:
+        errors.append("invocation does not use three distinct explicit ports")
+    provenance = report.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("port_isolation") != (
+        expected_ports
+    ):
+        errors.append("port provenance does not match the invocation")
+    return errors
+
+
 def validate_qualification_report(
     report: Any,
     invocation: QualificationInvocation,
@@ -737,6 +914,7 @@ def validate_qualification_report(
         return ["report is not a JSON object"]
     errors = []
     errors.extend(_validate_report_provenance(report, config))
+    errors.extend(_validate_execution_topology(report, invocation))
     if report.get("model_id") != config.model_id:
         errors.append("model_id does not match the qualification config")
     if report.get("prompt") != config.prompt or report.get("seed") != config.seed:
@@ -779,6 +957,26 @@ def validate_qualification_report(
                 "transformer_2": "fa",
             }:
                 errors.append("full-transformer component routing is incomplete")
+        for variant, variant_server in (
+            ("reference", reference_server),
+            ("candidate", candidate_server),
+        ):
+            if isinstance(variant_server, dict) and (
+                "transformer_weights_path" in variant_server
+                or "component_paths" in variant_server
+            ):
+                errors.append(f"{variant} model override is forbidden")
+        if invocation.scenario == "generation" and isinstance(candidate_server, dict):
+            expected_config = json.dumps(
+                {
+                    "wan_hybrid_layer_indices": WAN_HYBRID_PROMOTION_LAYER_INDICES,
+                    "wan_hybrid_max_timestep": WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if candidate_server.get("attention_backend_config") != expected_config:
+                errors.append("generation candidate is not locked to tail5 at t521")
 
     sampling_kwargs = report.get("sampling_kwargs")
     if not isinstance(sampling_kwargs, dict):
@@ -936,8 +1134,8 @@ def validate_qualification_report(
         if isinstance(qualification, dict):
             expected_thresholds = {
                 "required_run_orders": list(QUALIFICATION_RUN_ORDERS),
-                "warmup_runs_min": MIN_QUALIFICATION_WARMUP_RUNS,
-                "measure_runs_min": MIN_QUALIFICATION_MEASURE_RUNS,
+                "warmup_runs_equals": MIN_QUALIFICATION_WARMUP_RUNS,
+                "measure_runs_equals": MIN_QUALIFICATION_MEASURE_RUNS,
                 "speedup_min": MODEL_QUALIFICATION_THRESHOLDS["speedup_min"],
                 "candidate_hit_count_equals_expected": True,
                 "expected_hit_count_min_exclusive": 0,
@@ -1127,6 +1325,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "when selecting the full-transformer scenario."
         ),
     )
+    parser.add_argument(
+        "--full-transformer-performance-report",
+        dest="full_transformer_performance_reports",
+        action="append",
+        type=Path,
+        default=[],
+        help=(
+            "Independent transformer_2@t521 trajectory-off AB/BA performance "
+            "report; pass exactly one when selecting full-transformer performance."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -1160,6 +1369,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         full_transformer_forward_reports=tuple(
             path.expanduser().resolve()
             for path in args.full_transformer_forward_reports
+        ),
+        full_transformer_performance_reports=tuple(
+            path.expanduser().resolve()
+            for path in args.full_transformer_performance_reports
         ),
     )
     manifest = run_qualification_plan(config, dry_run=args.dry_run)

@@ -14,7 +14,9 @@ from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import 
     load_wan_transformer_input_capture,
 )
 from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
+    run_wan_transformer_forward_performance_qualification,
     run_wan_transformer_forward_qualification,
+    validate_wan_transformer_forward_performance_report,
     validate_wan_transformer_forward_report,
     write_wan_transformer_forward_report,
 )
@@ -48,13 +50,18 @@ def _configure_standalone_layerwise_offload(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--capture-manifest", required=True)
     parser.add_argument("--output-json", required=True)
     parser.add_argument(
         "--run-order",
-        choices=("reference-first", "candidate-first"),
+        choices=("reference-first", "candidate-first", "both"),
         required=True,
+    )
+    parser.add_argument(
+        "--comparison-mode",
+        choices=("correctness", "performance"),
+        default="correctness",
     )
     parser.add_argument("--model-id")
     parser.add_argument("--master-port", type=int, default=30005)
@@ -101,6 +108,14 @@ def build_direct_port_provenance(
         "reference_strict_ports": True,
         "candidate_strict_ports": True,
     }
+
+
+def select_direct_qualification_runner(comparison_mode: str):
+    if comparison_mode == "performance":
+        return run_wan_transformer_forward_performance_qualification
+    if comparison_mode == "correctness":
+        return run_wan_transformer_forward_qualification
+    raise ValueError(f"unsupported direct comparison mode: {comparison_mode}")
 
 
 def _initialize_single_gpu_runtime(master_port: int) -> None:
@@ -216,6 +231,15 @@ def _load_component(
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.comparison_mode == "performance" and args.run_order != "both":
+        raise ValueError("direct performance requires --run-order both")
+    if args.comparison_mode == "correctness" and args.run_order == "both":
+        raise ValueError("direct correctness requires one explicit run order")
+    if args.comparison_mode == "performance" and (
+        args.reference_transformer_weights_path is not None
+        or args.candidate_transformer_weights_path is not None
+    ):
+        raise ValueError("direct performance forbids variant model-weight overrides")
     port_provenance = build_direct_port_provenance(
         master_port=args.master_port,
         reference_scheduler_port=args.reference_scheduler_port,
@@ -262,21 +286,44 @@ def main() -> None:
         scheduler_port=args.candidate_scheduler_port,
         strict_ports=args.strict_ports,
     )
-    report = run_wan_transformer_forward_qualification(
-        reference_model=reference_model,
-        candidate_model=candidate_model,
-        capture_manifest_path=capture_manifest_path,
-        run_order=args.run_order,
-        warmup_runs=args.warmup_runs,
-        measure_runs=args.measure_runs,
-        candidate_backend_expectation=args.candidate_backend_expectation,
-    )
+    qualification_runner = select_direct_qualification_runner(args.comparison_mode)
+    if args.comparison_mode == "performance":
+        report = qualification_runner(
+            reference_model=reference_model,
+            candidate_model=candidate_model,
+            capture_manifest_path=capture_manifest_path,
+            warmup_runs=args.warmup_runs,
+            measure_runs=args.measure_runs,
+        )
+    else:
+        report = qualification_runner(
+            reference_model=reference_model,
+            candidate_model=candidate_model,
+            capture_manifest_path=capture_manifest_path,
+            run_order=args.run_order,
+            warmup_runs=args.warmup_runs,
+            measure_runs=args.measure_runs,
+            candidate_backend_expectation=args.candidate_backend_expectation,
+        )
     report["port_provenance"] = port_provenance
-    errors = validate_wan_transformer_forward_report(
-        report,
-        expected_warmup_runs=args.warmup_runs,
-        expected_measure_runs=args.measure_runs,
-        expected_model_path=model_root,
+    if args.comparison_mode == "performance":
+        report["execution_topology"].update(
+            {
+                "direct_in_process_models": 2,
+                "scheduler_worker_processes": 0,
+                "scheduler_ports_reserved_for_variant_configuration_only": True,
+                "port_topology": port_provenance,
+            }
+        )
+    errors = (
+        validate_wan_transformer_forward_performance_report(report)
+        if args.comparison_mode == "performance"
+        else validate_wan_transformer_forward_report(
+            report,
+            expected_warmup_runs=args.warmup_runs,
+            expected_measure_runs=args.measure_runs,
+            expected_model_path=model_root,
+        )
     )
     if errors:
         report["validation_errors"] = errors

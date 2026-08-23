@@ -53,6 +53,9 @@ MODEL_QUALIFICATION_THRESHOLDS = {
 QUALIFICATION_RUN_ORDERS = ("reference-first", "candidate-first")
 MIN_QUALIFICATION_WARMUP_RUNS = 2
 MIN_QUALIFICATION_MEASURE_RUNS = 5
+WAN_HYBRID_PROMOTION_LAYER_INDICES = (35, 36, 37, 38, 39)
+WAN_HYBRID_PROMOTION_MAX_TIMESTEP = 521
+WAN_HYBRID_PROMOTION_GENERATION_HITS = 10
 
 
 def validate_qualification_protocol(
@@ -63,10 +66,20 @@ def validate_qualification_protocol(
     measure_runs: int,
 ) -> None:
     failures = []
-    if warmup_runs < MIN_QUALIFICATION_WARMUP_RUNS:
-        failures.append(f"warmup_runs must be >= {MIN_QUALIFICATION_WARMUP_RUNS}")
-    if measure_runs < MIN_QUALIFICATION_MEASURE_RUNS:
-        failures.append(f"measure_runs must be >= {MIN_QUALIFICATION_MEASURE_RUNS}")
+    if comparison_mode == "performance":
+        if warmup_runs != MIN_QUALIFICATION_WARMUP_RUNS:
+            failures.append(
+                f"performance warmup_runs must equal {MIN_QUALIFICATION_WARMUP_RUNS}"
+            )
+        if measure_runs != MIN_QUALIFICATION_MEASURE_RUNS:
+            failures.append(
+                f"performance measure_runs must equal {MIN_QUALIFICATION_MEASURE_RUNS}"
+            )
+    else:
+        if warmup_runs < MIN_QUALIFICATION_WARMUP_RUNS:
+            failures.append(f"warmup_runs must be >= {MIN_QUALIFICATION_WARMUP_RUNS}")
+        if measure_runs < MIN_QUALIFICATION_MEASURE_RUNS:
+            failures.append(f"measure_runs must be >= {MIN_QUALIFICATION_MEASURE_RUNS}")
     if comparison_mode == "performance" and run_order != "both":
         failures.append("performance qualification requires run_order=both")
     if comparison_mode == "correctness" and run_order not in QUALIFICATION_RUN_ORDERS:
@@ -637,26 +650,26 @@ def evaluate_dual_order_performance_qualification(
             if (
                 isinstance(warmup_runs, bool)
                 or not isinstance(warmup_runs, int)
-                or warmup_runs < MIN_QUALIFICATION_WARMUP_RUNS
+                or warmup_runs != MIN_QUALIFICATION_WARMUP_RUNS
             ):
                 failures.append(
                     {
                         "run_order": run_order,
                         "scope": variant,
-                        "reason": "insufficient_warmup_runs",
+                        "reason": "unexpected_warmup_runs",
                         "warmup_runs": warmup_runs,
                     }
                 )
             if (
                 isinstance(measure_runs, bool)
                 or not isinstance(measure_runs, int)
-                or measure_runs < MIN_QUALIFICATION_MEASURE_RUNS
+                or measure_runs != MIN_QUALIFICATION_MEASURE_RUNS
             ):
                 failures.append(
                     {
                         "run_order": run_order,
                         "scope": variant,
-                        "reason": "insufficient_measure_runs",
+                        "reason": "unexpected_measure_runs",
                         "measure_runs": measure_runs,
                     }
                 )
@@ -699,8 +712,8 @@ def evaluate_dual_order_performance_qualification(
         "passed": not failures,
         "thresholds": {
             "required_run_orders": list(QUALIFICATION_RUN_ORDERS),
-            "warmup_runs_min": MIN_QUALIFICATION_WARMUP_RUNS,
-            "measure_runs_min": MIN_QUALIFICATION_MEASURE_RUNS,
+            "warmup_runs_equals": MIN_QUALIFICATION_WARMUP_RUNS,
+            "measure_runs_equals": MIN_QUALIFICATION_MEASURE_RUNS,
             "speedup_min": MODEL_QUALIFICATION_THRESHOLDS["speedup_min"],
             "candidate_hit_count_equals_expected": True,
             "expected_hit_count_min_exclusive": 0,
@@ -1365,7 +1378,7 @@ def _to_jsonable(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--model-path", required=True)
     parser.add_argument(
         "--model-id",
@@ -1669,6 +1682,20 @@ def main() -> None:
         candidate_server_kwargs=cand_server_kwargs,
         sampling_kwargs=result["sampling_kwargs"],
     )
+    result["execution_topology"] = {
+        "controller_pid": os.getpid(),
+        "controller_process_reused": True,
+        "variant_worker_process_sets": (
+            4 if args.comparison_mode == "performance" else 2
+        ),
+        "variant_worker_process_reused": False,
+        "variant_worker_lifecycle": (
+            "fresh local DiffGenerator scheduler process set per variant and run order"
+        ),
+        "same_gpu_worker_process": False,
+        "same_cuda_stream_proven": False,
+        "port_isolation": result["provenance"]["port_isolation"],
+    }
 
     if args.comparison_mode == "correctness":
         reference_run, candidate_run = run_one_order(args.run_order)
