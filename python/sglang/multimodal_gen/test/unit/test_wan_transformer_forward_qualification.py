@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
     WanTransformerInputCapture,
 )
+from sglang.multimodal_gen.tools.compare_wan_attention_direct import (
+    _validate_direct_route,
+)
 from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
     _model_device,
     _move_fixed_input_to_model,
@@ -39,6 +42,38 @@ from sglang.multimodal_gen.tools.run_wan_transformer_forward_report import (
     build_direct_port_provenance,
     select_direct_qualification_runner,
 )
+
+
+def test_direct_attention_route_accepts_exact_selected_layers():
+    config = {
+        "wan_hybrid_max_timestep": 521,
+        "wan_hybrid_layer_indices": [34],
+    }
+    assert _validate_direct_route((34,), config) == config
+
+    for layers, invalid in (
+        ((), {"wan_hybrid_max_timestep": 521, "wan_hybrid_layer_indices": []}),
+        (
+            (34, 34),
+            {"wan_hybrid_max_timestep": 521, "wan_hybrid_layer_indices": [34, 34]},
+        ),
+        (
+            (39, 35),
+            {"wan_hybrid_max_timestep": 521, "wan_hybrid_layer_indices": [39, 35]},
+        ),
+        (
+            (40,),
+            {"wan_hybrid_max_timestep": 521, "wan_hybrid_layer_indices": [40]},
+        ),
+    ):
+        with pytest.raises(ValueError, match="unique, sorted"):
+            _validate_direct_route(layers, invalid)
+
+    with pytest.raises(ValueError, match="must match"):
+        _validate_direct_route(
+            (34,),
+            {"wan_hybrid_max_timestep": 521, "wan_hybrid_layer_indices": [35]},
+        )
 
 
 def test_direct_port_provenance_requires_variant_isolation():

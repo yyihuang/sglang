@@ -46,6 +46,28 @@ from sglang.multimodal_gen.tools.run_wan_transformer_forward_report import (
 TAIL5_LAYER_INDICES = (35, 36, 37, 38, 39)
 
 
+def _validate_direct_route(
+    layers: tuple[int, ...], config: object
+) -> dict[str, object]:
+    if (
+        not layers
+        or layers != tuple(sorted(set(layers)))
+        or any(layer < 0 or layer >= 40 for layer in layers)
+    ):
+        raise ValueError(
+            "direct qualification layers must be unique, sorted, and within [0, 40)"
+        )
+    expected = {
+        "wan_hybrid_max_timestep": 521,
+        "wan_hybrid_layer_indices": list(layers),
+    }
+    if config != expected:
+        raise ValueError(
+            "candidate configuration must match the selected direct layers at t521"
+        )
+    return expected
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-manifest", required=True)
@@ -271,8 +293,6 @@ def _summarize_layer(
 def main() -> None:
     args = _build_parser().parse_args()
     layers = tuple(args.layers or TAIL5_LAYER_INDICES)
-    if layers != TAIL5_LAYER_INDICES:
-        raise ValueError(f"direct tail5 qualification requires {TAIL5_LAYER_INDICES}")
     if args.warmup_runs != 2 or args.measure_runs != 5:
         raise ValueError("direct qualification requires warmup=2 and measure=5")
     port_provenance = build_direct_port_provenance(
@@ -281,12 +301,9 @@ def main() -> None:
         candidate_scheduler_port=args.candidate_scheduler_port,
         strict_ports=args.strict_ports,
     )
-    config = json.loads(args.candidate_attention_backend_config)
-    if config != {
-        "wan_hybrid_max_timestep": 521,
-        "wan_hybrid_layer_indices": list(TAIL5_LAYER_INDICES),
-    }:
-        raise ValueError("candidate configuration must be the fixed t521 tail5 route")
+    config = _validate_direct_route(
+        layers, json.loads(args.candidate_attention_backend_config)
+    )
 
     capture_path = Path(args.capture_manifest).expanduser().resolve()
     fixed_input_cpu, manifest = load_wan_transformer_input_capture(capture_path)
@@ -403,7 +420,8 @@ def main() -> None:
                         "reason": "repeatability_not_bitwise",
                     }
                 )
-    if reference_hits != [0] * 5 or candidate_hits != [5] * 5:
+    expected_hits = len(layers)
+    if reference_hits != [0] * 5 or candidate_hits != [expected_hits] * 5:
         failures.append({"reason": "direct_hit_count_mismatch"})
     if any(len(set(pointers)) != 1 for pointers in candidate_pointers.values()):
         failures.append({"reason": "caller_output_not_reused"})
@@ -428,7 +446,7 @@ def main() -> None:
         },
         "reference_per_run_wan_hybrid_hit_count": reference_hits,
         "candidate_per_run_wan_hybrid_hit_count": candidate_hits,
-        "candidate_per_run_wan_hybrid_expected_hit_count": [5] * 5,
+        "candidate_per_run_wan_hybrid_expected_hit_count": [expected_hits] * 5,
         "candidate_caller_output_data_ptr": candidate_pointers,
         "layers": layer_reports,
         "qualification": {
