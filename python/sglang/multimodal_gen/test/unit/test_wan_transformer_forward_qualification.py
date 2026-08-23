@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +33,46 @@ from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
 )
 from sglang.multimodal_gen.tools.run_wan_transformer_forward_report import (
     _configure_standalone_layerwise_offload,
+    build_direct_port_provenance,
 )
+
+
+def test_direct_port_provenance_requires_variant_isolation():
+    assert build_direct_port_provenance(
+        master_port=32000,
+        reference_scheduler_port=56000,
+        candidate_scheduler_port=56001,
+        strict_ports=True,
+    ) == {
+        "master_port": 32000,
+        "reference_scheduler_port": 56000,
+        "candidate_scheduler_port": 56001,
+        "reference_strict_ports": True,
+        "candidate_strict_ports": True,
+    }
+
+    for kwargs in (
+        {
+            "master_port": 56000,
+            "reference_scheduler_port": 56000,
+            "candidate_scheduler_port": 56001,
+            "strict_ports": True,
+        },
+        {
+            "master_port": 32000,
+            "reference_scheduler_port": 56000,
+            "candidate_scheduler_port": 56000,
+            "strict_ports": True,
+        },
+        {
+            "master_port": 32000,
+            "reference_scheduler_port": 56000,
+            "candidate_scheduler_port": 56001,
+            "strict_ports": False,
+        },
+    ):
+        with pytest.raises(ValueError):
+            build_direct_port_provenance(**kwargs)
 
 
 class _AddBlock(nn.Module):
@@ -93,6 +133,8 @@ class _TinyWanTransformer(nn.Module):
         self.skip_last = skip_last
         self.hybrid = hybrid
         self.wan_hybrid_layer_indices = selected_hybrid_layers if hybrid else None
+        self.wan_hybrid_min_timestep = None
+        self.wan_hybrid_max_timestep = None
         self.config = {"num_layers": 40}
         self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
         self.input_ids = []
@@ -322,6 +364,8 @@ def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
     )
     assert report["num_blocks"] == 40
     assert report["candidate_wan_hybrid_layer_indices"] == [39]
+    assert report["candidate_wan_hybrid_eligible_layer_indices"] == [39]
+    assert report["candidate_backend_exercised"] is True
     assert report["candidate_per_run_wan_hybrid_hit_count"] == [1] * 5
     assert report["candidate_per_run_wan_hybrid_expected_hit_count"] == [1] * 5
     assert len(set(report["reference_per_run_request_id"])) == 5
@@ -379,9 +423,7 @@ def test_full_transformer_forward_uses_every_pair_and_every_block(tmp_path):
     errors = validate_wan_transformer_forward_report(report)
 
     assert any("run-pair coverage" in error for error in errors)
-    assert (
-        "every measured candidate hit count must equal the configured depth" in errors
-    )
+    assert "every measured candidate hit count must equal the eligible depth" in errors
     assert any("capture coordinates" in error for error in errors)
 
 
@@ -398,9 +440,77 @@ def test_full_transformer_forward_preserves_explicit_multi_layer_override(tmp_pa
     )
 
     assert report["candidate_wan_hybrid_layer_indices"] == [35, 39]
+    assert report["candidate_wan_hybrid_eligible_layer_indices"] == [35, 39]
     assert report["candidate_per_run_wan_hybrid_hit_count"] == [2] * 5
     assert report["candidate_per_run_wan_hybrid_expected_hit_count"] == [2] * 5
     assert validate_wan_transformer_forward_report(report) == []
+
+
+def test_full_transformer_forward_accepts_exact_temporal_fallback(tmp_path):
+    reference = _TinyWanTransformer()
+    candidate = _TinyWanTransformer(
+        hybrid=True, hybrid_layer_indices=(35, 36, 37, 38, 39)
+    )
+    candidate.wan_hybrid_max_timestep = 400
+    for block in candidate.blocks:
+        block.eligible_for_hybrid = False
+    hidden_states = torch.tensor([[1.0, 2.0]])
+    manifest = _capture_manifest(tmp_path, "transformer", hidden_states)
+
+    report = run_wan_transformer_forward_qualification(
+        reference_model=reference,
+        candidate_model=candidate,
+        capture_manifest_path=manifest,
+        candidate_backend_expectation="temporal_fallback",
+    )
+
+    assert report["candidate_wan_hybrid_layer_indices"] == [35, 36, 37, 38, 39]
+    assert report["candidate_wan_hybrid_eligible_layer_indices"] == []
+    assert report["candidate_backend_exercised"] is False
+    assert report["candidate_per_run_wan_hybrid_hit_count"] == [0] * 5
+    assert report["candidate_per_run_wan_hybrid_expected_hit_count"] == [0] * 5
+    assert report["qualification"]["candidate_backend_hits"] == {
+        "passed": True,
+        "thresholds": {
+            "candidate_hit_count_equals_expected": True,
+            "expected_hit_count_equals": 0,
+        },
+        "expected_hit_counts": [0] * 5,
+        "actual_hit_counts": [0] * 5,
+        "failures": [],
+        "candidate_backend_exercised": False,
+    }
+    assert report["qualification"]["passed"] is True
+    assert validate_wan_transformer_forward_report(report) == []
+
+    default_report = run_wan_transformer_forward_qualification(
+        reference_model=reference,
+        candidate_model=candidate,
+        capture_manifest_path=manifest,
+    )
+    assert default_report["qualification"]["passed"] is False
+    assert any(
+        failure["reason"] == "candidate_hit_count_not_positive"
+        for failure in default_report["qualification"]["failures"]
+    )
+    assert "exercised candidate expectation requires eligible layers" in (
+        validate_wan_transformer_forward_report(default_report)
+    )
+
+    relabelled = json.loads(json.dumps(report))
+    relabelled["candidate_backend_expectation"] = "exercised"
+    errors = validate_wan_transformer_forward_report(relabelled)
+    assert "exercised candidate expectation requires eligible layers" in errors
+
+    invalid_boundary = json.loads(json.dumps(report))
+    invalid_boundary["candidate_wan_hybrid_max_timestep"] = 600
+    errors = validate_wan_transformer_forward_report(invalid_boundary)
+    assert "temporal fallback expectation requires actual timestep above max" in errors
+
+    false_exercised = json.loads(json.dumps(report))
+    false_exercised["candidate_backend_exercised"] = True
+    errors = validate_wan_transformer_forward_report(false_exercised)
+    assert "candidate backend exercised status is invalid" in errors
 
 
 def test_full_transformer_report_cannot_be_relabelled(tmp_path):

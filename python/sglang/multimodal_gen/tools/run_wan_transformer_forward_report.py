@@ -58,14 +58,49 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model-id")
     parser.add_argument("--master-port", type=int, default=30005)
+    parser.add_argument("--reference-scheduler-port", type=int, required=True)
+    parser.add_argument("--candidate-scheduler-port", type=int, required=True)
+    parser.add_argument("--strict-ports", action="store_true")
     parser.add_argument("--reference-attention-backend", default="fa")
     parser.add_argument("--candidate-attention-backend", default="wan_hybrid")
     parser.add_argument("--candidate-attention-backend-config")
+    parser.add_argument(
+        "--candidate-backend-expectation",
+        choices=("exercised", "temporal_fallback"),
+        default="exercised",
+    )
     parser.add_argument("--reference-transformer-weights-path")
     parser.add_argument("--candidate-transformer-weights-path")
     parser.add_argument("--warmup-runs", type=int, default=2)
     parser.add_argument("--measure-runs", type=int, default=5)
     return parser
+
+
+def build_direct_port_provenance(
+    *,
+    master_port: int,
+    reference_scheduler_port: int,
+    candidate_scheduler_port: int,
+    strict_ports: bool,
+) -> dict[str, int | bool]:
+    ports = (master_port, reference_scheduler_port, candidate_scheduler_port)
+    if any(isinstance(port, bool) or not isinstance(port, int) for port in ports):
+        raise ValueError("direct qualification ports must be integers")
+    if any(port < 1 or port > 65535 for port in ports):
+        raise ValueError("direct qualification ports must be valid TCP ports")
+    if not strict_ports:
+        raise ValueError("direct qualification requires strict ports")
+    if len(set(ports)) != len(ports):
+        raise ValueError(
+            "direct qualification requires distinct master/reference/candidate ports"
+        )
+    return {
+        "master_port": master_port,
+        "reference_scheduler_port": reference_scheduler_port,
+        "candidate_scheduler_port": candidate_scheduler_port,
+        "reference_strict_ports": True,
+        "candidate_strict_ports": True,
+    }
 
 
 def _initialize_single_gpu_runtime(master_port: int) -> None:
@@ -107,6 +142,8 @@ def _load_component(
     attention_backend: str,
     attention_backend_config: str | None,
     transformer_weights_path: str | None,
+    scheduler_port: int,
+    strict_ports: bool,
 ) -> Any:
     from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
         PipelineComponentLoader,
@@ -121,6 +158,8 @@ def _load_component(
         "backend": "sglang",
         "num_gpus": 1,
         "warmup_mode": "off",
+        "scheduler_port": scheduler_port,
+        "strict_ports": strict_ports,
         "attention_backend": attention_backend,
         "component_paths": {component_name: component_path},
         "component_attention_backends": {
@@ -177,6 +216,12 @@ def _load_component(
 
 def main() -> None:
     args = _build_parser().parse_args()
+    port_provenance = build_direct_port_provenance(
+        master_port=args.master_port,
+        reference_scheduler_port=args.reference_scheduler_port,
+        candidate_scheduler_port=args.candidate_scheduler_port,
+        strict_ports=args.strict_ports,
+    )
     capture_manifest_path = Path(args.capture_manifest).expanduser().resolve()
 
     # This validates manifest, request/sampling/model/component bindings, every
@@ -203,6 +248,8 @@ def main() -> None:
         attention_backend=args.reference_attention_backend,
         attention_backend_config=None,
         transformer_weights_path=args.reference_transformer_weights_path,
+        scheduler_port=args.reference_scheduler_port,
+        strict_ports=args.strict_ports,
     )
     candidate_model = _load_component(
         model_root=model_root,
@@ -212,6 +259,8 @@ def main() -> None:
         attention_backend=args.candidate_attention_backend,
         attention_backend_config=args.candidate_attention_backend_config,
         transformer_weights_path=args.candidate_transformer_weights_path,
+        scheduler_port=args.candidate_scheduler_port,
+        strict_ports=args.strict_ports,
     )
     report = run_wan_transformer_forward_qualification(
         reference_model=reference_model,
@@ -220,7 +269,9 @@ def main() -> None:
         run_order=args.run_order,
         warmup_runs=args.warmup_runs,
         measure_runs=args.measure_runs,
+        candidate_backend_expectation=args.candidate_backend_expectation,
     )
+    report["port_provenance"] = port_provenance
     errors = validate_wan_transformer_forward_report(
         report,
         expected_warmup_runs=args.warmup_runs,

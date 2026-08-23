@@ -536,6 +536,7 @@ def evaluate_transformer_forward_correctness(
     candidate_traces: Sequence[WanTransformerForwardTrace],
     *,
     candidate_layer_indices: Sequence[int],
+    candidate_backend_expectation: str = "exercised",
 ) -> dict[str, Any]:
     cross_variant = summarize_transformer_forward_cross_variant(
         reference_traces, candidate_traces
@@ -552,10 +553,47 @@ def evaluate_transformer_forward_correctness(
         "passed": qualification["passed"] and not output_failures,
         "failures": qualification["failures"] + output_failures,
     }
-    hit_qualification = evaluate_candidate_backend_hit_qualification(
-        [trace.wan_hybrid_hit_count for trace in candidate_traces],
-        [len(candidate_layer_indices)] * len(candidate_traces),
-    )
+    hit_counts = [trace.wan_hybrid_hit_count for trace in candidate_traces]
+    expected_hit_counts = [len(candidate_layer_indices)] * len(candidate_traces)
+    if candidate_backend_expectation not in ("exercised", "temporal_fallback"):
+        raise ValueError("unsupported candidate backend expectation")
+    if candidate_backend_expectation == "exercised":
+        hit_qualification = evaluate_candidate_backend_hit_qualification(
+            hit_counts,
+            expected_hit_counts,
+        ) | {"candidate_backend_exercised": True}
+    else:
+        expected_hit_counts = [0] * len(candidate_traces)
+        zero_hit_failures = [
+            {
+                "reason": "temporal_fallback_hit_count_mismatch",
+                "run_index": run_index,
+                "expected_hit_count": 0,
+                "actual_hit_count": hit_count,
+            }
+            for run_index, hit_count in enumerate(hit_counts)
+            if isinstance(hit_count, bool)
+            or not isinstance(hit_count, int)
+            or hit_count != 0
+        ]
+        if candidate_layer_indices:
+            zero_hit_failures.append(
+                {
+                    "reason": "temporal_fallback_has_eligible_layers",
+                    "eligible_layer_indices": list(candidate_layer_indices),
+                }
+            )
+        hit_qualification = {
+            "passed": not zero_hit_failures,
+            "thresholds": {
+                "candidate_hit_count_equals_expected": True,
+                "expected_hit_count_equals": 0,
+            },
+            "expected_hit_counts": expected_hit_counts,
+            "actual_hit_counts": hit_counts,
+            "failures": zero_hit_failures,
+            "candidate_backend_exercised": False,
+        }
     qualification = qualification | {
         "passed": qualification["passed"] and hit_qualification["passed"],
         "failures": qualification["failures"]
@@ -600,6 +638,21 @@ def evaluate_transformer_forward_correctness(
         "repeatability": repeatability,
         "qualification": qualification,
     }
+
+
+def _eligible_wan_hybrid_layer_indices(
+    model: Any,
+    *,
+    configured_layer_indices: Sequence[int],
+    actual_timestep: int,
+) -> list[int]:
+    min_timestep = getattr(model, "wan_hybrid_min_timestep", None)
+    max_timestep = getattr(model, "wan_hybrid_max_timestep", None)
+    if min_timestep is not None and actual_timestep < min_timestep:
+        return []
+    if max_timestep is not None and actual_timestep > max_timestep:
+        return []
+    return list(configured_layer_indices)
 
 
 def _run_variant(
@@ -712,6 +765,7 @@ def run_wan_transformer_forward_qualification(
     run_order: str = "reference-first",
     warmup_runs: int = MIN_QUALIFICATION_WARMUP_RUNS,
     measure_runs: int = MIN_QUALIFICATION_MEASURE_RUNS,
+    candidate_backend_expectation: str = "exercised",
 ) -> dict[str, Any]:
     """Run a full-transformer correctness qualification on fixed real inputs."""
 
@@ -815,15 +869,21 @@ def run_wan_transformer_forward_qualification(
     candidate_layer_indices_value = getattr(
         candidate_model, "wan_hybrid_layer_indices", None
     )
-    candidate_layer_indices = (
+    configured_candidate_layer_indices = (
         list(range(len(traces["candidate"][0].block_outputs)))
         if candidate_layer_indices_value is None
         else sorted(candidate_layer_indices_value)
     )
+    eligible_candidate_layer_indices = _eligible_wan_hybrid_layer_indices(
+        candidate_model,
+        configured_layer_indices=configured_candidate_layer_indices,
+        actual_timestep=actual_timestep,
+    )
     result = evaluate_transformer_forward_correctness(
         traces["reference"],
         traces["candidate"],
-        candidate_layer_indices=candidate_layer_indices,
+        candidate_layer_indices=eligible_candidate_layer_indices,
+        candidate_backend_expectation=candidate_backend_expectation,
     )
     return {
         "comparison_mode": "correctness",
@@ -835,7 +895,18 @@ def run_wan_transformer_forward_qualification(
         "evidence_binding": evidence_binding,
         "invocation_input_sha256": invocation_input_sha256,
         "num_blocks": len(traces["reference"][0].block_outputs),
-        "candidate_wan_hybrid_layer_indices": candidate_layer_indices,
+        "candidate_wan_hybrid_layer_indices": configured_candidate_layer_indices,
+        "candidate_wan_hybrid_eligible_layer_indices": (
+            eligible_candidate_layer_indices
+        ),
+        "candidate_backend_exercised": bool(eligible_candidate_layer_indices),
+        "candidate_backend_expectation": candidate_backend_expectation,
+        "candidate_wan_hybrid_min_timestep": getattr(
+            candidate_model, "wan_hybrid_min_timestep", None
+        ),
+        "candidate_wan_hybrid_max_timestep": getattr(
+            candidate_model, "wan_hybrid_max_timestep", None
+        ),
         "candidate_per_run_wan_hybrid_expected_hit_count": [
             trace.wan_hybrid_coverage["expected_hit_count"]
             for trace in traces["candidate"]
@@ -1003,7 +1074,53 @@ def validate_wan_transformer_forward_report(
     ):
         errors.append("candidate Wan hybrid layer indices are invalid")
         candidate_layer_indices = []
-    candidate_expected_hits = len(candidate_layer_indices)
+    candidate_eligible_layer_indices = report.get(
+        "candidate_wan_hybrid_eligible_layer_indices"
+    )
+    if (
+        not isinstance(candidate_eligible_layer_indices, list)
+        or any(
+            isinstance(index, bool) or not isinstance(index, int)
+            for index in candidate_eligible_layer_indices
+        )
+        or candidate_eligible_layer_indices
+        != sorted(set(candidate_eligible_layer_indices))
+        or any(
+            index not in candidate_layer_indices
+            for index in candidate_eligible_layer_indices
+        )
+    ):
+        errors.append("candidate Wan hybrid eligible layer indices are invalid")
+        candidate_eligible_layer_indices = []
+    candidate_expected_hits = len(candidate_eligible_layer_indices)
+    candidate_backend_exercised = candidate_expected_hits > 0
+    if report.get("candidate_backend_exercised") is not candidate_backend_exercised:
+        errors.append("candidate backend exercised status is invalid")
+    candidate_backend_expectation = report.get("candidate_backend_expectation")
+    if candidate_backend_expectation not in ("exercised", "temporal_fallback"):
+        errors.append("candidate backend expectation is invalid")
+    elif candidate_backend_expectation == "exercised":
+        if not candidate_backend_exercised:
+            errors.append("exercised candidate expectation requires eligible layers")
+    else:
+        max_timestep = report.get("candidate_wan_hybrid_max_timestep")
+        actual_timestep = (
+            expected_capture_coordinates.get("actual_timestep")
+            if isinstance(expected_capture_coordinates, dict)
+            else None
+        )
+        if candidate_backend_exercised:
+            errors.append("temporal fallback expectation forbids eligible layers")
+        if (
+            isinstance(max_timestep, bool)
+            or not isinstance(max_timestep, (int, float))
+            or isinstance(actual_timestep, bool)
+            or not isinstance(actual_timestep, int)
+            or actual_timestep <= max_timestep
+        ):
+            errors.append(
+                "temporal fallback expectation requires actual timestep above max"
+            )
 
     expected_cross_pairs = set(
         itertools.product(range(expected_measure_runs), range(expected_measure_runs))
@@ -1097,7 +1214,7 @@ def validate_wan_transformer_forward_report(
         )
     ):
         errors.append(
-            "every measured candidate hit count must equal the configured depth"
+            "every measured candidate hit count must equal the eligible depth"
         )
 
     request_ids_by_variant = {}
@@ -1124,7 +1241,7 @@ def validate_wan_transformer_forward_report(
         errors.append("reference and candidate request IDs overlap")
     for variant, coverages in coverages_by_variant.items():
         candidate = variant == "candidate"
-        expected_hybrid_layers = candidate_layer_indices if candidate else []
+        expected_hybrid_layers = candidate_eligible_layer_indices if candidate else []
         expected_hits = len(expected_hybrid_layers)
         for run_index, coverage in enumerate(coverages):
             location = f"{variant}_per_run_wan_hybrid_coverage[{run_index}]"
@@ -1214,16 +1331,31 @@ def validate_wan_transformer_forward_report(
         or qualification.get("thresholds") != MODEL_QUALIFICATION_THRESHOLDS
     ):
         errors.append("correctness qualification is incomplete")
-    elif qualification.get("candidate_backend_hits") != {
-        "passed": True,
-        "thresholds": {
-            "candidate_hit_count_equals_expected": True,
-            "expected_hit_count_min_exclusive": 0,
-        },
-        "expected_hit_counts": [candidate_expected_hits] * expected_measure_runs,
-        "actual_hit_counts": [candidate_expected_hits] * expected_measure_runs,
-        "failures": [],
-    }:
+    elif qualification.get("candidate_backend_hits") != (
+        {
+            "passed": True,
+            "thresholds": {
+                "candidate_hit_count_equals_expected": True,
+                "expected_hit_count_min_exclusive": 0,
+            },
+            "expected_hit_counts": [candidate_expected_hits] * expected_measure_runs,
+            "actual_hit_counts": [candidate_expected_hits] * expected_measure_runs,
+            "failures": [],
+            "candidate_backend_exercised": True,
+        }
+        if candidate_backend_expectation == "exercised"
+        else {
+            "passed": True,
+            "thresholds": {
+                "candidate_hit_count_equals_expected": True,
+                "expected_hit_count_equals": 0,
+            },
+            "expected_hit_counts": [0] * expected_measure_runs,
+            "actual_hit_counts": [0] * expected_measure_runs,
+            "failures": [],
+            "candidate_backend_exercised": False,
+        }
+    ):
         errors.append("candidate backend-hit qualification is incomplete")
     elif qualification.get("request_local_backend_coverage") != {
         "passed": True,
