@@ -55,6 +55,7 @@ class RequestMetrics:
         self.total_duration_ms: float = 0.0
         self.wan_hybrid_hit_count: int = 0
         self.wan_hybrid_coverage: dict[str, Any] | None = None
+        self.attention_backend_identity: dict[str, Any] | None = None
         self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
@@ -89,6 +90,7 @@ class RequestMetrics:
             "total_duration_ms": self.total_duration_ms,
             "wan_hybrid_hit_count": self.wan_hybrid_hit_count,
             "wan_hybrid_coverage": self.wan_hybrid_coverage,
+            "attention_backend_identity": self.attention_backend_identity,
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()

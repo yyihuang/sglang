@@ -26,6 +26,7 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     WAN_HYBRID_PROMOTION_GENERATION_HITS,
     WAN_HYBRID_PROMOTION_LAYER_INDICES,
     WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+    validate_reference_attention_backend_identity,
 )
 from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
     validate_wan_transformer_forward_performance_report,
@@ -915,6 +916,11 @@ def validate_qualification_report(
     errors = []
     errors.extend(_validate_report_provenance(report, config))
     errors.extend(_validate_execution_topology(report, invocation))
+    errors.extend(
+        validate_reference_attention_backend_identity(
+            report.get("reference_attention_backend_identity")
+        )
+    )
     if report.get("model_id") != config.model_id:
         errors.append("model_id does not match the qualification config")
     if report.get("prompt") != config.prompt or report.get("seed") != config.seed:

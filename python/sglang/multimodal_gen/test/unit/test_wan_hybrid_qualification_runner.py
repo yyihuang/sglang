@@ -9,13 +9,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.multimodal_gen.runtime.qualification.attention_backend_identity import (
+    collect_runtime_attention_backend_identity,
+)
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MODEL_QUALIFICATION_THRESHOLDS,
+    PRODUCTION_FA4_BACKEND_CLASS,
+    PRODUCTION_FA4_IMPL_CLASS,
     QUALIFICATION_RUN_ORDERS,
     WAN_HYBRID_PROMOTION_GENERATION_HITS,
     WAN_HYBRID_PROMOTION_LAYER_INDICES,
     WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
     _module_git_revision,
+    validate_reference_attention_backend_identity,
 )
 from sglang.multimodal_gen.tools.run_wan_hybrid_qualification import (
     WAN_HYBRID_DEFAULT_LAYER_INDICES,
@@ -47,6 +53,19 @@ def _output_summary() -> dict:
         "frame_shapes": [[384, 640, 3]] * 17,
         "frame_dtypes": ["uint8"] * 17,
         "finite": True,
+    }
+
+
+def _reference_attention_backend_identity() -> dict:
+    return {
+        "requested_backend": "fa",
+        "resolved_backend_class": PRODUCTION_FA4_BACKEND_CLASS,
+        "resolved_impl_class": PRODUCTION_FA4_IMPL_CLASS,
+        "implementation": "FA4",
+        "flash_attention_version": 4,
+        "runtime_observed": True,
+        "expected_instance_count": 80,
+        "observed_instance_count": 80,
     }
 
 
@@ -258,6 +277,9 @@ def _correctness_report(run_order: str, measure_runs: int = 5) -> dict:
             "return_trajectory_decoded": False,
         },
         "server_kwargs": server_kwargs,
+        "reference_attention_backend_identity": (
+            _reference_attention_backend_identity()
+        ),
         "reference_generation": _generation(measure_runs, include_hits=False),
         "candidate_generation": _generation(measure_runs, include_hits=True),
         "cross_variant_metrics": {
@@ -354,6 +376,9 @@ def _performance_report(measure_runs: int = 5) -> dict:
             "return_trajectory_decoded": False,
         },
         "server_kwargs": server_kwargs,
+        "reference_attention_backend_identity": (
+            _reference_attention_backend_identity()
+        ),
         "order_results": {
             run_order: {
                 "reference_generation": _generation(measure_runs, include_hits=False),
@@ -673,6 +698,61 @@ def test_plan_rejects_variant_model_overrides_and_nonfixed_performance_counts(
         )
     with pytest.raises(ValueError, match="exactly warmup=2/measure=5"):
         build_qualification_plan(_config(tmp_path, warmup_runs=3))
+
+
+def test_runtime_attention_identity_uses_resolved_and_executed_instances():
+    class ResolvedBackend:
+        pass
+
+    class ExecutedImpl:
+        _runtime_observed_flash_attention_version = 4
+
+    layer = SimpleNamespace(
+        backend=SimpleNamespace(name="FA"),
+        attn_impl=ExecutedImpl(),
+        _resolved_attn_backend_cls=ResolvedBackend,
+    )
+    transformer = SimpleNamespace(modules=lambda: [layer])
+
+    identity = collect_runtime_attention_backend_identity(
+        [transformer], requested_backend="fa"
+    )
+
+    assert identity == {
+        "requested_backend": "fa",
+        "resolved_backend_class": (
+            f"{ResolvedBackend.__module__}.{ResolvedBackend.__qualname__}"
+        ),
+        "resolved_impl_class": (
+            f"{ExecutedImpl.__module__}.{ExecutedImpl.__qualname__}"
+        ),
+        "implementation": "FA4",
+        "flash_attention_version": 4,
+        "runtime_observed": True,
+        "expected_instance_count": 1,
+        "observed_instance_count": 1,
+    }
+    del ExecutedImpl._runtime_observed_flash_attention_version
+    missing_execution = collect_runtime_attention_backend_identity(
+        [transformer], requested_backend="fa"
+    )
+    assert missing_execution["runtime_observed"] is False
+    assert missing_execution["observed_instance_count"] == 0
+
+
+def test_reference_attention_identity_validation_fails_closed():
+    assert (
+        validate_reference_attention_backend_identity(
+            _reference_attention_backend_identity()
+        )
+        == []
+    )
+    missing = validate_reference_attention_backend_identity(None)
+    assert missing == ["reference runtime attention backend identity is missing"]
+    wrong_version = _reference_attention_backend_identity()
+    wrong_version["flash_attention_version"] = 3
+    errors = validate_reference_attention_backend_identity(wrong_version)
+    assert any("flash_attention_version" in error for error in errors)
 
 
 def test_dry_run_records_neutral_staging_revisions(tmp_path):

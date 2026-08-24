@@ -413,6 +413,7 @@ class FlashAttentionImpl(AttentionImpl):
                 return_softmax_lse=return_softmax_lse,
                 ver=fa_ver,
             )
+            self._runtime_observed_flash_attention_version = fa_ver
             return output
 
         if fa_ver == 4:
@@ -430,6 +431,7 @@ class FlashAttentionImpl(AttentionImpl):
                     return_softmax_lse=True,
                     ver=fa_ver,
                 )
+                self._runtime_observed_flash_attention_version = fa_ver
                 return out_tensor, softmax_lse
             out_tensor = flash_attn_varlen_func_op(
                 q=query,
@@ -444,6 +446,7 @@ class FlashAttentionImpl(AttentionImpl):
                 return_softmax_lse=False,
                 ver=fa_ver,
             )
+            self._runtime_observed_flash_attention_version = fa_ver
             return out_tensor
 
         raise ValueError(f"flash attention version {fa_ver} is not supported.")
@@ -471,4 +474,5 @@ class FlashAttentionImpl(AttentionImpl):
             causal=self.causal,
             ver=fa_ver,
         )
+        self._runtime_observed_flash_attention_version = fa_ver
         return output[0] if isinstance(output, tuple) else output
