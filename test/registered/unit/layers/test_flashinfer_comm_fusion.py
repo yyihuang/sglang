@@ -323,6 +323,86 @@ class TestFlashInferCommFusion(CustomTestCase):
             fusion._flashinfer_allreduce_unavailable = original_unavailable
 
 
+class TestFlashInferTrtllmMoeFinalizeCollectiveGuard(CustomTestCase):
+    def test_split_rank_local_eligibility_is_rejected_collectively(self):
+        def gather_with_split_rank(output, local, group):
+            self.assertEqual(group, "cpu_group")
+            for rank in range(4):
+                output[rank] = {
+                    "ok": rank != 2,
+                    "rank": rank,
+                    "contract": local["contract"],
+                }
+
+        with patch.object(
+            fusion.dist, "all_gather_object", side_effect=gather_with_split_rank
+        ):
+            self.assertFalse(
+                fusion._collective_tp4_contract_vote(
+                    local_ok=True,
+                    contract=("H7168", "BF16"),
+                    world_rank=0,
+                    world_size=4,
+                    cpu_group="cpu_group",
+                    label="test producer contract",
+                )
+            )
+
+    def test_split_rank_contract_metadata_is_rejected_collectively(self):
+        def gather_with_mismatch(output, local, group):
+            for rank in range(4):
+                output[rank] = {
+                    "ok": True,
+                    "rank": rank,
+                    "contract": (
+                        "H4096" if rank == 3 else local["contract"][0],
+                        local["contract"][1],
+                    ),
+                }
+
+        with patch.object(
+            fusion.dist, "all_gather_object", side_effect=gather_with_mismatch
+        ):
+            self.assertFalse(
+                fusion._collective_tp4_contract_vote(
+                    local_ok=True,
+                    contract=("H7168", "BF16"),
+                    world_rank=0,
+                    world_size=4,
+                    cpu_group="cpu_group",
+                    label="test producer contract",
+                )
+            )
+
+    def test_execution_route_rejects_tbo_piecewise_and_breakable_only(self):
+        def supported(*, tbo=False, piecewise=False, breakable=False):
+            with (
+                patch.object(
+                    fusion,
+                    "get_server_args",
+                    return_value=types.SimpleNamespace(enable_two_batch_overlap=tbo),
+                ),
+                patch(
+                    "sglang.srt.model_executor.runner_backend_utils."
+                    "tc_piecewise_cuda_graph.is_in_tc_piecewise_cuda_graph",
+                    return_value=piecewise,
+                ),
+                patch(
+                    "sglang.srt.model_executor.runner_backend_utils."
+                    "breakable_cuda_graph.context.is_in_breakable_cuda_graph",
+                    return_value=breakable,
+                ),
+            ):
+                return (
+                    fusion._is_flashinfer_trtllm_moe_finalize_execution_route_supported()
+                )
+
+        self.assertTrue(supported())
+        self.assertFalse(supported(tbo=True))
+        self.assertFalse(supported(piecewise=True))
+        self.assertFalse(supported(breakable=True))
+
+
 class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
     @staticmethod
     def _tensors():
@@ -399,13 +479,18 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
             patch.object(fusion, "get_server_args", return_value=server_args),
             patch.object(fusion, "get_parallel", return_value=parallel),
             patch.object(fusion, "get_moe_tp_group", return_value=coordinator),
+            patch.object(
+                fusion,
+                "_collective_tp4_contract_vote",
+                side_effect=lambda **kwargs: kwargs["local_ok"],
+            ) as contract_vote,
             patch(
                 "sglang.srt.layers.moe.get_moe_runner_backend",
                 return_value=runner_backend,
             ),
         ):
             try:
-                yield
+                yield contract_vote
             finally:
                 if original_manager is None:
                     buffers.pop(manager_key, None)
@@ -420,7 +505,7 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
         group_key = (object(), object())
         manager = self._manager(group_key)
         tensors = self._tensors()
-        with self._patched_moe_workspace(manager, group_key), patch.object(
+        with self._patched_moe_workspace(manager, group_key) as vote, patch.object(
             fusion,
             "ensure_workspace_initialized",
             side_effect=AssertionError("must not initialize on the S2 path"),
@@ -428,11 +513,55 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
             state = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
                 **tensors
             )
+            cached_state = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
+                **tensors
+            )
 
         self.assertIsNotNone(state)
+        self.assertIs(cached_state, state)
         self.assertIs(state.workspace, manager.workspace)
         self.assertIs(state.workspace_ptrs, manager.workspace.workspace_tensor)
+        vote.assert_called_once()
         ensure.assert_not_called()
+
+    def test_rejected_producer_payload_can_retry_commitment(self):
+        group_key = (object(), object())
+        manager = self._manager(group_key)
+        tensors = self._tensors()
+
+        with self._patched_moe_workspace(manager, group_key), patch.object(
+            fusion,
+            "_collective_tp4_contract_vote",
+            side_effect=(False, True),
+        ) as vote:
+            self.assertIsNone(
+                fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
+            )
+            self.assertFalse(manager._trtllm_moe_finalize_attestation_complete)
+
+            state = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
+                **tensors
+            )
+
+        self.assertIsNotNone(state)
+        self.assertTrue(manager._trtllm_moe_finalize_attestation_complete)
+        self.assertEqual(vote.call_count, 2)
+
+    def test_rank_local_route_ineligibility_reaches_collective_vote(self):
+        group_key = (object(), object())
+        manager = self._manager(group_key)
+        tensors = self._tensors()
+
+        with self._patched_moe_workspace(manager, group_key) as vote, patch.object(
+            fusion, "_flashinfer_trtllm_moe_finalize", None
+        ):
+            self.assertIsNone(
+                fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
+            )
+
+        vote.assert_called_once()
+        self.assertFalse(vote.call_args.kwargs["local_ok"])
+        self.assertFalse(manager._trtllm_moe_finalize_attestation_complete)
 
     def test_workspace_metadata_mismatch_fails_closed(self):
         group_key = (object(), object())
@@ -445,8 +574,15 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
             "dtype": lambda manager: setattr(manager, "dtype", torch.float16),
             "token_capacity": lambda manager: setattr(manager, "max_token_num", 1),
             "hidden_capacity": lambda manager: setattr(manager, "hidden_dim", 4096),
-            "pointer_table": lambda manager: setattr(
-                manager.workspace, "workspace_tensor", torch.zeros(8)
+            "pointer_table_dtype": lambda manager: setattr(
+                manager.workspace,
+                "workspace_tensor",
+                torch.zeros(32, dtype=torch.float32, device="cuda"),
+            ),
+            "pointer_table_entries": lambda manager: setattr(
+                manager.workspace,
+                "workspace_tensor",
+                torch.zeros(8, dtype=torch.int64, device="cuda"),
             ),
         }
 
@@ -461,7 +597,18 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
                         )
                     )
 
-    def test_workspace_replacement_after_publication_fails_fast(self):
+    def test_gemm2_rows_must_equal_tokens_times_topk(self):
+        group_key = (object(), object())
+        manager = self._manager(group_key)
+        tensors = self._tensors()
+        tensors["gemm2_out"] = tensors["gemm2_out"][:-1]
+
+        with self._patched_moe_workspace(manager, group_key):
+            self.assertIsNone(
+                fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
+            )
+
+    def test_workspace_replacement_after_publication_is_rejected_collectively(self):
         group_key = (object(), object())
         manager = self._manager(group_key)
         tensors = self._tensors()
@@ -478,7 +625,7 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
                 4,
                 workspace_tensor=torch.zeros(32, dtype=torch.int64, device="cuda"),
             )
-            with self.assertRaisesRegex(RuntimeError, "workspace changed"):
+            with self.assertRaisesRegex(RuntimeError, "not accepted symmetrically"):
                 fusion.try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
                     **tensors,
                     residual=residual,
@@ -487,24 +634,50 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
                     workspace_state=published,
                 )
 
-    def test_none_residual_fails_before_workspace_access(self):
-        with patch.object(
-            fusion,
-            "get_flashinfer_trtllm_moe_finalize_workspace_state",
-            side_effect=AssertionError("workspace must not be read"),
-        ):
-            with self.assertRaisesRegex(AssertionError, "requires a residual"):
+            fusion._flashinfer_trtllm_moe_finalize.assert_not_called()
+
+    def test_later_split_rank_consumer_drift_fails_before_kernel_launch(self):
+        group_key = (object(), object())
+        manager = self._manager(group_key)
+        tensors = self._tensors()
+        residual = torch.randn(2, 7168, dtype=torch.bfloat16, device="cuda")
+        norm_weight = torch.randn(7168, dtype=torch.bfloat16, device="cuda")
+
+        with self._patched_moe_workspace(manager, group_key):
+            published = (
+                fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
+            )
+            self.assertIsNotNone(published)
+            fusion.try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
+                **tensors,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=1e-6,
+                workspace_state=published,
+            )
+
+            # Simulate one rank observing a bad residual on a later launch.  A
+            # cached first-launch decision would miss this drift and let peers
+            # enter Cake; the per-launch vote must instead reject all ranks.
+            drifted_residual = residual[:, :-1]
+
+            def reject_local_drift(**kwargs):
+                self.assertFalse(kwargs["local_ok"])
+                return False
+
+            with patch.object(
+                fusion,
+                "_collective_tp4_contract_vote",
+                side_effect=reject_local_drift,
+            ), self.assertRaisesRegex(RuntimeError, "not accepted symmetrically"):
                 fusion.try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
-                    gemm2_out=None,
-                    expert_weights=None,
-                    expanded_idx_to_permuted_idx=None,
-                    shared_expert_output=None,
-                    residual=None,
-                    norm_weight=None,
-                    top_k=8,
+                    **tensors,
+                    residual=drifted_residual,
+                    norm_weight=norm_weight,
                     eps=1e-6,
-                    workspace_state=None,
+                    workspace_state=published,
                 )
+            fusion._flashinfer_trtllm_moe_finalize.assert_called_once()
 
 
 _GROUP_KEY = ("device_group", "cpu_group")

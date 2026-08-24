@@ -1031,22 +1031,25 @@ class DeepseekV2MoE(nn.Module):
                     get_flashinfer_trtllm_moe_finalize_workspace_state,
                 )
 
-                workspace_state = get_flashinfer_trtllm_moe_finalize_workspace_state(
-                    final_hidden_states.gemm2_out,
-                    final_hidden_states.expert_weights,
-                    final_hidden_states.expanded_idx_to_permuted_idx,
-                    shared_output,
-                    final_hidden_states.top_k,
+                workspace_commitment = (
+                    get_flashinfer_trtllm_moe_finalize_workspace_state(
+                        final_hidden_states.gemm2_out,
+                        final_hidden_states.expert_weights,
+                        final_hidden_states.expanded_idx_to_permuted_idx,
+                        shared_output,
+                        final_hidden_states.top_k,
+                    )
                 )
-                if workspace_state is not None:
+                if workspace_commitment is not None:
                     # Carry the permuted producer output to the next layer's
                     # input RMSNorm.  That is where residual and norm_weight
-                    # become available, so the collective is fused exactly
-                    # where the ordinary deferred all-reduce would run.
+                    # become available.  The workspace decision is a cached
+                    # TP4-wide commitment, so no rank may take the local
+                    # finalize fallback after this payload is published.
                     return FlashInferTrtllmDeferredFinalizeAllReduceOutput(
                         deferred_output=final_hidden_states,
                         shared_expert_output=shared_output,
-                        workspace_state=workspace_state,
+                        workspace_state=workspace_commitment,
                     )
 
             final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
