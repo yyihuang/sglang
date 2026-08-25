@@ -14,6 +14,14 @@ from pathlib import Path
 import torch
 
 
+EXPECTED_CANDIDATE_PYTHON_VERSION = "0.6.18"
+EXPECTED_IMAGE_CUBIN_VERSION = "0.6.14"
+EXPECTED_CAKE_SMEM_BYTES = 197632
+EXPECTED_CAKE_KERNEL_SYMBOL = (
+    "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4"
+)
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -45,6 +53,12 @@ def main():
 
     if "@sha256:" not in args.container_image:
         raise RuntimeError("Container image is not pinned by sha256 digest")
+    version_check_bypass = os.environ.get("FLASHINFER_DISABLE_VERSION_CHECK")
+    if version_check_bypass != "1":
+        raise RuntimeError(
+            "FLASHINFER_DISABLE_VERSION_CHECK must be exactly 1 for the pinned "
+            "image cubin/candidate Python version split"
+        )
     cluster = os.environ.get("SLURM_CLUSTER_NAME")
     if cluster != args.expected_cluster:
         raise RuntimeError(f"Cluster {cluster!r} != expected {args.expected_cluster!r}")
@@ -83,7 +97,9 @@ def main():
     if "backend" not in inspect.signature(all_gather_matmul).parameters:
         raise RuntimeError("FlashInfer all_gather_matmul has no backend parameter")
     distribution = importlib.metadata.distribution("flashinfer-python")
+    cubin_distribution = importlib.metadata.distribution("flashinfer-cubin")
     distribution_root = Path(distribution.locate_file("")).resolve()
+    cubin_distribution_root = Path(cubin_distribution.locate_file("")).resolve()
     import_path = Path(flashinfer.__file__).resolve()
     api_source_path = Path(inspect.getsourcefile(all_gather_matmul)).resolve()
     install_root = args.flashinfer_install_root.resolve()
@@ -96,6 +112,50 @@ def main():
     if distribution_root not in import_path.parents or distribution_root not in api_source_path.parents:
         raise RuntimeError(
             f"FlashInfer import escaped installed distribution: {import_path}, {api_source_path}"
+        )
+    if distribution.version != EXPECTED_CANDIDATE_PYTHON_VERSION:
+        raise RuntimeError(
+            f"Candidate flashinfer-python {distribution.version} != "
+            f"{EXPECTED_CANDIDATE_PYTHON_VERSION}"
+        )
+    if cubin_distribution.version != EXPECTED_IMAGE_CUBIN_VERSION:
+        raise RuntimeError(
+            f"Image flashinfer-cubin {cubin_distribution.version} != "
+            f"{EXPECTED_IMAGE_CUBIN_VERSION}"
+        )
+
+    expected_api_source = (
+        distribution_root
+        / "flashinfer/comm/all_gather_matmul/all_gather_matmul.py"
+    )
+    cake_backend_source = (
+        distribution_root
+        / "flashinfer/comm/all_gather_matmul/all_gather_matmul_cake.py"
+    )
+    cake_kernel_source = (
+        distribution_root
+        / "flashinfer/data/csrc/cake_all_gather_matmul/sm100a/"
+        "cake_all_gather_matmul_kernels.cu"
+    )
+    if api_source_path != expected_api_source:
+        raise RuntimeError(
+            f"all_gather_matmul API source {api_source_path} != {expected_api_source}"
+        )
+    for source in (cake_backend_source, cake_kernel_source):
+        if not source.is_file() or source.is_symlink():
+            raise RuntimeError(f"Candidate Cake source is missing or a symlink: {source}")
+        if distribution_root not in source.resolve().parents:
+            raise RuntimeError(f"Candidate Cake source escaped fresh target: {source}")
+    backend_text = cake_backend_source.read_text()
+    kernel_text = cake_kernel_source.read_text()
+    if EXPECTED_CAKE_KERNEL_SYMBOL not in backend_text:
+        raise RuntimeError("Candidate Cake backend does not select the exact ws4 symbol")
+    if EXPECTED_CAKE_KERNEL_SYMBOL not in kernel_text:
+        raise RuntimeError("Candidate Cake kernel source lacks the exact ws4 symbol")
+    expected_smem_define = f"#define SMEM_TOTAL {EXPECTED_CAKE_SMEM_BYTES}"
+    if expected_smem_define not in kernel_text:
+        raise RuntimeError(
+            f"Candidate Cake kernel source lacks {expected_smem_define!r}"
         )
     if sglang_python_root not in sglang_import_path.parents:
         raise RuntimeError(
@@ -152,6 +212,23 @@ def main():
             "distribution_root": str(distribution_root),
             "import_path": str(import_path),
             "api_source_path": str(api_source_path),
+            "python_distribution_version": distribution.version,
+            "cubin_distribution_version": cubin_distribution.version,
+            "cubin_distribution_root": str(cubin_distribution_root),
+            "version_check_bypass": {
+                "environment_variable": "FLASHINFER_DISABLE_VERSION_CHECK",
+                "value": version_check_bypass,
+                "scope": (
+                    "pinned image flashinfer-cubin 0.6.14 with candidate "
+                    "flashinfer-python 0.6.18"
+                ),
+            },
+            "cake_backend_source_path": str(cake_backend_source),
+            "cake_backend_source_sha256": sha256_file(cake_backend_source),
+            "cake_kernel_source_path": str(cake_kernel_source),
+            "cake_kernel_source_sha256": sha256_file(cake_kernel_source),
+            "cake_kernel_symbol": EXPECTED_CAKE_KERNEL_SYMBOL,
+            "cake_dynamic_smem_bytes": EXPECTED_CAKE_SMEM_BYTES,
         },
         "sglang_import_path": str(sglang_import_path),
         "gpus": gpus,

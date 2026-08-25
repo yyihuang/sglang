@@ -66,6 +66,14 @@ force-installed without dependencies into a fresh node-local Python target;
 the runtime contract rejects imports from any other installation. It also
 requires exactly four unique GB200/B200 UUIDs with compute capability 10.0.
 
+The pinned image provides `flashinfer-cubin==0.6.14`, while the isolated
+candidate provides `flashinfer-python==0.6.18` and bundles the Cake JIT source.
+The job therefore sets `FLASHINFER_DISABLE_VERSION_CHECK=1` only for this exact
+version split. The runtime receipt records both distributions and the bypass,
+then still requires the public API to come from the isolated wheel, the exact
+Cake ws4 backend and kernel sources to be present there, and the SM100 source to
+declare `SMEM_TOTAL` as 197632 bytes.
+
 The result root, each arm, and each profile directory must not exist before the
 run. Every arm requires a bounded, clean process-group shutdown and writes
 `COMPLETE` only after its server shuts down and all gates pass; the top-level
