@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 import torch
+from packaging.version import Version
 
 
 EXPECTED_CANDIDATE_PYTHON_VERSION = "0.6.18"
@@ -118,9 +119,10 @@ def main():
             f"Candidate flashinfer-python {distribution.version} != "
             f"{EXPECTED_CANDIDATE_PYTHON_VERSION}"
         )
-    if cubin_distribution.version != EXPECTED_IMAGE_CUBIN_VERSION:
+    cubin_base_version = Version(cubin_distribution.version).base_version
+    if cubin_base_version != EXPECTED_IMAGE_CUBIN_VERSION:
         raise RuntimeError(
-            f"Image flashinfer-cubin {cubin_distribution.version} != "
+            f"Image flashinfer-cubin base version {cubin_base_version} != "
             f"{EXPECTED_IMAGE_CUBIN_VERSION}"
         )
 
@@ -214,6 +216,7 @@ def main():
             "api_source_path": str(api_source_path),
             "python_distribution_version": distribution.version,
             "cubin_distribution_version": cubin_distribution.version,
+            "cubin_distribution_base_version": cubin_base_version,
             "cubin_distribution_root": str(cubin_distribution_root),
             "version_check_bypass": {
                 "environment_variable": "FLASHINFER_DISABLE_VERSION_CHECK",

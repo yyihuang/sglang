@@ -66,8 +66,9 @@ force-installed without dependencies into a fresh node-local Python target;
 the runtime contract rejects imports from any other installation. It also
 requires exactly four unique GB200/B200 UUIDs with compute capability 10.0.
 
-The pinned image provides `flashinfer-cubin==0.6.14`, while the isolated
-candidate provides `flashinfer-python==0.6.18` and bundles the Cake JIT source.
+The pinned image provides a locally versioned `flashinfer-cubin` whose PEP 440
+base version is `0.6.14`, while the isolated candidate provides
+`flashinfer-python==0.6.18` and bundles the Cake JIT source.
 The job therefore sets `FLASHINFER_DISABLE_VERSION_CHECK=1` only for this exact
 version split. The runtime receipt records both distributions and the bypass,
 then still requires the public API to come from the isolated wheel, the exact
