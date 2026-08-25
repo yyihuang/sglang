@@ -132,7 +132,7 @@ def main():
     )
     cake_backend_source = (
         distribution_root
-        / "flashinfer/comm/all_gather_matmul/all_gather_matmul_cake.py"
+        / "flashinfer/comm/all_gather_matmul/cake_all_gather_matmul.py"
     )
     cake_kernel_source = (
         distribution_root
