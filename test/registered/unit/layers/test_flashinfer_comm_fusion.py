@@ -121,9 +121,7 @@ class TestFlashInferCommFusion(CustomTestCase):
         ):
             pass
 
-        comm = types.SimpleNamespace(
-            trtllm_moe_finalize_allreduce_fusion=legacy_api
-        )
+        comm = types.SimpleNamespace(trtllm_moe_finalize_allreduce_fusion=legacy_api)
         self.assertIsNone(fusion._get_flashinfer_trtllm_moe_finalize_api(comm))
 
         def opted_in_api(
@@ -414,9 +412,7 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
             expanded_idx_to_permuted_idx=torch.zeros(
                 tokens, 8, dtype=torch.int32, device="cuda"
             ),
-            shared_expert_output=torch.randn(
-                tokens, 7168, dtype=dtype, device="cuda"
-            ),
+            shared_expert_output=torch.randn(tokens, 7168, dtype=dtype, device="cuda"),
             top_k=8,
         )
 
@@ -459,9 +455,7 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
         coordinator = types.SimpleNamespace(
             device_group=group_key[0], cpu_group=group_key[1]
         )
-        runner_backend = types.SimpleNamespace(
-            is_flashinfer_trtllm=lambda: True
-        )
+        runner_backend = types.SimpleNamespace(is_flashinfer_trtllm=lambda: True)
         server_args = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="trtllm"
         )
@@ -505,14 +499,15 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
         group_key = (object(), object())
         manager = self._manager(group_key)
         tensors = self._tensors()
-        with self._patched_moe_workspace(manager, group_key) as vote, patch.object(
-            fusion,
-            "ensure_workspace_initialized",
-            side_effect=AssertionError("must not initialize on the S2 path"),
-        ) as ensure:
-            state = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
-                **tensors
-            )
+        with (
+            self._patched_moe_workspace(manager, group_key) as vote,
+            patch.object(
+                fusion,
+                "ensure_workspace_initialized",
+                side_effect=AssertionError("must not initialize on the S2 path"),
+            ) as ensure,
+        ):
+            state = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
             cached_state = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
                 **tensors
             )
@@ -529,19 +524,20 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
         manager = self._manager(group_key)
         tensors = self._tensors()
 
-        with self._patched_moe_workspace(manager, group_key), patch.object(
-            fusion,
-            "_collective_tp4_contract_vote",
-            side_effect=(False, True),
-        ) as vote:
+        with (
+            self._patched_moe_workspace(manager, group_key),
+            patch.object(
+                fusion,
+                "_collective_tp4_contract_vote",
+                side_effect=(False, True),
+            ) as vote,
+        ):
             self.assertIsNone(
                 fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
             )
             self.assertFalse(manager._trtllm_moe_finalize_attestation_complete)
 
-            state = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
-                **tensors
-            )
+            state = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
 
         self.assertIsNotNone(state)
         self.assertTrue(manager._trtllm_moe_finalize_attestation_complete)
@@ -552,8 +548,9 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
         manager = self._manager(group_key)
         tensors = self._tensors()
 
-        with self._patched_moe_workspace(manager, group_key) as vote, patch.object(
-            fusion, "_flashinfer_trtllm_moe_finalize", None
+        with (
+            self._patched_moe_workspace(manager, group_key) as vote,
+            patch.object(fusion, "_flashinfer_trtllm_moe_finalize", None),
         ):
             self.assertIsNone(
                 fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
@@ -616,8 +613,8 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
         norm_weight = torch.randn(7168, dtype=torch.bfloat16, device="cuda")
 
         with self._patched_moe_workspace(manager, group_key):
-            published = (
-                fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
+            published = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
+                **tensors
             )
             self.assertIsNotNone(published)
             manager.workspace = _FakeWorkspace(
@@ -644,8 +641,8 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
         norm_weight = torch.randn(7168, dtype=torch.bfloat16, device="cuda")
 
         with self._patched_moe_workspace(manager, group_key):
-            published = (
-                fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(**tensors)
+            published = fusion.get_flashinfer_trtllm_moe_finalize_workspace_state(
+                **tensors
             )
             self.assertIsNotNone(published)
             fusion.try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
@@ -665,11 +662,14 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
                 self.assertFalse(kwargs["local_ok"])
                 return False
 
-            with patch.object(
-                fusion,
-                "_collective_tp4_contract_vote",
-                side_effect=reject_local_drift,
-            ), self.assertRaisesRegex(RuntimeError, "not accepted symmetrically"):
+            with (
+                patch.object(
+                    fusion,
+                    "_collective_tp4_contract_vote",
+                    side_effect=reject_local_drift,
+                ),
+                self.assertRaisesRegex(RuntimeError, "not accepted symmetrically"),
+            ):
                 fusion.try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
                     **tensors,
                     residual=drifted_residual,
@@ -914,9 +914,12 @@ class TestTagGroupsForFlashInferAllReduceOnly(CustomTestCase):
     def _tag(self, *, attn_tp, moe_ep, moe_tp):
         from sglang.srt.distributed import parallel_state as ps
 
-        with patch.object(ps, "_ENABLE_FLASHINFER_ALLREDUCE_ONLY", True), patch.object(
-            ps, "_ATTN_TP", attn_tp
-        ), patch.object(ps, "_MOE_EP", moe_ep), patch.object(ps, "_MOE_TP", moe_tp):
+        with (
+            patch.object(ps, "_ENABLE_FLASHINFER_ALLREDUCE_ONLY", True),
+            patch.object(ps, "_ATTN_TP", attn_tp),
+            patch.object(ps, "_MOE_EP", moe_ep),
+            patch.object(ps, "_MOE_TP", moe_tp),
+        ):
             ps._tag_groups_for_flashinfer_allreduce_only()
 
     def test_hybrid_ep_tp_tags_only_the_ep_group(self):

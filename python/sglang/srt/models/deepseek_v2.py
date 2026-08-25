@@ -2490,9 +2490,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         pre_normalized = False
-        if isinstance(
-            hidden_states, FlashInferTrtllmDeferredFinalizeAllReduceOutput
-        ):
+        if isinstance(hidden_states, FlashInferTrtllmDeferredFinalizeAllReduceOutput):
             pending_finalize = hidden_states
             from sglang.srt.layers.flashinfer_comm_fusion import (
                 try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm,

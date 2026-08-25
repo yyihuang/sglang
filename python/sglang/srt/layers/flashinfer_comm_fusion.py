@@ -135,9 +135,7 @@ if is_flashinfer_available():
     try:
         import flashinfer.comm as comm
 
-        _flashinfer_trtllm_moe_finalize = (
-            _get_flashinfer_trtllm_moe_finalize_api(comm)
-        )
+        _flashinfer_trtllm_moe_finalize = _get_flashinfer_trtllm_moe_finalize_api(comm)
 
         if hasattr(comm, "allreduce_fusion") and hasattr(
             comm, "create_allreduce_fusion_workspace"
@@ -482,16 +480,13 @@ def _collective_tp4_contract_vote(
         return False
 
     ranks = {entry.get("rank") for entry in gathered if isinstance(entry, dict)}
-    contracts = {
-        entry.get("contract") for entry in gathered if isinstance(entry, dict)
-    }
+    contracts = {entry.get("contract") for entry in gathered if isinstance(entry, dict)}
     agreed = (
         len(gathered) == world_size
         and ranks == set(range(world_size))
         and len(contracts) == 1
         and all(
-            isinstance(entry, dict) and entry.get("ok") is True
-            for entry in gathered
+            isinstance(entry, dict) and entry.get("ok") is True for entry in gathered
         )
     )
     if not agreed:
@@ -1105,13 +1100,16 @@ def can_use_flashinfer_trtllm_moe_finalize_allreduce(
     keeps older FlashInfer installations on the existing finalize path.
     """
 
-    return get_flashinfer_trtllm_moe_finalize_workspace_state(
-        gemm2_out,
-        expert_weights,
-        expanded_idx_to_permuted_idx,
-        shared_expert_output,
-        top_k,
-    ) is not None
+    return (
+        get_flashinfer_trtllm_moe_finalize_workspace_state(
+            gemm2_out,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+            shared_expert_output,
+            top_k,
+        )
+        is not None
+    )
 
 
 def try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
@@ -1177,9 +1175,7 @@ def try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
         and _flashinfer_trtllm_moe_finalize is not None
         and is_sm100_supported()
         and _is_flashinfer_trtllm_moe_finalize_execution_route_supported()
-        and getattr(
-            get_server_args(), "flashinfer_allreduce_fusion_backend", None
-        )
+        and getattr(get_server_args(), "flashinfer_allreduce_fusion_backend", None)
         == "trtllm"
         and workspace_is_current
         and gemm2_out.ndim == 2
