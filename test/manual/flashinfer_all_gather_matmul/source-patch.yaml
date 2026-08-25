@@ -1,0 +1,11 @@
+patches:
+  - target: sglang.srt.layers.linear.ColumnParallelLinear.forward
+    preamble: from agmm_experiment import maybe_qkv_forward
+    edits:
+      - match: |-
+            bias = self.bias if not self.skip_bias_add else None
+        prepend: |-
+            experimental_result = maybe_qkv_forward(self, input_)
+            if experimental_result is not None:
+                return experimental_result
+
