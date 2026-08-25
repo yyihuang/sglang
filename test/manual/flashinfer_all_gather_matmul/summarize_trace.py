@@ -27,11 +27,9 @@ def sha256_file(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace-dir", type=Path, required=True)
-    parser.add_argument("--kernel-regex", required=True)
+    parser.add_argument("--expected-kernel-symbol", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    pattern = re.compile(args.kernel_regex)
-
     trace_paths = sorted(
         path
         for path in args.trace_dir.rglob("*")
@@ -65,12 +63,12 @@ def main():
                 continue
             gpu_kernel_events += 1
             name = str(event.get("name", ""))
-            if pattern.search(name):
+            if name == args.expected_kernel_symbol:
                 matches[name] += 1
                 total_duration_us += float(event.get("dur", 0.0))
         if not matches:
             raise RuntimeError(
-                f"TP rank {rank} has no GPU kernel matching {args.kernel_regex!r}"
+                f"TP rank {rank} has no exact GPU kernel {args.expected_kernel_symbol!r}"
             )
         all_matches.update(matches)
         rank_results[str(rank)] = {
@@ -82,7 +80,7 @@ def main():
             "matched_symbols": dict(matches.most_common()),
         }
     result = {
-        "kernel_regex": args.kernel_regex,
+        "expected_kernel_symbol": args.expected_kernel_symbol,
         "rank_count": 4,
         "ranks": rank_results,
         "matched_launches": sum(all_matches.values()),

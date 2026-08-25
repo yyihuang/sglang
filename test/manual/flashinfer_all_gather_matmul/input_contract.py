@@ -21,6 +21,12 @@ MODEL_REVISION = "1605565b47bb9346c5515c34102e054115b4f98b"
 MODEL_MANIFEST_SHA256 = "438a360fe1b9c1f748fdd543757f11eb677c453cc522aa61100c4a5e6dce2c6f"
 MODEL_CONFIG_SHA256 = "fa6e9124e4621df77aecf96fbfaf7975814013d2d5ab1c972e965000588a9749"
 MODEL_INDEX_SHA256 = "2abe0910e23770a30ccf9b1b91804c64831c47f9c98defaa5293aa999433fc2b"
+MODEL_TOKENIZER_SHA256 = {
+    "generation_config.json": "ececd938ce5442fbe86264ad158056f14df3501f3eabf89a12fc8ae8a82a21f1",
+    "special_tokens_map.json": "6f38c73729248f6c127296386e3cdde96e254636cc58b4169d3fd32328d9a8ec",
+    "tokenizer.json": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4",
+    "tokenizer_config.json": "177c7b61e616fecb84c17ce0591acb92c6c4d60e9ac5ababfb940ff23bbcd424",
+}
 
 
 def sha256_file(path):
@@ -88,6 +94,12 @@ def main():
         raise RuntimeError(
             f"Runtime model metadata mismatch: config={config_sha}, index={index_sha}"
         )
+    tokenizer_hashes = {
+        filename: sha256_file(args.model_path / filename)
+        for filename in MODEL_TOKENIZER_SHA256
+    }
+    if tokenizer_hashes != MODEL_TOKENIZER_SHA256:
+        raise RuntimeError(f"Runtime tokenizer snapshot mismatch: {tokenizer_hashes}")
     config = json.loads(config_path.read_text())
     shape_contract = {
         "hidden_size": config["hidden_size"],
@@ -127,12 +139,14 @@ def main():
     selection_payload = json.dumps(selected, separators=(",", ":"), sort_keys=True).encode()
     result = {
         "model_repo": "meta-llama/Llama-3.1-70B-Instruct",
+        "model_path": str(args.model_path.resolve()),
         "model_revision": MODEL_REVISION,
         "model_lfs_manifest_sha256": manifest_sha,
         "model_weight_bytes": model_result["weight_bytes"],
         "model_weight_shards": len(weights),
         "model_config_sha256": config_sha,
         "model_safetensors_index_sha256": index_sha,
+        "model_tokenizer_sha256": tokenizer_hashes,
         "runtime_weight_verification_seconds": time.time() - verify_started,
         "verified_weights": verified_weights,
         "gsm8k": {
@@ -145,6 +159,7 @@ def main():
             "revision": "192ab2185289094fc556ec8ce5ce1e8e587154ca",
             "file": "ShareGPT_V3_unfiltered_cleaned_split.json",
             "sha256": sharegpt_sha,
+            "path": str(args.sharegpt.resolve()),
             "serving_selection_sha256": hashlib.sha256(selection_payload).hexdigest(),
             "selected_requests": selected,
         },

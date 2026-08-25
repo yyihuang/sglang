@@ -19,12 +19,32 @@ export PYTHONDONTWRITEBYTECODE=1
 : "${FLASHINFER_EXPECTED_API_SIGNATURE:?set FLASHINFER_EXPECTED_API_SIGNATURE}"
 : "${FLASHINFER_INSTALL_ROOT:?set FLASHINFER_INSTALL_ROOT}"
 : "${SGLANG_CONTAINER_IMAGE:?set SGLANG_CONTAINER_IMAGE}"
+: "${TASK_SCHEDULER_SUBMIT_TIME:?set TASK_SCHEDULER_SUBMIT_TIME}"
+: "${TASK_ALLOCATION_START_TIME:?set TASK_ALLOCATION_START_TIME}"
 readonly harness_dir="$SGLANG_ROOT/test/manual/flashinfer_all_gather_matmul"
 if [[ -e "$RESULT_ROOT" || -L "$RESULT_ROOT" ]]; then
   echo "refusing pre-existing result root: $RESULT_ROOT" >&2
   exit 1
 fi
 mkdir "$RESULT_ROOT"
+
+python3 - "$RESULT_ROOT/timing-start.json" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], "w") as stream:
+    json.dump(
+        {
+            "scheduler_submit_time": os.environ["TASK_SCHEDULER_SUBMIT_TIME"],
+            "allocation_start_time": os.environ["TASK_ALLOCATION_START_TIME"],
+        },
+        stream,
+        indent=2,
+        sort_keys=True,
+    )
+    stream.write("\n")
+PY
 
 python3 "$harness_dir/runtime_contract.py" \
   --sglang-root "$SGLANG_ROOT" --sglang-commit "$SGLANG_EXPECTED_COMMIT" \
@@ -37,7 +57,6 @@ python3 "$harness_dir/runtime_contract.py" \
   --flashinfer-install-root "$FLASHINFER_INSTALL_ROOT" \
   --container-image "$SGLANG_CONTAINER_IMAGE" \
   --expected-cluster oci-hsg-cs-001 \
-  --expected-gpu-name-regex 'NVIDIA (GB200|B200)' \
   --output "$RESULT_ROOT/runtime-contract.json"
 
 python3 "$harness_dir/input_contract.py" \
@@ -57,4 +76,7 @@ for variant in explicit candidate; do
 done
 python3 "$harness_dir/summarize_results.py" \
   --result-root "$RESULT_ROOT" --output "$RESULT_ROOT/summary.json"
-printf 'pass\n' > "$RESULT_ROOT/COMPLETE"
+python3 "$harness_dir/write_complete.py" --kind run \
+  --runtime-contract "$RESULT_ROOT/runtime-contract.json" \
+  --input-contract "$RESULT_ROOT/input-contract.json" \
+  --summary "$RESULT_ROOT/summary.json" --output "$RESULT_ROOT/COMPLETE"

@@ -41,6 +41,15 @@ def main():
                 raise RuntimeError(f"Rank {rank} did not request Cake: {row}")
             if row["cake_backend_requests"] != row["candidate_hits"]:
                 raise RuntimeError(f"Rank {rank} Cake request count mismatch: {row}")
+    for key in (
+        "tp_device_group_name",
+        "api_process_group_name",
+        "api_process_group_type",
+        "tp_group_backend",
+    ):
+        values = {row[key] for row in rows}
+        if len(values) != 1:
+            raise RuntimeError(f"TP ranks disagree on {key}: {sorted(values)}")
     result = {"variant": args.variant, "rank_count": 4, "ranks": rows}
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 

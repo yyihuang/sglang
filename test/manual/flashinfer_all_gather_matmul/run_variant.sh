@@ -20,7 +20,7 @@ readonly result_dir="$RESULT_ROOT/$variant"
 readonly port=${SGLANG_PORT:-30000}
 readonly base_url="http://127.0.0.1:$port"
 readonly model_revision=1605565b47bb9346c5515c34102e054115b4f98b
-readonly kernel_regex=${AGMM_EXPECTED_KERNEL_REGEX:-'kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4'}
+readonly kernel_symbol=${AGMM_EXPECTED_KERNEL_SYMBOL:-kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4}
 if [[ -e "$result_dir" || -L "$result_dir" ]]; then
   echo "refusing pre-existing arm artifact: $result_dir" >&2
   exit 1
@@ -58,7 +58,8 @@ if [[ "$actual_sglang_commit" != "$SGLANG_EXPECTED_COMMIT" || \
 fi
 printf '%s\n' "$actual_sglang_commit" > "$result_dir/sglang-commit.txt"
 printf '%s\n' "$actual_sglang_tree" > "$result_dir/sglang-tree.txt"
-nvidia-smi --query-gpu=index,name,uuid,compute_cap,pci.bus_id,memory.total --format=csv \
+nvidia-smi --query-gpu=index,name,uuid,compute_cap,pci.bus_id,memory.total \
+  --format=csv,noheader,nounits \
   > "$result_dir/gpus.csv"
 python3 - "$result_dir/environment.json" "$variant" "$model_revision" <<'PY'
 import importlib.metadata
@@ -90,13 +91,87 @@ with open(output, "w") as stream:
 PY
 
 server_pid=
-stop_server() {
-  if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+process_group_live_count() {
+  ps -eo pgid=,stat= | \
+    awk -v pgid="$server_pid" '$1 == pgid && $2 !~ /^Z/ {count++} END {print count + 0}'
+}
+
+force_stop_server() {
+  if [[ -n "$server_pid" ]] && [[ "$(process_group_live_count)" -gt 0 ]]; then
     kill -TERM -- -"$server_pid" 2>/dev/null || true
+    for _ in $(seq 1 15); do
+      [[ "$(process_group_live_count)" -gt 0 ]] || break
+      sleep 1
+    done
+    if [[ "$(process_group_live_count)" -gt 0 ]]; then
+      kill -KILL -- -"$server_pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -n "$server_pid" ]]; then
     wait "$server_pid" 2>/dev/null || true
   fi
 }
-trap stop_server EXIT
+
+stop_server_clean() {
+  ps -eo pid=,pgid=,stat=,comm= | \
+    awk -v pgid="$server_pid" '$2 == pgid {print}' \
+    > "$result_dir/server-processes-before-stop.txt"
+  if [[ ! -s "$result_dir/server-processes-before-stop.txt" ]]; then
+    echo "server process group census was empty before SIGTERM" >&2
+    return 1
+  fi
+  kill -TERM -- -"$server_pid"
+  for _ in $(seq 1 60); do
+    [[ "$(process_group_live_count)" -gt 0 ]] || break
+    sleep 1
+  done
+  if [[ "$(process_group_live_count)" -gt 0 ]]; then
+    echo "server process group did not stop after SIGTERM" >&2
+    return 1
+  fi
+  local exit_code
+  if wait "$server_pid"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+  if [[ "$exit_code" -ne 0 && "$exit_code" -ne 143 ]]; then
+    echo "server exited unexpectedly during clean shutdown: $exit_code" >&2
+    return 1
+  fi
+  ps -eo pid=,pgid=,stat=,comm= | \
+    awk -v pgid="$server_pid" '$2 == pgid {print}' \
+    > "$result_dir/server-processes-after-stop.txt"
+  if [[ -s "$result_dir/server-processes-after-stop.txt" ]]; then
+    echo "server process group still has members after shutdown" >&2
+    return 1
+  fi
+  nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid \
+    --format=csv,noheader,nounits > "$result_dir/gpu-processes-after-stop.txt"
+  if [[ -s "$result_dir/gpu-processes-after-stop.txt" ]]; then
+    echo "GPU compute processes remain after server shutdown" >&2
+    return 1
+  fi
+  python3 - "$port" "$result_dir/port-after-stop.json" <<'PY'
+import json
+import socket
+import sys
+
+port, output = int(sys.argv[1]), sys.argv[2]
+with socket.socket() as client:
+    client.settimeout(2)
+    connect_ex = client.connect_ex(("127.0.0.1", port))
+if connect_ex == 0:
+    raise RuntimeError(f"Server port {port} is still accepting connections")
+with open(output, "w") as stream:
+    json.dump({"host": "127.0.0.1", "port": port, "connect_ex": connect_ex}, stream)
+    stream.write("\n")
+PY
+  printf 'signal=TERM\nexit_code=%s\nprocess_group_stopped=true\n' "$exit_code" \
+    > "$result_dir/server-shutdown.txt"
+  server_pid=
+}
+trap force_stop_server EXIT
 
 PYTHONUNBUFFERED=1 setsid python3 -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
@@ -161,6 +236,40 @@ python3 "$harness_dir/verify_gsm8k.py" \
   --metrics "$result_dir/gsm8k.json" --report "$result_dir/gsm8k.html" \
   --expected-examples 500 --output "$result_dir/gsm8k-evidence.json"
 
+python3 - "$RESULT_ROOT/input-contract.json" "$result_dir/serving-contract.json" \
+  "$MODEL_PATH" "$SHAREGPT_PATH" <<'PY'
+import json
+import sys
+
+input_contract_path, output, model_path, sharegpt_path = sys.argv[1:]
+with open(input_contract_path) as stream:
+    input_contract = json.load(stream)
+contract = {
+    "model_path": model_path,
+    "sharegpt_path": sharegpt_path,
+    "sharegpt_sha256": input_contract["sharegpt"]["sha256"],
+    "serving_selection_sha256": input_contract["sharegpt"][
+        "serving_selection_sha256"
+    ],
+    "backend": "sglang",
+    "dataset_name": "random",
+    "warmup_prompts": 32,
+    "measured_prompts_per_repetition": 256,
+    "measured_repetitions": 3,
+    "random_input_len": 4096,
+    "random_output_len": 128,
+    "random_range_ratio": 0.0,
+    "request_rate": "infinity",
+    "max_concurrency": 64,
+    "seed": 20260825,
+    "temperature": 0.0,
+    "output_details": True,
+}
+with open(output, "w") as stream:
+    json.dump(contract, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+
 bench_common=(
   --backend sglang --base-url "$base_url" --model "$MODEL_PATH"
   --dataset-name random --dataset-path "$SHAREGPT_PATH"
@@ -187,8 +296,7 @@ python3 -m sglang.bench_serving "${bench_common[@]}" \
   > "$result_dir/profile-serving.log" 2>&1
 curl -fsS -X POST "$base_url/stop_profile" > "$result_dir/stop-profile.txt"
 
-stop_server
-server_pid=
+stop_server_clean
 if [[ "$variant" == native ]]; then
   if compgen -G "$result_dir/agmm-route-rank*.json" >/dev/null; then
     echo "native arm unexpectedly emitted AGMM route counters" >&2
@@ -200,10 +308,13 @@ else
 fi
 if [[ "$variant" == candidate ]]; then
   python3 "$harness_dir/summarize_trace.py" --trace-dir "$result_dir/profile" \
-    --kernel-regex "$kernel_regex" --output "$result_dir/cake-kernel-evidence.json"
+    --expected-kernel-symbol "$kernel_symbol" \
+    --output "$result_dir/cake-kernel-evidence.json"
 fi
 
 readonly physical_end=$(date +%s)
 echo $((physical_end - physical_start)) > "$result_dir/physical-seconds.txt"
 date --iso-8601=seconds > "$result_dir/end-time.txt"
-printf 'pass\n' > "$result_dir/COMPLETE"
+python3 "$harness_dir/write_complete.py" --kind arm \
+  --variant "$variant" --runtime-contract "$RESULT_ROOT/runtime-contract.json" \
+  --output "$result_dir/COMPLETE"

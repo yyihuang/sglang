@@ -71,9 +71,17 @@ for path in "$wheel" "$flashinfer_receipt" "$model_result" \
   test -f "$path"
 done
 test -d "$model"
-test -d "$SGLANG_CHECKOUT/.git"
+test "$(git -C "$SGLANG_CHECKOUT" rev-parse --is-inside-work-tree)" = true
+test "$(git -C "$SGLANG_CHECKOUT" rev-parse HEAD)" = "$SGLANG_EXPECTED_COMMIT"
+test "$(git -C "$SGLANG_CHECKOUT" rev-parse HEAD^{tree})" = "$SGLANG_EXPECTED_TREE"
+test -z "$(git -C "$SGLANG_CHECKOUT" status --porcelain=v1)"
 test ! -e "$result_root"
 test ! -L "$result_root"
+IFS='|' read -r task_scheduler_submit_time task_allocation_start_time < <(
+  squeue --noheader --jobs "$SLURM_JOB_ID" --format='%V|%S'
+)
+test -n "$task_scheduler_submit_time"
+test -n "$task_allocation_start_time"
 
 srun \
   --nodes=1 --ntasks=1 --cpus-per-task=32 --gres=gpu:4 \
@@ -99,7 +107,9 @@ srun \
     FLASHINFER_EXPECTED_WHEEL_SHA256="$FLASHINFER_EXPECTED_WHEEL_SHA256" \
     FLASHINFER_EXPECTED_API_SIGNATURE="$FLASHINFER_EXPECTED_API_SIGNATURE" \
     SGLANG_CONTAINER_IMAGE="$SGLANG_CONTAINER_IMAGE" \
-    AGMM_EXPECTED_KERNEL_REGEX=kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4 \
+    AGMM_EXPECTED_KERNEL_SYMBOL=kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4 \
+    TASK_SCHEDULER_SUBMIT_TIME="$task_scheduler_submit_time" \
+    TASK_ALLOCATION_START_TIME="$task_allocation_start_time" \
     PYTHONNOUSERSITE=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

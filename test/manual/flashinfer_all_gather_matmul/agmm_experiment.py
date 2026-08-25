@@ -40,6 +40,7 @@ _COUNTERS = {
     "validated_calls": 0,
 }
 _SEEN_MODULES: set[int] = set()
+_VALIDATED_MODULES: set[int] = set()
 
 
 def _tp_state():
@@ -163,10 +164,14 @@ def _q_weight_kn(layer) -> torch.Tensor:
 
 
 def _validate(layer, x: torch.Tensor, result: torch.Tensor) -> None:
-    if _COUNTERS["validated_calls"] >= _VALIDATE_CALLS:
+    module_id = id(layer)
+    if module_id in _VALIDATED_MODULES:
         return
+    if len(_VALIDATED_MODULES) >= _VALIDATE_CALLS:
+        raise RuntimeError("Encountered an unvalidated QKV module beyond the validation budget")
     expected = F.linear(x, layer.weight, None)
     torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+    _VALIDATED_MODULES.add(module_id)
     _COUNTERS["validated_calls"] += 1
 
 

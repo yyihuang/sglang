@@ -36,6 +36,8 @@ justify changing SGLang's default Llama path.
   `fa6e9124e4621df77aecf96fbfaf7975814013d2d5ab1c972e965000588a9749`
 - Safetensors index SHA256:
   `2abe0910e23770a30ccf9b1b91804c64831c47f9c98defaa5293aa999433fc2b`
+- The four tokenizer/generation metadata files are also hashed at use; their
+  exact digests are recorded in `input-contract.json`.
 - GSM8K SHA256: `3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14`
 - ShareGPT SHA256: `35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4`
 - TP: 4, BF16, seed `20260825`
@@ -65,8 +67,12 @@ the runtime contract rejects imports from any other installation. It also
 requires exactly four unique GB200/B200 UUIDs with compute capability 10.0.
 
 The result root, each arm, and each profile directory must not exist before the
-run. Every arm writes `COMPLETE` only after its server shuts down and all gates
-pass; the top-level marker is written only after three-arm aggregation passes.
+run. Every arm requires a bounded, clean process-group shutdown and writes
+`COMPLETE` only after its server shuts down and all gates pass; the top-level
+marker is written only after three-arm aggregation passes. Completion receipts
+use exclusive/no-follow creation. The top-level receipt binds the summary and
+inventory hashes, runtime and input receipt hashes, source identity, container
+digest, and Slurm job.
 The aggregator requires exactly one warmup result with 32 completed requests,
 exactly three measured results with 256 completed requests, finite positive
 metrics, no request errors, 500 GSM8K examples, a minimum GSM8K score of 0.90,
@@ -76,3 +82,7 @@ The candidate CUPTI evidence must consist of exactly one GPU activity trace
 for each TP rank 0 through 3, with the Cake ws4 symbol present on every rank.
 This trace is route evidence only; performance is derived exclusively from the
 three measured end-to-end serving repetitions.
+
+The final summary keeps timing scopes separate: scheduler queue time, physical
+turnaround from submission through summary completion, allocation physical
+time, the sum of the three arm wall times, and the measured serving runtime.

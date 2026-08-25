@@ -7,7 +7,6 @@ import importlib.metadata
 import inspect
 import json
 import os
-import re
 import socket
 import subprocess
 from pathlib import Path
@@ -41,7 +40,6 @@ def main():
     parser.add_argument("--flashinfer-install-root", type=Path, required=True)
     parser.add_argument("--container-image", required=True)
     parser.add_argument("--expected-cluster", required=True)
-    parser.add_argument("--expected-gpu-name-regex", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -129,10 +127,10 @@ def main():
         raise RuntimeError(f"Expected four visible GPUs, nvidia-smi={len(gpus)}, torch={torch.cuda.device_count()}")
     if len({gpu["uuid"] for gpu in gpus}) != 4:
         raise RuntimeError(f"GPU UUIDs are not unique: {gpus}")
-    name_pattern = re.compile(args.expected_gpu_name_regex)
+    allowed_gpu_names = {"NVIDIA GB200", "NVIDIA B200"}
     for index, gpu in enumerate(gpus):
-        if not name_pattern.fullmatch(gpu["name"]):
-            raise RuntimeError(f"GPU name does not match GB200 contract: {gpu}")
+        if gpu["name"] not in allowed_gpu_names:
+            raise RuntimeError(f"GPU name is not in the GB200/B200 allow-set: {gpu}")
         if gpu["compute_cap"] != "10.0" or torch.cuda.get_device_capability(index) != (10, 0):
             raise RuntimeError(f"GPU is not SM100: {gpu}")
 
@@ -157,6 +155,7 @@ def main():
         },
         "sglang_import_path": str(sglang_import_path),
         "gpus": gpus,
+        "allowed_gpu_names": sorted(allowed_gpu_names),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
