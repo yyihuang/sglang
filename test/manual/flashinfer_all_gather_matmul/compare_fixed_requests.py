@@ -20,6 +20,15 @@ def main():
     candidate = json.loads(args.candidate.read_text())
     if len(reference) != len(candidate):
         raise RuntimeError("Fixed-request result counts differ")
+    if len(reference) != args.required_exact:
+        raise RuntimeError(
+            f"Expected {args.required_exact} fixed requests, found {len(reference)}"
+        )
+    expected_indices = list(range(args.required_exact))
+    if [row.get("index") for row in reference] != expected_indices:
+        raise RuntimeError("Reference request indices are missing or out of order")
+    if [row.get("index") for row in candidate] != expected_indices:
+        raise RuntimeError("Candidate request indices are missing or out of order")
 
     exact = 0
     compared_logprobs = []
@@ -28,6 +37,13 @@ def main():
         if ref["prompt_sha256"] != got["prompt_sha256"]:
             raise RuntimeError(f"Prompt mismatch at index {ref['index']}")
         ref_ids, got_ids = ref["output_ids"], got["output_ids"]
+        ref_logprobs, got_logprobs = ref["output_logprobs"], got["output_logprobs"]
+        if not ref_ids or not got_ids:
+            raise RuntimeError(f"Empty output token sequence at index {ref['index']}")
+        if len(ref_ids) != len(ref_logprobs) or len(got_ids) != len(got_logprobs):
+            raise RuntimeError(f"Token/logprob length mismatch at index {ref['index']}")
+        if not all(math.isfinite(value) for value in ref_logprobs + got_logprobs):
+            raise RuntimeError(f"Non-finite output logprob at index {ref['index']}")
         common = 0
         for ref_id, got_id in zip(ref_ids, got_ids):
             if ref_id != got_id:
@@ -38,9 +54,8 @@ def main():
         deltas = [
             abs(a - b)
             for a, b in zip(
-                ref["output_logprobs"][:common], got["output_logprobs"][:common]
+                ref_logprobs[:common], got_logprobs[:common]
             )
-            if math.isfinite(a) and math.isfinite(b)
         ]
         compared_logprobs.extend(deltas)
         rows.append(

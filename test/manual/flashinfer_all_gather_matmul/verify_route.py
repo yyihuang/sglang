@@ -30,6 +30,12 @@ def main():
             raise RuntimeError(f"Rank {rank} has no API process-group evidence: {row}")
         if row["api_process_group_name"] != row["tp_device_group_name"]:
             raise RuntimeError(f"Rank {rank} did not pass the TP device_group: {row}")
+        if row["tp_group_world_size"] != 4 or row["tp_group_rank"] != rank:
+            raise RuntimeError(f"Rank {rank} has wrong TP group size/rank: {row}")
+        if row["tp_group_backend"] != "nccl":
+            raise RuntimeError(f"Rank {rank} did not use NCCL: {row}")
+        if row["tp_coordinator_ranks"] != [0, 1, 2, 3]:
+            raise RuntimeError(f"Rank {rank} has unexpected coordinator ranks: {row}")
         if args.variant == "candidate":
             if row["candidate_backend"] != "cake":
                 raise RuntimeError(f"Rank {rank} did not request Cake: {row}")

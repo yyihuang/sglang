@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 : "${SGLANG_ROOT:?set SGLANG_ROOT}"
 : "${RESULT_ROOT:?set RESULT_ROOT}"
@@ -8,8 +9,36 @@ set -euo pipefail
 : "${WEIGHTS_MANIFEST_PATH:?set WEIGHTS_MANIFEST_PATH}"
 : "${GSM8K_PATH:?set GSM8K_PATH}"
 : "${SHAREGPT_PATH:?set SHAREGPT_PATH}"
+: "${SGLANG_EXPECTED_COMMIT:?set SGLANG_EXPECTED_COMMIT}"
+: "${SGLANG_EXPECTED_TREE:?set SGLANG_EXPECTED_TREE}"
+: "${FLASHINFER_WHEEL:?set FLASHINFER_WHEEL}"
+: "${FLASHINFER_RECEIPT:?set FLASHINFER_RECEIPT}"
+: "${FLASHINFER_EXPECTED_COMMIT:?set FLASHINFER_EXPECTED_COMMIT}"
+: "${FLASHINFER_EXPECTED_TREE:?set FLASHINFER_EXPECTED_TREE}"
+: "${FLASHINFER_EXPECTED_WHEEL_SHA256:?set FLASHINFER_EXPECTED_WHEEL_SHA256}"
+: "${FLASHINFER_EXPECTED_API_SIGNATURE:?set FLASHINFER_EXPECTED_API_SIGNATURE}"
+: "${FLASHINFER_INSTALL_ROOT:?set FLASHINFER_INSTALL_ROOT}"
+: "${SGLANG_CONTAINER_IMAGE:?set SGLANG_CONTAINER_IMAGE}"
 readonly harness_dir="$SGLANG_ROOT/test/manual/flashinfer_all_gather_matmul"
-mkdir -p "$RESULT_ROOT"
+if [[ -e "$RESULT_ROOT" || -L "$RESULT_ROOT" ]]; then
+  echo "refusing pre-existing result root: $RESULT_ROOT" >&2
+  exit 1
+fi
+mkdir "$RESULT_ROOT"
+
+python3 "$harness_dir/runtime_contract.py" \
+  --sglang-root "$SGLANG_ROOT" --sglang-commit "$SGLANG_EXPECTED_COMMIT" \
+  --sglang-tree "$SGLANG_EXPECTED_TREE" --flashinfer-wheel "$FLASHINFER_WHEEL" \
+  --flashinfer-receipt "$FLASHINFER_RECEIPT" \
+  --flashinfer-commit "$FLASHINFER_EXPECTED_COMMIT" \
+  --flashinfer-tree "$FLASHINFER_EXPECTED_TREE" \
+  --flashinfer-wheel-sha256 "$FLASHINFER_EXPECTED_WHEEL_SHA256" \
+  --flashinfer-api-signature "$FLASHINFER_EXPECTED_API_SIGNATURE" \
+  --flashinfer-install-root "$FLASHINFER_INSTALL_ROOT" \
+  --container-image "$SGLANG_CONTAINER_IMAGE" \
+  --expected-cluster oci-hsg-cs-001 \
+  --expected-gpu-name-regex 'NVIDIA (GB200|B200)' \
+  --output "$RESULT_ROOT/runtime-contract.json"
 
 python3 "$harness_dir/input_contract.py" \
   --model-path "$MODEL_PATH" --model-result "$MODEL_RESULT_PATH" \
@@ -28,3 +57,4 @@ for variant in explicit candidate; do
 done
 python3 "$harness_dir/summarize_results.py" \
   --result-root "$RESULT_ROOT" --output "$RESULT_ROOT/summary.json"
+printf 'pass\n' > "$RESULT_ROOT/COMPLETE"

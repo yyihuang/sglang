@@ -2,9 +2,11 @@
 """Verify pinned inputs and hash the exact deterministic request selection."""
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +18,9 @@ from sglang.benchmark.datasets.random import sample_random_requests
 GSM8K_SHA256 = "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14"
 SHAREGPT_SHA256 = "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4"
 MODEL_REVISION = "1605565b47bb9346c5515c34102e054115b4f98b"
+MODEL_MANIFEST_SHA256 = "438a360fe1b9c1f748fdd543757f11eb677c453cc522aa61100c4a5e6dce2c6f"
+MODEL_CONFIG_SHA256 = "fa6e9124e4621df77aecf96fbfaf7975814013d2d5ab1c972e965000588a9749"
+MODEL_INDEX_SHA256 = "2abe0910e23770a30ccf9b1b91804c64831c47f9c98defaa5293aa999433fc2b"
 
 
 def sha256_file(path):
@@ -48,10 +53,55 @@ def main():
         raise RuntimeError(f"Unexpected model revision: {model_result}")
     if len(weights) != 30:
         raise RuntimeError(f"Expected 30 weight shards, found {len(weights)}")
+    if Path(model_result["model_path"]).resolve() != args.model_path.resolve():
+        raise RuntimeError(
+            f"MODEL_PATH {args.model_path.resolve()} != receipt {model_result['model_path']}"
+        )
     manifest_payload = json.dumps(weights, separators=(",", ":"), sort_keys=True).encode()
     manifest_sha = hashlib.sha256(manifest_payload).hexdigest()
+    if manifest_sha != MODEL_MANIFEST_SHA256:
+        raise RuntimeError(f"Unexpected pinned model manifest: {manifest_sha}")
     if manifest_sha != model_result["weight_manifest_sha256"]:
         raise RuntimeError("Weight manifest digest does not match model result")
+
+    verify_started = time.time()
+
+    def verify_weight(row):
+        relative = Path(row["path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError(f"Unsafe weight path in manifest: {relative}")
+        path = args.model_path / relative
+        size = path.stat().st_size
+        digest = sha256_file(path)
+        if size != row["size"] or digest != row["sha256"]:
+            raise RuntimeError(f"Runtime weight mismatch: {relative}")
+        return {"path": str(relative), "size": size, "sha256": digest}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        verified_weights = list(pool.map(verify_weight, weights))
+
+    config_path = args.model_path / "config.json"
+    index_path = args.model_path / "model.safetensors.index.json"
+    config_sha = sha256_file(config_path)
+    index_sha = sha256_file(index_path)
+    if config_sha != MODEL_CONFIG_SHA256 or index_sha != MODEL_INDEX_SHA256:
+        raise RuntimeError(
+            f"Runtime model metadata mismatch: config={config_sha}, index={index_sha}"
+        )
+    config = json.loads(config_path.read_text())
+    shape_contract = {
+        "hidden_size": config["hidden_size"],
+        "num_attention_heads": config["num_attention_heads"],
+        "num_key_value_heads": config["num_key_value_heads"],
+        "num_hidden_layers": config["num_hidden_layers"],
+        "torch_dtype": config.get("torch_dtype"),
+    }
+    if shape_contract != model_result["shape_contract"]:
+        raise RuntimeError(f"Runtime model config differs from receipt: {shape_contract}")
+    index = json.loads(index_path.read_text())
+    indexed_shards = sorted(set(index["weight_map"].values()))
+    if indexed_shards != sorted(row["path"] for row in weights):
+        raise RuntimeError("Safetensors index does not reference the pinned 30 shards")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     random.seed(20260825)
@@ -81,6 +131,10 @@ def main():
         "model_lfs_manifest_sha256": manifest_sha,
         "model_weight_bytes": model_result["weight_bytes"],
         "model_weight_shards": len(weights),
+        "model_config_sha256": config_sha,
+        "model_safetensors_index_sha256": index_sha,
+        "runtime_weight_verification_seconds": time.time() - verify_started,
+        "verified_weights": verified_weights,
         "gsm8k": {
             "url": "https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/test.jsonl",
             "sha256": gsm8k_sha,

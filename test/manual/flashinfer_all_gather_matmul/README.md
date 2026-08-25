@@ -30,6 +30,12 @@ justify changing SGLang's default Llama path.
 
 - Model: `meta-llama/Llama-3.1-70B-Instruct`
 - Revision: `1605565b47bb9346c5515c34102e054115b4f98b`
+- 30-shard LFS manifest SHA256:
+  `438a360fe1b9c1f748fdd543757f11eb677c453cc522aa61100c4a5e6dce2c6f`
+- Model config SHA256:
+  `fa6e9124e4621df77aecf96fbfaf7975814013d2d5ab1c972e965000588a9749`
+- Safetensors index SHA256:
+  `2abe0910e23770a30ccf9b1b91804c64831c47f9c98defaa5293aa999433fc2b`
 - GSM8K SHA256: `3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14`
 - ShareGPT SHA256: `35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4`
 - TP: 4, BF16, seed `20260825`
@@ -48,3 +54,25 @@ output-logprob delta of 0.05. `input_contract.py` verifies both dataset hashes,
 the 30-shard model LFS manifest, and records the exact 256-request serving
 selection hash. `run_all_variants.sh` is intended to run only inside a Slurm
 GPU allocation with real weights.
+
+## Fail-closed execution contract
+
+`run_all_variants.sbatch` requires a digest-pinned container, an exact clean
+SGLang commit and tree, and a candidate wheel receipt containing exact
+FlashInfer commit, tree, wheel SHA256, and public API signature. The wheel is
+force-installed without dependencies into a fresh node-local Python target;
+the runtime contract rejects imports from any other installation. It also
+requires exactly four unique GB200/B200 UUIDs with compute capability 10.0.
+
+The result root, each arm, and each profile directory must not exist before the
+run. Every arm writes `COMPLETE` only after its server shuts down and all gates
+pass; the top-level marker is written only after three-arm aggregation passes.
+The aggregator requires exactly one warmup result with 32 completed requests,
+exactly three measured results with 256 completed requests, finite positive
+metrics, no request errors, 500 GSM8K examples, a minimum GSM8K score of 0.90,
+and a maximum cross-arm score delta of 0.002. It hashes all raw artifacts.
+
+The candidate CUPTI evidence must consist of exactly one GPU activity trace
+for each TP rank 0 through 3, with the Cake ws4 symbol present on every rank.
+This trace is route evidence only; performance is derived exclusively from the
+three measured end-to-end serving repetitions.

@@ -12,6 +12,8 @@ esac
 : "${RESULT_ROOT:?set RESULT_ROOT}"
 : "${SHAREGPT_PATH:?set SHAREGPT_PATH}"
 : "${GSM8K_PATH:?set GSM8K_PATH}"
+: "${SGLANG_EXPECTED_COMMIT:?set SGLANG_EXPECTED_COMMIT}"
+: "${SGLANG_EXPECTED_TREE:?set SGLANG_EXPECTED_TREE}"
 
 readonly harness_dir="$SGLANG_ROOT/test/manual/flashinfer_all_gather_matmul"
 readonly result_dir="$RESULT_ROOT/$variant"
@@ -19,13 +21,24 @@ readonly port=${SGLANG_PORT:-30000}
 readonly base_url="http://127.0.0.1:$port"
 readonly model_revision=1605565b47bb9346c5515c34102e054115b4f98b
 readonly kernel_regex=${AGMM_EXPECTED_KERNEL_REGEX:-'kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4'}
-mkdir -p "$result_dir" "$result_dir/profile"
+if [[ -e "$result_dir" || -L "$result_dir" ]]; then
+  echo "refusing pre-existing arm artifact: $result_dir" >&2
+  exit 1
+fi
+mkdir "$result_dir"
+mkdir "$result_dir/profile"
 
 export PYTHONPATH="$SGLANG_ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
-unset DUMPER_SOURCE_PATCHER_CONFIG AGMM_EXPERIMENT_VARIANT
+unset DUMPER_SOURCE_PATCHER_CONFIG DUMPER_SERVER_PORT \
+  DUMPER_NON_INTRUSIVE_MODE DUMPER_ENABLE AGMM_EXPERIMENT_VARIANT
 if [[ "$variant" != native ]]; then
   export PYTHONPATH="$harness_dir:$PYTHONPATH"
   export DUMPER_SOURCE_PATCHER_CONFIG="$harness_dir/source-patch.yaml"
+  # Source patches are applied only when dumper.may_enable is true. Reuse mode
+  # activates patching without a standalone HTTP listener; mode=off avoids
+  # installing non-intrusive tensor hooks in either experimental arm.
+  export DUMPER_SERVER_PORT=reuse
+  export DUMPER_NON_INTRUSIVE_MODE=off
   export AGMM_EXPERIMENT_VARIANT="$variant"
   export AGMM_EXPERIMENT_ARTIFACT_DIR="$result_dir"
   export AGMM_EXPERIMENT_MIN_FULL_TOKENS=512
@@ -34,7 +47,17 @@ fi
 
 readonly physical_start=$(date +%s)
 date --iso-8601=seconds > "$result_dir/start-time.txt"
-git -C "$SGLANG_ROOT" rev-parse HEAD > "$result_dir/sglang-commit.txt"
+actual_sglang_commit=$(git -C "$SGLANG_ROOT" rev-parse HEAD)
+actual_sglang_tree=$(git -C "$SGLANG_ROOT" rev-parse HEAD^{tree})
+actual_sglang_status=$(git -C "$SGLANG_ROOT" status --porcelain=v1)
+if [[ "$actual_sglang_commit" != "$SGLANG_EXPECTED_COMMIT" || \
+      "$actual_sglang_tree" != "$SGLANG_EXPECTED_TREE" || \
+      -n "$actual_sglang_status" ]]; then
+  echo "SGLang source identity mismatch" >&2
+  exit 1
+fi
+printf '%s\n' "$actual_sglang_commit" > "$result_dir/sglang-commit.txt"
+printf '%s\n' "$actual_sglang_tree" > "$result_dir/sglang-tree.txt"
 nvidia-smi --query-gpu=index,name,uuid,compute_cap,pci.bus_id,memory.total --format=csv \
   > "$result_dir/gpus.csv"
 python3 - "$result_dir/environment.json" "$variant" "$model_revision" <<'PY'
@@ -75,7 +98,7 @@ stop_server() {
 }
 trap stop_server EXIT
 
-setsid python3 -m sglang.launch_server \
+PYTHONUNBUFFERED=1 setsid python3 -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
   --tp-size 4 \
   --dtype bfloat16 \
@@ -106,25 +129,44 @@ done
 curl -fsS "$base_url/health" >/dev/null
 readonly ready_end=$(date +%s)
 echo $((ready_end - ready_start)) > "$result_dir/server-ready-seconds.txt"
+readonly patch_marker='[source_patcher] patching sglang.srt.layers.linear.ColumnParallelLinear.forward'
+if [[ "$variant" == native ]]; then
+  if grep -Fq "$patch_marker" "$result_dir/server.log"; then
+    echo "native arm unexpectedly loaded the source patch" >&2
+    exit 1
+  fi
+else
+  patch_count=$(grep -Fc "$patch_marker" "$result_dir/server.log" || true)
+  if [[ "$patch_count" -ne 4 ]]; then
+    echo "expected source patch activation on four TP ranks, found $patch_count" >&2
+    exit 1
+  fi
+  grep -F "$patch_marker" "$result_dir/server.log" > "$result_dir/source-patch-evidence.txt"
+fi
 
 python3 "$harness_dir/fixed_requests.py" \
   --base-url "$base_url" --gsm8k "$GSM8K_PATH" \
   --output "$result_dir/fixed-requests.json"
 
+model_key=${MODEL_PATH//\//_}
+rm -f "/tmp/gsm8k_${model_key}.json" "/tmp/gsm8k_${model_key}.html"
 python3 -m sglang.test.run_eval \
   --base-url "$base_url" --model "$MODEL_PATH" --eval-name gsm8k \
   --api generate --num-examples 500 --num-threads 64 --num-shots 5 \
   --gsm8k-data-path "$GSM8K_PATH" --temperature 0 --top-p 1 \
   --max-tokens 512 > "$result_dir/gsm8k.log" 2>&1
-model_key=${MODEL_PATH//\//_}
 cp "/tmp/gsm8k_${model_key}.json" "$result_dir/gsm8k.json"
+cp "/tmp/gsm8k_${model_key}.html" "$result_dir/gsm8k.html"
+python3 "$harness_dir/verify_gsm8k.py" \
+  --metrics "$result_dir/gsm8k.json" --report "$result_dir/gsm8k.html" \
+  --expected-examples 500 --output "$result_dir/gsm8k-evidence.json"
 
 bench_common=(
   --backend sglang --base-url "$base_url" --model "$MODEL_PATH"
   --dataset-name random --dataset-path "$SHAREGPT_PATH"
   --random-input-len 4096 --random-output-len 128 --random-range-ratio 0
   --request-rate inf --max-concurrency 64 --seed 20260825 --temperature 0
-  --disable-tqdm
+  --disable-tqdm --output-details
 )
 python3 -m sglang.bench_serving "${bench_common[@]}" \
   --num-prompts 32 --output-file "$result_dir/serving-warmup.jsonl" \
@@ -164,3 +206,4 @@ fi
 readonly physical_end=$(date +%s)
 echo $((physical_end - physical_start)) > "$result_dir/physical-seconds.txt"
 date --iso-8601=seconds > "$result_dir/end-time.txt"
+printf 'pass\n' > "$result_dir/COMPLETE"

@@ -25,6 +25,10 @@ _GROUP_METADATA = {
     "tp_device_group_name": None,
     "api_process_group_name": None,
     "api_process_group_type": None,
+    "tp_group_world_size": None,
+    "tp_group_rank": None,
+    "tp_group_backend": None,
+    "tp_coordinator_ranks": None,
 }
 _COUNTERS = {
     "candidate_hits": 0,
@@ -102,11 +106,29 @@ def _record_api_group(coordinator, group) -> None:
     group_name = getattr(group, "group_name", None)
     if not group_name:
         raise RuntimeError("TP device_group has no group_name")
+    group_world_size = dist.get_world_size(group)
+    group_rank = dist.get_rank(group)
+    group_backend = str(dist.get_backend(group))
+    coordinator_ranks = list(coordinator.ranks)
+    if group_world_size != 4:
+        raise RuntimeError(f"TP device_group world size is {group_world_size}, expected 4")
+    if group_rank != coordinator.rank_in_group:
+        raise RuntimeError(
+            f"TP device_group rank {group_rank} != coordinator rank {coordinator.rank_in_group}"
+        )
+    if group_backend != "nccl":
+        raise RuntimeError(f"TP device_group backend is {group_backend}, expected nccl")
+    if coordinator_ranks != [0, 1, 2, 3]:
+        raise RuntimeError(f"Unexpected TP coordinator ranks: {coordinator_ranks}")
     _GROUP_METADATA.update(
         {
             "tp_device_group_name": coordinator.device_group.group_name,
             "api_process_group_name": group_name,
             "api_process_group_type": f"{type(group).__module__}.{type(group).__name__}",
+            "tp_group_world_size": group_world_size,
+            "tp_group_rank": group_rank,
+            "tp_group_backend": group_backend,
+            "tp_coordinator_ranks": coordinator_ranks,
         }
     )
 
