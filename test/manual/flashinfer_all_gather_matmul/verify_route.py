@@ -26,6 +26,10 @@ def main():
             raise RuntimeError(f"Rank {rank} did not hit {args.variant}")
         if row["unique_qkv_modules"] != 80 or row["validated_calls"] != 80:
             raise RuntimeError(f"Rank {rank} did not validate all 80 layers: {row}")
+        if not row["api_process_group_name"] or not row["api_process_group_type"]:
+            raise RuntimeError(f"Rank {rank} has no API process-group evidence: {row}")
+        if row["api_process_group_name"] != row["tp_device_group_name"]:
+            raise RuntimeError(f"Rank {rank} did not pass the TP device_group: {row}")
         if args.variant == "candidate":
             if row["candidate_backend"] != "cake":
                 raise RuntimeError(f"Rank {rank} did not request Cake: {row}")
@@ -37,4 +41,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

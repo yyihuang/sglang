@@ -8,4 +8,3 @@ patches:
             experimental_result = maybe_qkv_forward(self, input_)
             if experimental_result is not None:
                 return experimental_result
-

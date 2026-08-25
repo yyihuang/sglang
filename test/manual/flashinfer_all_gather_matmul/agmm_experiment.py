@@ -21,6 +21,11 @@ _VALIDATE_CALLS = int(os.environ.get("AGMM_EXPERIMENT_VALIDATE_CALLS", "80"))
 _ARTIFACT_DIR = Path(os.environ.get("AGMM_EXPERIMENT_ARTIFACT_DIR", "/tmp"))
 _LOCAL_INPUTS: dict[tuple[int, int, torch.dtype], torch.Tensor] = {}
 _ENABLED_GROUPS: set[str] = set()
+_GROUP_METADATA = {
+    "tp_device_group_name": None,
+    "api_process_group_name": None,
+    "api_process_group_type": None,
+}
 _COUNTERS = {
     "candidate_hits": 0,
     "cake_backend_requests": 0,
@@ -55,6 +60,7 @@ def _write_summary() -> None:
         "world_size": coordinator.world_size,
         "min_full_tokens": _MIN_FULL_TOKENS,
         "unique_qkv_modules": len(_SEEN_MODULES),
+        **_GROUP_METADATA,
         **_COUNTERS,
     }
     _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,6 +94,21 @@ def _enable_symmetric_memory(group) -> None:
     symm_mem.set_backend("NVSHMEM")
     symm_mem.enable_symm_mem_for_group(group.group_name)
     _ENABLED_GROUPS.add(group.group_name)
+
+
+def _record_api_group(coordinator, group) -> None:
+    if group is not coordinator.device_group:
+        raise RuntimeError("AGMM API group is not the TP coordinator device_group")
+    group_name = getattr(group, "group_name", None)
+    if not group_name:
+        raise RuntimeError("TP device_group has no group_name")
+    _GROUP_METADATA.update(
+        {
+            "tp_device_group_name": coordinator.device_group.group_name,
+            "api_process_group_name": group_name,
+            "api_process_group_type": f"{type(group).__module__}.{type(group).__name__}",
+        }
+    )
 
 
 def _local_symmetric_input(
@@ -145,6 +166,7 @@ def maybe_qkv_forward(layer, input_: torch.Tensor):
     if torch.cuda.get_device_capability(input_.device)[0] != 10:
         raise RuntimeError("AGMM experiment requires an SM100/SM103 GPU")
 
+    _record_api_group(coordinator, group)
     _enable_symmetric_memory(group)
     local, full_padded_m = _local_symmetric_input(
         input_, rank=coordinator.rank_in_group, world_size=coordinator.world_size
