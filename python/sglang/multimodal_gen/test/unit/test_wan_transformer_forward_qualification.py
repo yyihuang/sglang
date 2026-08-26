@@ -38,8 +38,10 @@ from sglang.multimodal_gen.tools.compare_wan_transformer_forward import (
     validate_wan_transformer_forward_report,
 )
 from sglang.multimodal_gen.tools.run_wan_transformer_forward_report import (
+    _build_parser,
     _configure_standalone_layerwise_offload,
     build_direct_port_provenance,
+    build_direct_server_kwargs,
     select_direct_qualification_runner,
 )
 
@@ -112,6 +114,57 @@ def test_direct_port_provenance_requires_variant_isolation():
     ):
         with pytest.raises(ValueError):
             build_direct_port_provenance(**kwargs)
+
+
+def test_direct_http_ports_parse_forward_and_require_pairwise_isolation():
+    args = _build_parser().parse_args(
+        [
+            "--capture-manifest",
+            "capture.json",
+            "--output-json",
+            "report.json",
+            "--run-order",
+            "reference-first",
+            "--reference-scheduler-port",
+            "56000",
+            "--candidate-scheduler-port",
+            "56001",
+            "--http-port",
+            "57000",
+            "--strict-ports",
+        ]
+    )
+    assert args.http_port == 57000
+
+    common = {
+        "model_root": "/models/wan",
+        "component_name": "transformer_2",
+        "component_path": "/models/wan/transformer_2",
+        "model_id": "wan",
+        "attention_backend": "fa",
+        "attention_backend_config": None,
+        "transformer_weights_path": None,
+        "scheduler_port": 56000,
+        "strict_ports": True,
+    }
+    assert build_direct_server_kwargs(**common, http_port=57000)["port"] == 57000
+    assert "port" not in build_direct_server_kwargs(**common)
+    assert build_direct_port_provenance(
+        master_port=32000,
+        reference_scheduler_port=56000,
+        candidate_scheduler_port=56001,
+        http_port=57000,
+        strict_ports=True,
+    )["http_port"] == 57000
+
+    with pytest.raises(ValueError, match="distinct"):
+        build_direct_port_provenance(
+            master_port=32000,
+            reference_scheduler_port=56000,
+            candidate_scheduler_port=56001,
+            http_port=56001,
+            strict_ports=True,
+        )
 
 
 def test_direct_cli_mode_dispatches_to_trajectory_free_performance_runner():

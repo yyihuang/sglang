@@ -16,6 +16,7 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     _extract_wan_hybrid_hit_count,
     _request_sampling_kwargs,
     _with_candidate_backend_hit_qualification,
+    add_http_port_argument,
     build_sampling_kwargs,
     build_server_kwargs,
     evaluate_candidate_backend_hit_qualification,
@@ -40,6 +41,7 @@ def _args(**overrides):
         "master_port": None,
         "reference_scheduler_port": None,
         "candidate_scheduler_port": None,
+        "http_port": None,
         "dit_cpu_offload": False,
         "dit_layerwise_offload": False,
         "text_encoder_cpu_offload": False,
@@ -98,6 +100,24 @@ def test_build_server_kwargs_forwards_isolated_scheduler_ports():
     assert candidate["strict_ports"] is True
 
 
+def test_generation_http_ports_parse_forward_and_preserve_omission():
+    parser = argparse.ArgumentParser()
+    add_http_port_argument(parser)
+    parsed = parser.parse_args(
+        [
+            "--http-port",
+            "57010",
+        ]
+    )
+    assert parsed.http_port == 57010
+
+    args = _args(http_port=57010)
+    assert build_server_kwargs(args, variant="reference")["port"] == 57010
+    assert build_server_kwargs(args, variant="candidate")["port"] == 57010
+    assert "port" not in build_server_kwargs(_args(), variant="reference")
+    assert "port" not in build_server_kwargs(_args(), variant="candidate")
+
+
 def test_validate_server_port_isolation_requires_distinct_explicit_ports():
     validate_server_port_isolation(
         master_port=31005,
@@ -118,6 +138,21 @@ def test_validate_server_port_isolation_requires_distinct_explicit_ports():
             master_port=31005,
             reference_scheduler_port=56000,
             candidate_scheduler_port=56000,
+            enforce_qualification=True,
+        )
+    validate_server_port_isolation(
+        master_port=31005,
+        reference_scheduler_port=56000,
+        candidate_scheduler_port=56001,
+        http_port=57000,
+        enforce_qualification=True,
+    )
+    with pytest.raises(ValueError, match="must be distinct"):
+        validate_server_port_isolation(
+            master_port=31005,
+            reference_scheduler_port=56000,
+            candidate_scheduler_port=56001,
+            http_port=56001,
             enforce_qualification=True,
         )
 

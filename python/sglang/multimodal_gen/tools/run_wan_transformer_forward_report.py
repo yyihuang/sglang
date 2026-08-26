@@ -67,6 +67,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--master-port", type=int, default=30005)
     parser.add_argument("--reference-scheduler-port", type=int, required=True)
     parser.add_argument("--candidate-scheduler-port", type=int, required=True)
+    parser.add_argument("--http-port", type=int)
     parser.add_argument("--strict-ports", action="store_true")
     parser.add_argument("--reference-attention-backend", default="fa")
     parser.add_argument("--candidate-attention-backend", default="wan_hybrid")
@@ -89,8 +90,18 @@ def build_direct_port_provenance(
     reference_scheduler_port: int,
     candidate_scheduler_port: int,
     strict_ports: bool,
+    http_port: int | None = None,
 ) -> dict[str, int | bool]:
-    ports = (master_port, reference_scheduler_port, candidate_scheduler_port)
+    ports = tuple(
+        port
+        for port in (
+            master_port,
+            reference_scheduler_port,
+            candidate_scheduler_port,
+            http_port,
+        )
+        if port is not None
+    )
     if any(isinstance(port, bool) or not isinstance(port, int) for port in ports):
         raise ValueError("direct qualification ports must be integers")
     if any(port < 1 or port > 65535 for port in ports):
@@ -98,16 +109,17 @@ def build_direct_port_provenance(
     if not strict_ports:
         raise ValueError("direct qualification requires strict ports")
     if len(set(ports)) != len(ports):
-        raise ValueError(
-            "direct qualification requires distinct master/reference/candidate ports"
-        )
-    return {
+        raise ValueError("direct qualification requires distinct configured ports")
+    provenance = {
         "master_port": master_port,
         "reference_scheduler_port": reference_scheduler_port,
         "candidate_scheduler_port": candidate_scheduler_port,
         "reference_strict_ports": True,
         "candidate_strict_ports": True,
     }
+    if http_port is not None:
+        provenance["http_port"] = http_port
+    return provenance
 
 
 def select_direct_qualification_runner(comparison_mode: str):
@@ -148,7 +160,7 @@ def _initialize_single_gpu_runtime(master_port: int) -> None:
         get_context().set_server_args(SrtServerArgs(model_path="dummy"))
 
 
-def _load_component(
+def build_direct_server_kwargs(
     *,
     model_root: str,
     component_name: str,
@@ -159,15 +171,8 @@ def _load_component(
     transformer_weights_path: str | None,
     scheduler_port: int,
     strict_ports: bool,
-) -> Any:
-    from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-        PipelineComponentLoader,
-    )
-    from sglang.multimodal_gen.runtime.server_args import (
-        ServerArgs,
-        set_global_server_args,
-    )
-
+    http_port: int | None = None,
+) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "model_path": model_root,
         "backend": "sglang",
@@ -181,6 +186,8 @@ def _load_component(
             component_name: attention_backend,
         },
     }
+    if http_port is not None:
+        kwargs["port"] = http_port
     if model_id is not None:
         kwargs["model_id"] = model_id
     if attention_backend_config is not None:
@@ -197,6 +204,42 @@ def _load_component(
             kwargs["component_transformer_weights_paths"] = {
                 component_name: transformer_weights_path
             }
+    return kwargs
+
+
+def _load_component(
+    *,
+    model_root: str,
+    component_name: str,
+    component_path: str,
+    model_id: str | None,
+    attention_backend: str,
+    attention_backend_config: str | None,
+    transformer_weights_path: str | None,
+    scheduler_port: int,
+    strict_ports: bool,
+    http_port: int | None = None,
+) -> Any:
+    from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+        PipelineComponentLoader,
+    )
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs,
+        set_global_server_args,
+    )
+
+    kwargs = build_direct_server_kwargs(
+        model_root=model_root,
+        component_name=component_name,
+        component_path=component_path,
+        model_id=model_id,
+        attention_backend=attention_backend,
+        attention_backend_config=attention_backend_config,
+        transformer_weights_path=transformer_weights_path,
+        scheduler_port=scheduler_port,
+        strict_ports=strict_ports,
+        http_port=http_port,
+    )
     server_args = ServerArgs.from_kwargs(**kwargs)
     set_global_server_args(server_args)
     config = json.loads(
@@ -245,6 +288,7 @@ def main() -> None:
         reference_scheduler_port=args.reference_scheduler_port,
         candidate_scheduler_port=args.candidate_scheduler_port,
         strict_ports=args.strict_ports,
+        http_port=args.http_port,
     )
     capture_manifest_path = Path(args.capture_manifest).expanduser().resolve()
 
@@ -274,6 +318,7 @@ def main() -> None:
         transformer_weights_path=args.reference_transformer_weights_path,
         scheduler_port=args.reference_scheduler_port,
         strict_ports=args.strict_ports,
+        http_port=args.http_port,
     )
     candidate_model = _load_component(
         model_root=model_root,
@@ -285,6 +330,7 @@ def main() -> None:
         transformer_weights_path=args.candidate_transformer_weights_path,
         scheduler_port=args.candidate_scheduler_port,
         strict_ports=args.strict_ports,
+        http_port=args.http_port,
     )
     qualification_runner = select_direct_qualification_runner(args.comparison_mode)
     if args.comparison_mode == "performance":

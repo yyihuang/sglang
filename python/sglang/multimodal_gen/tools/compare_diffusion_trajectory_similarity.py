@@ -104,11 +104,13 @@ def validate_server_port_isolation(
     reference_scheduler_port: int | None,
     candidate_scheduler_port: int | None,
     enforce_qualification: bool,
+    http_port: int | None = None,
 ) -> None:
     ports = {
         "master_port": master_port,
         "reference_scheduler_port": reference_scheduler_port,
         "candidate_scheduler_port": candidate_scheduler_port,
+        "http_port": http_port,
     }
     for name, port in ports.items():
         if port is not None and (
@@ -118,16 +120,27 @@ def validate_server_port_isolation(
         ):
             raise ValueError(f"{name} must be an integer within [1, 65535]")
     if enforce_qualification:
-        missing = [name for name, port in ports.items() if port is None]
+        required = {
+            name: port
+            for name, port in ports.items()
+            if name != "http_port"
+        }
+        missing = [name for name, port in required.items() if port is None]
         if missing:
             raise ValueError(
                 "qualification requires explicit isolated ports: " + ", ".join(missing)
             )
     configured = [port for port in ports.values() if port is not None]
     if len(configured) != len(set(configured)):
-        raise ValueError(
-            "master, reference scheduler, and candidate scheduler ports must be distinct"
-        )
+        raise ValueError("configured qualification ports must be distinct")
+
+
+def add_http_port_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        help="Explicit HTTP port reused by the sequential reference/candidate variants.",
+    )
 
 
 def parse_component_overrides(entries: Sequence[str] | None) -> dict[str, str]:
@@ -1053,7 +1066,17 @@ def build_qualification_provenance(
             "candidate_scheduler_port": candidate_server_kwargs.get("scheduler_port"),
             "reference_strict_ports": reference_server_kwargs.get("strict_ports"),
             "candidate_strict_ports": candidate_server_kwargs.get("strict_ports"),
-        },
+        }
+        | (
+            {
+                "http_port": reference_server_kwargs["port"],
+            }
+            if (
+                "port" in reference_server_kwargs
+                and reference_server_kwargs["port"] == candidate_server_kwargs.get("port")
+            )
+            else {}
+        ),
     }
 
 
@@ -1085,6 +1108,9 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
     }
     if args.master_port is not None:
         kwargs["master_port"] = args.master_port
+    http_port = getattr(args, "http_port", None)
+    if http_port is not None:
+        kwargs["port"] = http_port
     scheduler_port = getattr(args, f"{variant}_scheduler_port", None)
     if scheduler_port is not None:
         kwargs["scheduler_port"] = scheduler_port
@@ -1497,6 +1523,7 @@ def main() -> None:
         type=int,
         help="Explicit scheduler port for the candidate variant.",
     )
+    add_http_port_argument(parser)
     parser.add_argument("--ulysses-degree", type=int, default=1)
     parser.add_argument("--sp-degree", type=int)
     parser.add_argument("--trajectory-step-index", type=int, default=-1)
@@ -1645,6 +1672,7 @@ def main() -> None:
         reference_scheduler_port=args.reference_scheduler_port,
         candidate_scheduler_port=args.candidate_scheduler_port,
         enforce_qualification=args.enforce_qualification,
+        http_port=args.http_port,
     )
 
     output_json = Path(args.output_json).expanduser().resolve()
