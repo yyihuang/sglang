@@ -45,6 +45,14 @@ FORBIDDEN_VARIANT_MODEL_OVERRIDE_OPTIONS = frozenset(
         "--candidate-component-path",
     }
 )
+QUALIFICATION_OWNED_PORT_OPTIONS = frozenset(
+    {
+        "--master-port",
+        "--reference-scheduler-port",
+        "--candidate-scheduler-port",
+        "--http-port",
+    }
+)
 SCENARIO_EVIDENCE_SCOPES = {
     "single-block": "generation-trajectory-selected-transformer-block",
     "full-transformer": "independent-direct-correctness-and-trajectory-off-performance",
@@ -125,6 +133,12 @@ class WanQualificationConfig:
             raise ValueError(
                 "qualification forbids reference/candidate model overrides: "
                 + ", ".join(forbidden)
+            )
+        port_overrides = sorted(override_options & QUALIFICATION_OWNED_PORT_OPTIONS)
+        if port_overrides:
+            raise ValueError(
+                "qualification owns invocation port options: "
+                + ", ".join(port_overrides)
             )
 
 
@@ -245,6 +259,8 @@ def build_qualification_plan(
                         str(next_port + 1),
                         "--candidate-scheduler-port",
                         str(next_port + 2),
+                        "--http-port",
+                        str(next_port + 3),
                         "--output-json",
                         str(output_path),
                     ]
@@ -259,7 +275,7 @@ def build_qualification_plan(
                         command=command,
                     )
                 )
-                next_port += 3
+                next_port += 4
     if next_port - 1 > 65535:
         raise ValueError("qualification port range exceeds 65535")
     return invocations
@@ -871,6 +887,7 @@ def _validate_execution_topology(
         "candidate_scheduler_port": _invocation_integer_option(
             invocation, "--candidate-scheduler-port"
         ),
+        "http_port": _invocation_integer_option(invocation, "--http-port"),
         "reference_strict_ports": True,
         "candidate_strict_ports": True,
     }
@@ -896,8 +913,8 @@ def _validate_execution_topology(
     ):
         errors.append("execution topology does not describe the worker lifecycle")
     ports = [expected_ports[name] for name in expected_ports if name.endswith("port")]
-    if any(port is None for port in ports) or len(set(ports)) != 3:
-        errors.append("invocation does not use three distinct explicit ports")
+    if any(port is None for port in ports) or len(set(ports)) != 4:
+        errors.append("invocation does not use four distinct explicit ports")
     provenance = report.get("provenance")
     if not isinstance(provenance, dict) or provenance.get("port_isolation") != (
         expected_ports

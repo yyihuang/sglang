@@ -227,6 +227,7 @@ def _provenance(server_kwargs: dict) -> dict:
             "master_port": 30000,
             "reference_scheduler_port": 30001,
             "candidate_scheduler_port": 30002,
+            "http_port": 30003,
             "reference_strict_ports": True,
             "candidate_strict_ports": True,
         },
@@ -241,6 +242,7 @@ def _correctness_report(run_order: str, measure_runs: int = 5) -> dict:
             "attention_backend": "fa",
             "master_port": 30000,
             "scheduler_port": 30001,
+            "port": 30003,
             "strict_ports": True,
         },
         "candidate": {
@@ -255,6 +257,7 @@ def _correctness_report(run_order: str, measure_runs: int = 5) -> dict:
             ),
             "master_port": 30000,
             "scheduler_port": 30002,
+            "port": 30003,
             "strict_ports": True,
         },
     }
@@ -340,6 +343,7 @@ def _performance_report(measure_runs: int = 5) -> dict:
             "attention_backend": "fa",
             "master_port": 30000,
             "scheduler_port": 30001,
+            "port": 30003,
             "strict_ports": True,
         },
         "candidate": {
@@ -354,6 +358,7 @@ def _performance_report(measure_runs: int = 5) -> dict:
             ),
             "master_port": 30000,
             "scheduler_port": 30002,
+            "port": 30003,
             "strict_ports": True,
         },
     }
@@ -657,16 +662,17 @@ def test_plan_uses_generation_invocations_and_direct_full_transformer_evidence(
             "correctness",
             "performance",
         ]
-    port_triples = {
+    port_quads = {
         (
             item.command[item.command.index("--master-port") + 1],
             item.command[item.command.index("--reference-scheduler-port") + 1],
             item.command[item.command.index("--candidate-scheduler-port") + 1],
+            item.command[item.command.index("--http-port") + 1],
         )
         for item in plan
     }
-    assert len(port_triples) == 6
-    assert len({port for triple in port_triples for port in triple}) == 18
+    assert len(port_quads) == 6
+    assert len({port for quad in port_quads for port in quad}) == 24
     assert all("--reference-attention-backend" in item.command for item in plan)
 
     single_block = next(item for item in plan if item.scenario == "single-block")
@@ -698,6 +704,42 @@ def test_plan_rejects_variant_model_overrides_and_nonfixed_performance_counts(
         )
     with pytest.raises(ValueError, match="exactly warmup=2/measure=5"):
         build_qualification_plan(_config(tmp_path, warmup_runs=3))
+
+
+@pytest.mark.parametrize(
+    "option",
+    (
+        "--master-port=31000",
+        "--reference-scheduler-port=31001",
+        "--candidate-scheduler-port=31002",
+        "--http-port=31003",
+    ),
+)
+def test_plan_rejects_forwarded_port_overrides(tmp_path, option):
+    with pytest.raises(ValueError, match="owns invocation port options"):
+        build_qualification_plan(_config(tmp_path, extra_compare_args=(option,)))
+
+
+def test_plan_accepts_last_complete_port_quad_and_rejects_overflow(tmp_path):
+    plan = build_qualification_plan(
+        _config(
+            tmp_path,
+            scenarios=("generation",),
+            modes=("performance",),
+            master_port=65532,
+        )
+    )
+    assert plan[0].command[plan[0].command.index("--http-port") + 1] == "65535"
+
+    with pytest.raises(ValueError, match="port range exceeds 65535"):
+        build_qualification_plan(
+            _config(
+                tmp_path,
+                scenarios=("generation",),
+                modes=("performance",),
+                master_port=65533,
+            )
+        )
 
 
 def test_runtime_attention_identity_uses_resolved_and_executed_instances():
@@ -908,6 +950,7 @@ def test_generation_promotion_rejects_route_port_and_topology_tampering(tmp_path
     report["server_kwargs"]["reference"]["transformer_weights_path"] = "/tmp/other"
     report["execution_topology"]["same_cuda_stream_proven"] = True
     report["provenance"]["port_isolation"]["candidate_scheduler_port"] = 30001
+    report["provenance"]["port_isolation"]["http_port"] = 30002
     report["candidate_generation"]["per_run_wan_hybrid_hit_count"][0] = 5
     errors = validate_qualification_report(report, invocation, config)
 
