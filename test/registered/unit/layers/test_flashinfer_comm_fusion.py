@@ -453,9 +453,7 @@ class TestFlashInferTrtllmMoeFinalizeGuard(CustomTestCase):
         runner_backend = types.SimpleNamespace(is_flashinfer_trtllm=lambda: True)
         exec_config = types.SimpleNamespace(
             overlap=types.SimpleNamespace(enable_two_batch_overlap=False),
-            comm=types.SimpleNamespace(
-                flashinfer_allreduce_fusion_backend="trtllm"
-            ),
+            comm=types.SimpleNamespace(flashinfer_allreduce_fusion_backend="trtllm"),
         )
 
         buffers[manager_key] = manager
