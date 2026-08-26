@@ -14,7 +14,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -123,12 +123,16 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     return backend
 
 
-def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
-    backend = getattr(server_args, "flashinfer_allreduce_fusion_backend", None)
+def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
+    """The fusion backend for this process, or None when fusion is off.
+
+    Reads the published leaves (`exec.comm`, `parallel`): the backend is a
+    resolution decision, and the node count is launch topology.
+    """
+    backend = get_exec().comm.flashinfer_allreduce_fusion_backend
     if backend is None:
         return None
-    is_multi_node = getattr(server_args, "nnodes", 1) > 1
-    return _resolve_backend(backend, is_multi_node)
+    return _resolve_backend(backend, get_parallel().config.nnodes > 1)
 
 
 if is_flashinfer_available():
@@ -845,8 +849,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_args = get_server_args()
-    backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
+    backend = resolve_flashinfer_allreduce_fusion_backend()
     if backend is None:
         return False
 
@@ -895,7 +898,7 @@ def _is_flashinfer_trtllm_moe_finalize_execution_route_supported() -> bool:
     # custom op likewise declares a single Tensor output.  Neither route can
     # transport the Python dataclass across layers yet.
     return not (
-        getattr(get_server_args(), "enable_two_batch_overlap", False)
+        get_exec().overlap.enable_two_batch_overlap
         or is_in_tc_piecewise_cuda_graph()
         or is_in_breakable_cuda_graph()
     )
@@ -932,9 +935,7 @@ def get_flashinfer_trtllm_moe_finalize_workspace_state(
     execution_route_supported = (
         _is_flashinfer_trtllm_moe_finalize_execution_route_supported()
     )
-    configured_backend = getattr(
-        get_server_args(), "flashinfer_allreduce_fusion_backend", None
-    )
+    configured_backend = get_exec().comm.flashinfer_allreduce_fusion_backend
     moe_backend_supported = get_moe_runner_backend().is_flashinfer_trtllm()
     route_ok = (
         not _flashinfer_allreduce_unavailable
@@ -1175,8 +1176,7 @@ def try_flashinfer_trtllm_moe_finalize_allreduce_residual_rmsnorm(
         and _flashinfer_trtllm_moe_finalize is not None
         and is_sm100_supported()
         and _is_flashinfer_trtllm_moe_finalize_execution_route_supported()
-        and getattr(get_server_args(), "flashinfer_allreduce_fusion_backend", None)
-        == "trtllm"
+        and get_exec().comm.flashinfer_allreduce_fusion_backend == "trtllm"
         and workspace_is_current
         and gemm2_out.ndim == 2
         and expert_weights.ndim == 2
