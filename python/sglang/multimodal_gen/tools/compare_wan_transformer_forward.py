@@ -46,6 +46,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.qualification.attention_backend_identity import (
+    collect_runtime_attention_backend_identity,
+)
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
     _model_identity,
     load_wan_transformer_input_capture,
@@ -58,11 +61,13 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     QUALIFICATION_RUN_ORDERS,
     WAN_HYBRID_PROMOTION_LAYER_INDICES,
     WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+    _collapse_reference_attention_backend_identities,
     compute_tensor_metrics,
     evaluate_candidate_backend_hit_qualification,
     evaluate_correctness_qualification,
     summarize_trajectory_metrics,
     validate_qualification_protocol,
+    validate_reference_attention_backend_identity,
 )
 
 
@@ -113,6 +118,7 @@ class WanTransformerForwardTiming:
     cuda_stream_handle: int
     wan_hybrid_coverage: dict[str, Any]
     output_summary: dict[str, Any]
+    attention_backend_identity: dict[str, Any] | None = None
 
     @property
     def wan_hybrid_hit_count(self) -> int:
@@ -609,6 +615,7 @@ def _timed_wan_transformer_forward(
     actual_timestep: int,
     cfg_branch_index: int,
     device: torch.device,
+    requested_attention_backend: str | None,
 ) -> WanTransformerForwardTiming:
     """Time one synchronized forward without hooks or trajectory snapshots."""
 
@@ -642,6 +649,9 @@ def _timed_wan_transformer_forward(
         "device": str(output_tensor.device),
         "finite": bool(torch.isfinite(output_tensor).all().item()),
     }
+    attention_backend_identity = collect_runtime_attention_backend_identity(
+        [model], requested_backend=requested_attention_backend
+    )
     return WanTransformerForwardTiming(
         duration_ms=duration_ms,
         request_id=request_id,
@@ -654,6 +664,7 @@ def _timed_wan_transformer_forward(
         cuda_stream_handle=cuda_stream_handle,
         wan_hybrid_coverage=collector.coverage(),
         output_summary=output_summary,
+        attention_backend_identity=attention_backend_identity,
     )
 
 
@@ -695,6 +706,7 @@ def _run_timed_variant(
             actual_timestep=actual_timestep,
             cfg_branch_index=cfg_branch_index,
             device=device,
+            requested_attention_backend=("fa" if variant == "reference" else None),
         )
         for _ in range(measure_runs)
     ]
@@ -1224,7 +1236,7 @@ def run_wan_transformer_forward_performance_qualification(
             )
             is not None
         ]
-        return {
+        summary = {
             "warmup_runs": warmup_runs,
             "measure_runs": measure_runs,
             "per_run_duration_ms": [timing.duration_ms for timing in timings],
@@ -1248,8 +1260,14 @@ def run_wan_transformer_forward_performance_qualification(
             "per_run_output_summary": [timing.output_summary for timing in timings],
             "coverage_failures": coverage_failures,
         }
+        if variant == "reference":
+            summary["per_run_attention_backend_identity"] = [
+                timing.attention_backend_identity for timing in timings
+            ]
+        return summary
 
     order_results: dict[str, Any] = {}
+    reference_order_identities = []
     failures = []
     for run_order in QUALIFICATION_RUN_ORDERS:
         execution_order = (
@@ -1257,7 +1275,17 @@ def run_wan_transformer_forward_performance_qualification(
             if run_order == "reference-first"
             else ("candidate", "reference")
         )
-        timings = {variant: run_variant(variant) for variant in execution_order}
+        timings = {}
+        reference_identity = None
+        for variant in execution_order:
+            timings[variant] = run_variant(variant)
+            if variant == "reference":
+                reference_identity = _collapse_reference_attention_backend_identities(
+                    [timing.attention_backend_identity for timing in timings[variant]],
+                    location=f"{run_order} direct reference measured forwards",
+                )
+        assert reference_identity is not None
+        reference_order_identities.append(reference_identity)
         reference_summary = summarize_variant(timings["reference"], variant="reference")
         candidate_summary = summarize_variant(timings["candidate"], variant="candidate")
         speedup = (
@@ -1266,6 +1294,7 @@ def run_wan_transformer_forward_performance_qualification(
         )
         order_results[run_order] = {
             "execution_order": list(execution_order),
+            "reference_attention_backend_identity": reference_identity,
             "reference_forward": reference_summary,
             "candidate_forward": candidate_summary,
             "performance": {
@@ -1318,6 +1347,12 @@ def run_wan_transformer_forward_performance_qualification(
                     }
                 )
 
+    reference_attention_backend_identity = (
+        _collapse_reference_attention_backend_identities(
+            reference_order_identities,
+            location="direct reference performance run orders",
+        )
+    )
     invocation_input_sha256 = _sha256_json(_summarize_fixed_input(fixed_input_cpu))
     if evidence_binding["fixed_input_sha256"] != invocation_input_sha256:
         raise RuntimeError("full-transformer performance mutated the fixed input")
@@ -1345,6 +1380,7 @@ def run_wan_transformer_forward_performance_qualification(
             model, "wan_hybrid_max_timestep", None
         ),
         "candidate_backend_exercised": True,
+        "reference_attention_backend_identity": reference_attention_backend_identity,
         "execution_topology": {
             "controller_pid": os.getpid(),
             "same_python_process": True,
@@ -1382,6 +1418,23 @@ def validate_wan_transformer_forward_performance_report(
     if not isinstance(report, dict):
         return ["performance report is not a JSON object"]
     errors = []
+    reference_attention_backend_identity = report.get(
+        "reference_attention_backend_identity"
+    )
+    errors.extend(
+        f"reference_attention_backend_identity: {error}"
+        for error in validate_reference_attention_backend_identity(
+            reference_attention_backend_identity
+        )
+    )
+    if isinstance(reference_attention_backend_identity, dict) and (
+        reference_attention_backend_identity.get("expected_instance_count") != 80
+        or reference_attention_backend_identity.get("observed_instance_count") != 80
+    ):
+        errors.append(
+            "reference_attention_backend_identity: direct Wan transformer "
+            "performance requires all 80 attention instances"
+        )
     expected_layers = list(WAN_HYBRID_PROMOTION_LAYER_INDICES)
     expected_hits = len(expected_layers)
     expected_scalars = {
@@ -1502,6 +1555,19 @@ def validate_wan_transformer_forward_performance_report(
             )
             if order.get("execution_order") != expected_order:
                 errors.append(f"{run_order}: execution order is invalid")
+            order_reference_identity = order.get(
+                "reference_attention_backend_identity"
+            )
+            if order_reference_identity != reference_attention_backend_identity:
+                errors.append(
+                    f"{run_order}: reference attention backend identity is inconsistent"
+                )
+            errors.extend(
+                f"{run_order}.reference_attention_backend_identity: {error}"
+                for error in validate_reference_attention_backend_identity(
+                    order_reference_identity
+                )
+            )
             for variant in ("reference", "candidate"):
                 summary = order.get(f"{variant}_forward")
                 if not isinstance(summary, dict):
@@ -1511,6 +1577,9 @@ def validate_wan_transformer_forward_performance_report(
                 request_ids = summary.get("per_run_request_id")
                 output_summaries = summary.get("per_run_output_summary")
                 coverages = summary.get("per_run_wan_hybrid_coverage")
+                per_run_attention_backend_identities = summary.get(
+                    "per_run_attention_backend_identity"
+                )
                 expected_variant_hits = expected_hits if variant == "candidate" else 0
                 expected_pid = (
                     topology.get("controller_pid")
@@ -1560,6 +1629,16 @@ def validate_wan_transformer_forward_performance_report(
                     or any(
                         not isinstance(output, dict) or output.get("finite") is not True
                         for output in output_summaries or []
+                    )
+                    or (
+                        variant == "reference"
+                        and per_run_attention_backend_identities
+                        != [reference_attention_backend_identity]
+                        * MIN_QUALIFICATION_MEASURE_RUNS
+                    )
+                    or (
+                        variant == "candidate"
+                        and "per_run_attention_backend_identity" in summary
                     )
                 ):
                     errors.append(f"{run_order}.{variant}: forward evidence is invalid")

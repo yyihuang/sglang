@@ -182,7 +182,29 @@ def test_direct_cli_mode_dispatches_to_trajectory_free_performance_runner():
         select_direct_qualification_runner("other")
 
 
-def test_direct_performance_report_requires_promotion_hits_and_process_stream_proof():
+def _reference_attention_backend_identity(
+    *, flash_attention_version: int = 4
+) -> dict:
+    return {
+        "requested_backend": "fa",
+        "resolved_backend_class": (
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "flash_attn.FlashAttentionBackend"
+        ),
+        "resolved_impl_class": (
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "flash_attn.FlashAttentionImpl"
+        ),
+        "implementation": f"FA{flash_attention_version}",
+        "flash_attention_version": flash_attention_version,
+        "runtime_observed": True,
+        "expected_instance_count": 80,
+        "observed_instance_count": 80,
+    }
+
+
+def _valid_direct_performance_report() -> dict:
+    reference_identity = _reference_attention_backend_identity()
     binding = {
         "schema_version": 1,
         "component_name": "transformer_2",
@@ -274,7 +296,7 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
                 ],
             }
 
-        return {
+        summary = {
             "warmup_runs": 2,
             "measure_runs": 5,
             "per_run_duration_ms": [1.0] * 5,
@@ -291,6 +313,11 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
             "per_run_output_summary": [{"finite": True} for _ in range(5)],
             "coverage_failures": [],
         }
+        if variant == "reference":
+            summary["per_run_attention_backend_identity"] = [
+                reference_identity
+            ] * 5
+        return summary
 
     port_provenance = {
         "master_port": 32000,
@@ -320,6 +347,7 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
         "candidate_wan_hybrid_eligible_layer_indices": [37, 38, 39],
         "candidate_wan_hybrid_max_timestep": 521,
         "candidate_backend_exercised": True,
+        "reference_attention_backend_identity": reference_identity,
         "execution_topology": {
             "controller_pid": 1234,
             "same_python_process": True,
@@ -346,6 +374,7 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
                     if run_order == "reference-first"
                     else ["candidate", "reference"]
                 ),
+                "reference_attention_backend_identity": reference_identity,
                 "reference_forward": variant_summary("reference"),
                 "candidate_forward": variant_summary("candidate"),
                 "performance": {
@@ -368,6 +397,12 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
             "failures": [],
         },
     }
+
+    return report
+
+
+def test_direct_performance_report_requires_promotion_hits_and_process_stream_proof():
+    report = _valid_direct_performance_report()
 
     assert validate_wan_transformer_forward_performance_report(report) == []
 
@@ -411,6 +446,59 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
     assert any("candidate: forward evidence" in error for error in errors)
     assert "performance process/stream topology is not proven" in errors
     assert "performance ports are not explicit, strict, and distinct" in errors
+
+
+def test_direct_performance_report_rejects_missing_fa3_and_mixed_identities():
+    missing = _valid_direct_performance_report()
+    missing.pop("reference_attention_backend_identity")
+    missing_errors = validate_wan_transformer_forward_performance_report(missing)
+    assert any(
+        "runtime attention backend identity is missing" in error
+        for error in missing_errors
+    )
+
+    fa3 = _valid_direct_performance_report()
+    fa3_identity = _reference_attention_backend_identity(flash_attention_version=3)
+    fa3["reference_attention_backend_identity"] = fa3_identity
+    for order in fa3["order_results"].values():
+        order["reference_attention_backend_identity"] = fa3_identity
+        order["reference_forward"]["per_run_attention_backend_identity"] = [
+            fa3_identity
+        ] * 5
+    fa3_errors = validate_wan_transformer_forward_performance_report(fa3)
+    assert any("invalid implementation" in error for error in fa3_errors)
+    assert any("invalid flash_attention_version" in error for error in fa3_errors)
+
+    mixed = _valid_direct_performance_report()
+    mixed["order_results"]["candidate-first"][
+        "reference_attention_backend_identity"
+    ] = fa3_identity
+    mixed["order_results"]["candidate-first"]["reference_forward"][
+        "per_run_attention_backend_identity"
+    ][0] = fa3_identity
+    mixed_errors = validate_wan_transformer_forward_performance_report(mixed)
+    assert any(
+        "reference attention backend identity is inconsistent" in error
+        for error in mixed_errors
+    )
+    assert any(
+        "reference: forward evidence is invalid" in error for error in mixed_errors
+    )
+
+    partial = _valid_direct_performance_report()
+    partial_identity = _reference_attention_backend_identity()
+    partial_identity["expected_instance_count"] = 1
+    partial_identity["observed_instance_count"] = 1
+    partial["reference_attention_backend_identity"] = partial_identity
+    for order in partial["order_results"].values():
+        order["reference_attention_backend_identity"] = partial_identity
+        order["reference_forward"]["per_run_attention_backend_identity"] = [
+            partial_identity
+        ] * 5
+    partial_errors = validate_wan_transformer_forward_performance_report(partial)
+    assert any(
+        "requires all 80 attention instances" in error for error in partial_errors
+    )
 
 
 def test_direct_performance_variant_switch_reuses_one_layer_set(monkeypatch):

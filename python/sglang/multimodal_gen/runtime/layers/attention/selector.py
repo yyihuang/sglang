@@ -86,6 +86,11 @@ def get_global_forced_attn_backend() -> AttentionBackendEnum | None:
     return forced_attn_backend
 
 
+def get_component_forced_attn_backend() -> AttentionBackendEnum | None:
+    """Current main has no component override scope; retain the public hook."""
+    return None
+
+
 def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,

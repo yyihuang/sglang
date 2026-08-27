@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
     record_wan_attention_route,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
@@ -152,6 +153,8 @@ def _wan_cross_attention_backends(
     }
     selected_backend = get_global_forced_attn_backend()
     if selected_backend is None:
+        selected_backend = get_component_forced_attn_backend()
+    if selected_backend is None:
         selected_backend_name = get_global_server_args().attention_backend
         if selected_backend_name is not None:
             selected_backend = AttentionBackendEnum[selected_backend_name.upper()]
@@ -234,6 +237,7 @@ class WanSelfAttention(nn.Module):
         eps=1e-6,
         parallel_attention=False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        is_cross_attention: bool = True,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -264,6 +268,8 @@ class WanSelfAttention(nn.Module):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            skip_sequence_parallel=is_cross_attention,
+            is_cross_attention=is_cross_attention,
         )
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, context_lens: int):
