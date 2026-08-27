@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    WAN_HYBRID_EXACT_SERVING_BOUNDARY,
     _record_successful_wan_hybrid_forward,
     record_wan_attention_route,
 )
@@ -22,6 +23,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
     WanTransformerInputCapture,
+)
+from sglang.multimodal_gen.tools import (
+    compare_wan_transformer_forward as forward_module,
 )
 from sglang.multimodal_gen.tools.compare_wan_attention_direct import (
     _validate_direct_route,
@@ -187,6 +191,7 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
         "reference_model": {"num_blocks": 40},
         "candidate_model": {"num_blocks": 40},
         "capture_manifest_sha256": "b" * 64,
+        "capture_input_sha256": "d" * 64,
         "capture_request_id": "capture-request",
         "capture_sampling_sha256": "c" * 64,
         "capture_coordinates": {
@@ -211,6 +216,17 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
         hybrid_layers = [37, 38, 39] if variant == "candidate" else []
 
         def coverage(request_id: str) -> dict:
+            successful_calls = [
+                {
+                    "step_index": 11,
+                    "actual_timestep": 521,
+                    "component_name": "transformer_2",
+                    "cfg_branch_index": 0,
+                    "layer_index": layer_index,
+                    "serving_boundary": WAN_HYBRID_EXACT_SERVING_BOUNDARY,
+                }
+                for layer_index in hybrid_layers
+            ]
             return {
                 "schema_version": 2,
                 "request_id": request_id,
@@ -221,6 +237,7 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
                 "eligible_hybrid_miss_count": 0,
                 "num_route_events": 40,
                 "num_success_events": hits,
+                "successful_calls": successful_calls,
                 "steps": [
                     {
                         "step_index": 11,
@@ -265,6 +282,7 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
             "per_run_request_id": request_ids,
             "per_run_controller_pid": [1234] * 5,
             "per_run_cuda_stream_handle": [5678] * 5,
+            "per_run_model_object_id": [9012] * 5,
             "per_run_wan_hybrid_expected_hit_count": [hits] * 5,
             "per_run_wan_hybrid_hit_count": [hits] * 5,
             "per_run_wan_hybrid_coverage": [
@@ -307,12 +325,15 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
             "same_python_process": True,
             "reference_model_reused_across_orders": True,
             "candidate_model_reused_across_orders": True,
+            "shared_model_instance": True,
+            "shared_model_reused_across_variants_and_orders": True,
+            "model_object_id": 9012,
             "same_cuda_device": True,
             "same_fixed_input_object": True,
             "cuda_device": "cuda:0",
             "same_cuda_stream_proven": True,
             "cuda_stream_handle": 5678,
-            "direct_in_process_models": 2,
+            "direct_in_process_models": 1,
             "scheduler_worker_processes": 0,
             "scheduler_ports_reserved_for_variant_configuration_only": True,
             "port_topology": port_provenance,
@@ -350,6 +371,37 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
 
     assert validate_wan_transformer_forward_performance_report(report) == []
 
+    invalid_boundary_report = json.loads(json.dumps(report))
+    invalid_boundary_report["order_results"]["reference-first"][
+        "candidate_forward"
+    ]["per_run_wan_hybrid_coverage"][0]["successful_calls"][0][
+        "serving_boundary"
+    ]["causal"] = True
+    boundary_errors = validate_wan_transformer_forward_performance_report(
+        invalid_boundary_report
+    )
+    assert any(
+        "serialized coverage is invalid" in error for error in boundary_errors
+    )
+
+    invalid_capture_report = json.loads(json.dumps(report))
+    invalid_capture_report["evidence_binding"]["capture_input_sha256"] = "not-a-sha"
+    invalid_capture_report["evidence_binding"]["binding_sha256"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in invalid_capture_report["evidence_binding"].items()
+                if key != "binding_sha256"
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    capture_errors = validate_wan_transformer_forward_performance_report(
+        invalid_capture_report
+    )
+    assert "performance real-input provenance is incomplete" in capture_errors
+
     report["order_results"]["candidate-first"]["candidate_forward"][
         "per_run_wan_hybrid_hit_count"
     ][0] = 4
@@ -359,6 +411,25 @@ def test_direct_performance_report_requires_promotion_hits_and_process_stream_pr
     assert any("candidate: forward evidence" in error for error in errors)
     assert "performance process/stream topology is not proven" in errors
     assert "performance ports are not explicit, strict, and distinct" in errors
+
+
+def test_direct_performance_variant_switch_reuses_one_layer_set(monkeypatch):
+    layers = [object(), object()]
+    calls = []
+    monkeypatch.setattr(
+        forward_module,
+        "apply_attention_backend_override",
+        lambda layer, target: calls.append((layer, target)),
+    )
+
+    forward_module._select_shared_performance_variant(layers, "reference")
+    forward_module._select_shared_performance_variant(layers, "candidate")
+
+    assert calls[:2] == [
+        (layers[0], forward_module.AttentionBackendEnum.FA),
+        (layers[1], forward_module.AttentionBackendEnum.FA),
+    ]
+    assert calls[2:] == [(layers[0], None), (layers[1], None)]
 
 
 class _AddBlock(nn.Module):
@@ -384,7 +455,9 @@ class _AddBlock(nn.Module):
         output = hidden_states + self.value
         if self.eligible_for_hybrid:
             output = _record_successful_wan_hybrid_forward(
-                output, layer_index=self.layer_index
+                output,
+                layer_index=self.layer_index,
+                serving_boundary=WAN_HYBRID_EXACT_SERVING_BOUNDARY,
             )
         return output
 

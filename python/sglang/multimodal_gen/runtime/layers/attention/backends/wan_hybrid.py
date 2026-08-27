@@ -28,6 +28,24 @@ _SHARED_SCRATCH: weakref.WeakValueDictionary[tuple, _WanHybridSharedScratch] = (
 )
 
 
+WAN_HYBRID_EXACT_SERVING_BOUNDARY = {
+    "schema_version": 1,
+    "batch_size": 1,
+    "sequence_length": 4800,
+    "num_query_heads": 40,
+    "num_key_value_heads": 40,
+    "head_dim": 128,
+    "qkv_layout": "NHD",
+    "causal": False,
+    "qkv_dtype": "torch.bfloat16",
+    "qkv_representation": "raw_post_rope",
+    "output_dtype": "torch.bfloat16",
+    "output_shape": [1, 4800, 40, 128],
+    "output_ownership": "caller_owned",
+    "caller_output_storage_reused": True,
+}
+
+
 @dataclass
 class WanHybridEvidenceCollector:
     """Evidence owned by exactly one Wan serving request."""
@@ -134,7 +152,10 @@ def record_wan_attention_route(
 
 
 def _record_successful_wan_hybrid_forward(
-    result: torch.Tensor, *, layer_index: int | None
+    result: torch.Tensor,
+    *,
+    layer_index: int | None,
+    serving_boundary: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     if layer_index is None:
         from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -162,7 +183,10 @@ def _record_successful_wan_hybrid_forward(
         _standalone_evidence().record_success(None)
     else:
         collector, coordinates = evidence
-        collector.record_success(coordinates)
+        event = coordinates
+        if serving_boundary is not None:
+            event = event | {"serving_boundary": dict(serving_boundary)}
+        collector.record_success(event)
     return result
 
 
@@ -299,8 +323,46 @@ def _build_wan_hybrid_coverage(
         "eligible_hybrid_miss_count": eligible_hybrid_miss_count,
         "num_route_events": len(routes),
         "num_success_events": len(successes),
+        "successful_calls": successes,
         "steps": steps,
     }
+
+
+def validate_wan_hybrid_exact_serving_boundary_evidence(
+    coverage: Any,
+) -> list[str]:
+    """Validate one exact-boundary record for every successful public API call."""
+
+    if not isinstance(coverage, dict):
+        return ["coverage is not an object"]
+    successes = coverage.get("successful_calls")
+    expected_count = coverage.get("num_success_events")
+    if (
+        not isinstance(successes, list)
+        or isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or len(successes) != expected_count
+    ):
+        return ["successful-call evidence cardinality is inconsistent"]
+
+    errors = []
+    required_coordinates = (
+        "step_index",
+        "actual_timestep",
+        "component_name",
+        "cfg_branch_index",
+        "layer_index",
+    )
+    for index, success in enumerate(successes):
+        location = f"successful_calls[{index}]"
+        if not isinstance(success, dict):
+            errors.append(f"{location} is not an object")
+            continue
+        if any(success.get(name) is None for name in required_coordinates):
+            errors.append(f"{location} has incomplete route coordinates")
+        if success.get("serving_boundary") != WAN_HYBRID_EXACT_SERVING_BOUNDARY:
+            errors.append(f"{location} does not prove the exact serving boundary")
+    return errors
 
 
 class WanHybridAttentionBackend(AttentionBackend):
@@ -467,16 +529,30 @@ class WanHybridAttentionImpl(AttentionImpl):
             )
 
         workspace, output = self._get_workspace_and_output(query)
+        result = wan_hybrid_attention(
+            query,
+            key,
+            value,
+            out=output,
+            workspace=workspace,
+            sm_scale=self.softmax_scale,
+            qkv_layout="NHD",
+            causal=False,
+        )
+        same_output_storage = result is output
+        if isinstance(result, torch.Tensor) and isinstance(output, torch.Tensor):
+            same_output_storage = (
+                result.shape == output.shape
+                and result.dtype == output.dtype
+                and result.data_ptr() == output.data_ptr()
+            )
+        if not same_output_storage:
+            raise RuntimeError(
+                "FlashInfer wan_hybrid_attention did not return the caller-owned "
+                "BF16 output storage"
+            )
         return _record_successful_wan_hybrid_forward(
-            wan_hybrid_attention(
-                query,
-                key,
-                value,
-                out=output,
-                workspace=workspace,
-                sm_scale=self.softmax_scale,
-                qkv_layout="NHD",
-                causal=False,
-            ),
+            result,
             layer_index=self._wan_layer_index,
+            serving_boundary=WAN_HYBRID_EXACT_SERVING_BOUNDARY,
         )

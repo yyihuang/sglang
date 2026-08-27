@@ -113,7 +113,11 @@ captures every trajectory step and evaluates every same-variant and
 cross-variant run pair. Performance disables trajectory capture, executes both
 reference-first and candidate-first orders, and passes only when both median
 speedups are at least 1.0 and every measured candidate run reports a positive
-backend hit count.
+backend hit count. Every successful hybrid call also records and validates the
+exact serving boundary (`B=1, S=4800, H=40, D=128`, NHD, noncausal, raw
+post-RoPE BF16 Q/K/V, and caller-owned BF16 output storage) in its request-local
+coverage. A hit count without the corresponding per-call boundary record is not
+qualification evidence.
 
 The qualification runner builds the fixed single-block, full-transformer, and
 generation matrices without depending on a particular cluster layout. Pass the
@@ -160,8 +164,15 @@ python -m sglang.multimodal_gen.tools.capture_wan_transformer_inputs \
 
 Each worker-produced manifest binds the serving request, sampling parameters,
 model/component identity, step/timestep/CFG branch, and CPU tensor artifact.
-Use each manifest to load the real component twice and run a direct forward in
-both explicit execution orders:
+Reports retain three separate digests: the capture manifest's tensor-artifact
+digest (`capture_input_sha256`), the canonical fixed-input summary digest
+(`fixed_input_sha256`), and the canonical invocation digest
+(`invocation_input_sha256`). The artifact digest includes serialization and
+storage metadata and therefore is not interchangeable with the two canonical
+digests.
+
+Correctness uses separately configured reference and candidate instances and
+runs one direct forward report for each explicit execution order:
 
 ```bash
 python -m sglang.multimodal_gen.tools.run_wan_transformer_forward_report \
@@ -181,6 +192,14 @@ invocation:
   --full-transformer-forward-report /results/transformer-2-reference-first.json \
   --full-transformer-forward-report /results/transformer-2-candidate-first.json
 ```
+
+Direct full-transformer performance instead loads one candidate-configured
+model, prepares the production FA implementation once, and switches that same
+model instance request-locally between FA and its construction-default
+`wan_hybrid` implementation. Both paired orders reuse the same model, fixed
+input object, CUDA device, process, and stream; performance keeps trajectory
+capture disabled and requires two warmups plus five measured forwards per
+variant and order.
 
 The runner validates these reports as independent evidence before starting its
 generation matrix. The harness reuses the trajectory evaluator over

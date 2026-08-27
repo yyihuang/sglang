@@ -308,40 +308,53 @@ def main() -> None:
         )
 
     _initialize_single_gpu_runtime(args.master_port)
-    reference_model = _load_component(
-        model_root=model_root,
-        component_name=component_name,
-        component_path=component_path,
-        model_id=args.model_id,
-        attention_backend=args.reference_attention_backend,
-        attention_backend_config=None,
-        transformer_weights_path=args.reference_transformer_weights_path,
-        scheduler_port=args.reference_scheduler_port,
-        strict_ports=args.strict_ports,
-        http_port=args.http_port,
-    )
-    candidate_model = _load_component(
-        model_root=model_root,
-        component_name=component_name,
-        component_path=component_path,
-        model_id=args.model_id,
-        attention_backend=args.candidate_attention_backend,
-        attention_backend_config=args.candidate_attention_backend_config,
-        transformer_weights_path=args.candidate_transformer_weights_path,
-        scheduler_port=args.candidate_scheduler_port,
-        strict_ports=args.strict_ports,
-        http_port=args.http_port,
-    )
     qualification_runner = select_direct_qualification_runner(args.comparison_mode)
     if args.comparison_mode == "performance":
+        if args.reference_attention_backend != "fa":
+            raise ValueError("direct performance reference backend must be fa")
+        candidate_model = _load_component(
+            model_root=model_root,
+            component_name=component_name,
+            component_path=component_path,
+            model_id=args.model_id,
+            attention_backend=args.candidate_attention_backend,
+            attention_backend_config=args.candidate_attention_backend_config,
+            transformer_weights_path=args.candidate_transformer_weights_path,
+            scheduler_port=args.candidate_scheduler_port,
+            strict_ports=args.strict_ports,
+            http_port=args.http_port,
+        )
         report = qualification_runner(
-            reference_model=reference_model,
-            candidate_model=candidate_model,
+            model=candidate_model,
             capture_manifest_path=capture_manifest_path,
             warmup_runs=args.warmup_runs,
             measure_runs=args.measure_runs,
         )
     else:
+        reference_model = _load_component(
+            model_root=model_root,
+            component_name=component_name,
+            component_path=component_path,
+            model_id=args.model_id,
+            attention_backend=args.reference_attention_backend,
+            attention_backend_config=None,
+            transformer_weights_path=args.reference_transformer_weights_path,
+            scheduler_port=args.reference_scheduler_port,
+            strict_ports=args.strict_ports,
+            http_port=args.http_port,
+        )
+        candidate_model = _load_component(
+            model_root=model_root,
+            component_name=component_name,
+            component_path=component_path,
+            model_id=args.model_id,
+            attention_backend=args.candidate_attention_backend,
+            attention_backend_config=args.candidate_attention_backend_config,
+            transformer_weights_path=args.candidate_transformer_weights_path,
+            scheduler_port=args.candidate_scheduler_port,
+            strict_ports=args.strict_ports,
+            http_port=args.http_port,
+        )
         report = qualification_runner(
             reference_model=reference_model,
             candidate_model=candidate_model,
@@ -355,7 +368,7 @@ def main() -> None:
     if args.comparison_mode == "performance":
         report["execution_topology"].update(
             {
-                "direct_in_process_models": 2,
+                "direct_in_process_models": 1,
                 "scheduler_worker_processes": 0,
                 "scheduler_ports_reserved_for_variant_configuration_only": True,
                 "port_topology": port_provenance,
