@@ -21,6 +21,7 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
     WAN_HYBRID_PROMOTION_LAYER_INDICES,
     WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
     _module_git_revision,
+    _request_sampling_kwargs,
     validate_reference_attention_backend_identity,
 )
 from sglang.multimodal_gen.tools.run_wan_hybrid_qualification import (
@@ -154,7 +155,11 @@ def _coverage(
 
 
 def _generation(
-    measure_runs: int, *, include_hits: bool, scenario="generation"
+    measure_runs: int,
+    *,
+    include_hits: bool,
+    scenario="generation",
+    worker_topology: dict | None = None,
 ) -> dict:
     request_ids = [f"request-{index}" for index in range(measure_runs)]
     result = {
@@ -166,6 +171,10 @@ def _generation(
         "per_run_output_summaries": [_output_summary() for _ in range(measure_runs)],
         "per_run_request_id": request_ids,
     }
+    if worker_topology is not None:
+        result["per_run_worker_execution_topology"] = [
+            worker_topology
+        ] * measure_runs
     if include_hits:
         coverages = [
             _coverage(scenario, request_id=request_id) for request_id in request_ids
@@ -345,6 +354,11 @@ def _correctness_report(run_order: str, measure_runs: int = 5) -> dict:
 
 
 def _performance_report(measure_runs: int = 5) -> dict:
+    worker_topology = {
+        "worker_pid": 4321,
+        "cuda_device": "cuda:0",
+        "cuda_stream_handle": 5678,
+    }
     server_kwargs = {
         "reference": {
             "attention_backend": "fa",
@@ -393,8 +407,16 @@ def _performance_report(measure_runs: int = 5) -> dict:
         ),
         "order_results": {
             run_order: {
-                "reference_generation": _generation(measure_runs, include_hits=False),
-                "candidate_generation": _generation(measure_runs, include_hits=True),
+                "reference_generation": _generation(
+                    measure_runs,
+                    include_hits=False,
+                    worker_topology=worker_topology,
+                ),
+                "candidate_generation": _generation(
+                    measure_runs,
+                    include_hits=True,
+                    worker_topology=worker_topology,
+                ),
                 "performance": {"wall_median_speedup": 1.01},
             }
             for run_order in ("reference-first", "candidate-first")
@@ -423,13 +445,18 @@ def _performance_report(measure_runs: int = 5) -> dict:
     report["execution_topology"] = {
         "controller_pid": 1234,
         "controller_process_reused": True,
-        "variant_worker_process_sets": 4,
-        "variant_worker_process_reused": False,
+        "variant_worker_process_sets": 1,
+        "variant_worker_process_reused": True,
         "variant_worker_lifecycle": (
-            "fresh local DiffGenerator scheduler process set per variant and run order"
+            "one long-lived candidate-configured DiffGenerator scheduler worker "
+            "reused for both variants and run orders"
         ),
-        "same_gpu_worker_process": False,
-        "same_cuda_stream_proven": False,
+        "same_gpu_worker_process": True,
+        "same_cuda_stream_proven": True,
+        "shared_model_instance": True,
+        "reference_attention_backend_override": "fa",
+        "candidate_attention_backend_override": None,
+        "worker_execution_topology": worker_topology,
         "port_isolation": provenance["port_isolation"],
     }
     return report
@@ -799,6 +826,42 @@ def test_runtime_attention_identity_uses_resolved_and_executed_instances():
     assert missing_execution["observed_instance_count"] == 0
 
 
+def test_runtime_attention_identity_ignores_dormant_wan_fallback():
+    class ResolvedBackend:
+        pass
+
+    class ExecutedImpl:
+        _runtime_observed_flash_attention_version = 4
+
+    class DormantImpl:
+        pass
+
+    active = SimpleNamespace(
+        backend=SimpleNamespace(name="FA"),
+        attn_impl=ExecutedImpl(),
+        _resolved_attn_backend_cls=ResolvedBackend,
+    )
+    dormant = SimpleNamespace(
+        backend=SimpleNamespace(name="FA"),
+        attn_impl=DormantImpl(),
+        _resolved_attn_backend_cls=ResolvedBackend,
+    )
+    transformer = SimpleNamespace(
+        named_modules=lambda: [
+            ("blocks.0.attn1", active),
+            ("blocks.0.attn1_fallback", dormant),
+        ]
+    )
+
+    identity = collect_runtime_attention_backend_identity(
+        [transformer], requested_backend="fa"
+    )
+
+    assert identity["runtime_observed"] is True
+    assert identity["expected_instance_count"] == 1
+    assert identity["observed_instance_count"] == 1
+
+
 def test_reference_attention_identity_validation_fails_closed():
     assert (
         validate_reference_attention_backend_identity(
@@ -1073,3 +1136,48 @@ def test_performance_gate_requires_both_orders_without_trajectory(tmp_path):
 
     assert any("below 1.0" in error for error in errors)
     assert "performance unexpectedly captured trajectory latents" in errors
+
+
+def test_performance_gate_requires_one_worker_and_stream_for_every_run(tmp_path):
+    config = _config(
+        tmp_path,
+        scenarios=("generation",),
+        modes=("performance",),
+    )
+    invocation = build_qualification_plan(config)[0]
+    report = _performance_report()
+    assert validate_qualification_report(report, invocation, config) == []
+
+    report["order_results"]["candidate-first"]["reference_generation"][
+        "per_run_worker_execution_topology"
+    ][0] = {
+        "worker_pid": 4321,
+        "cuda_device": "cuda:0",
+        "cuda_stream_handle": 9999,
+    }
+    errors = validate_qualification_report(report, invocation, config)
+    assert any("shared worker/stream evidence" in error for error in errors)
+
+
+def test_performance_reference_request_uses_fa_override_only():
+    base = {"prompt": "A curious raccoon", "seed": 4254}
+    reference = _request_sampling_kwargs(
+        base,
+        variant_name="reference",
+        phase="measure",
+        run_index=0,
+        run_order="candidate-first",
+        attention_backend_override="fa",
+    )
+    candidate = _request_sampling_kwargs(
+        base,
+        variant_name="candidate",
+        phase="measure",
+        run_index=0,
+        run_order="candidate-first",
+    )
+
+    assert reference["attention_backend_override"] == "fa"
+    assert "attention_backend_override" not in candidate
+    assert reference["request_id"] != candidate["request_id"]
+    assert "candidate-first" in reference["request_id"]

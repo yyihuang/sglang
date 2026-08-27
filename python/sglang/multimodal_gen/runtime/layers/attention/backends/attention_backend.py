@@ -33,6 +33,11 @@ class AttentionBackend(ABC):
     def get_impl_cls() -> type["AttentionImpl"]:
         raise NotImplementedError
 
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        """Whether the backend can expose softmax LSE for ring merging."""
+        return False
+
     @staticmethod
     @abstractmethod
     def get_metadata_cls() -> type["AttentionMetadata"]:
@@ -168,3 +173,8 @@ class AttentionImpl(ABC, Generic[T]):
         attn_metadata: T,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+
+def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:
+    """Compatibility hook for request-scoped implementation construction."""
+    return attn_impl

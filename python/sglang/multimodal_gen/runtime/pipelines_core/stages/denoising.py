@@ -44,6 +44,13 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_bac
 from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
     WanHybridEvidenceCollector,
 )
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    LocalAttention,
+    UlyssesAttention,
+    USPAttention,
+    apply_attention_backend_override,
+    prepare_attention_backend_override,
+)
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
@@ -83,6 +90,25 @@ from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
 logger = init_logger(__name__)
 
+REQUEST_SWITCHABLE_ATTENTION_BACKENDS = frozenset(
+    {
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.SAGE_ATTN_3,
+    }
+)
+
+
+def _qualification_requested_attention_backend(
+    batch: Req, server_args: ServerArgs
+) -> str | None:
+    """Return the backend requested by this qualification request."""
+    return (
+        batch.sampling_params.attention_backend_override
+        or server_args.attention_backend
+    )
+
 
 class DenoisingStage(PipelineStage):
     """
@@ -118,6 +144,9 @@ class DenoisingStage(PipelineStage):
             head_size=attn_head_size,
             dtype=torch.float16,
         )
+        self._attn_metadata_head_size = attn_head_size
+        self._attn_backend_default = self.attn_backend
+        self._attention_backend_active_override = None
 
         # cfg
         self.guidance = None
@@ -137,6 +166,102 @@ class DenoisingStage(PipelineStage):
         self._wan_transformer_input_capture = (
             WanTransformerInputCapture.from_environment()
         )
+
+    def _maybe_override_attention_backend(self, batch: Req) -> None:
+        target = self._parse_attention_backend_override(
+            batch.sampling_params.attention_backend_override
+        )
+        if target == self._attention_backend_active_override:
+            return
+        layers = self._request_switchable_attention_layers()
+        stage_backend = self._attn_backend_default
+        if target is not None:
+            stage_backend = self._validate_attention_backend_override(target, layers)
+            for layer in layers:
+                prepare_attention_backend_override(layer, target)
+        for layer in layers:
+            apply_attention_backend_override(layer, target)
+        self.attn_backend = stage_backend
+        self._attention_backend_active_override = target
+
+    def _parse_attention_backend_override(
+        self, name: str | None
+    ) -> AttentionBackendEnum | None:
+        if name is None:
+            return None
+        try:
+            target = AttentionBackendEnum[name.upper()]
+        except KeyError:
+            raise ValueError(
+                f"Unknown attention_backend_override {name!r}. Valid values: "
+                f"{sorted(b.name.lower() for b in REQUEST_SWITCHABLE_ATTENTION_BACKENDS)}."
+            ) from None
+        if target not in REQUEST_SWITCHABLE_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"attention_backend_override {name!r} is not switchable per request. "
+                f"Valid values: "
+                f"{sorted(b.name.lower() for b in REQUEST_SWITCHABLE_ATTENTION_BACKENDS)}."
+            )
+        return target
+
+    def _request_switchable_attention_layers(self) -> list[nn.Module]:
+        return [
+            module
+            for transformer in filter(None, [self.transformer, self.transformer_2])
+            for module in transformer.modules()
+            if isinstance(module, (LocalAttention, UlyssesAttention, USPAttention))
+        ]
+
+    def _validate_attention_backend_override(
+        self, target: AttentionBackendEnum, layers: list[nn.Module]
+    ) -> type:
+        reasons: list[str] = []
+        if getattr(self.server_args, "enable_breakable_cuda_graph", False):
+            reasons.append("breakable CUDA graphs bake the attention kernel in")
+        if getattr(self.server_args, "enable_torch_compile", False):
+            reasons.append("torch.compile traces the attention kernel in")
+        if not layers:
+            reasons.append("this model exposes no switchable attention layers")
+        sparse_defaults = sorted(
+            {
+                layer._default_attn_backend.name.lower()
+                for layer in layers
+                if layer._default_attn_backend.is_sparse
+            }
+        )
+        if sparse_defaults:
+            reasons.append(
+                f"the server-selected sparse backend(s) {sparse_defaults} cannot "
+                "be mixed with per-request dense switching"
+            )
+        stage_backend = None
+        if not reasons:
+            try:
+                stage_backend = get_attn_backend(
+                    head_size=self._attn_metadata_head_size,
+                    dtype=torch.float16,
+                    selected_attention_backend=target,
+                )
+            except ValueError as exc:
+                reasons.append(str(exc))
+        if (
+            stage_backend is not None
+            and (getattr(self.server_args, "ring_degree", 1) or 1) > 1
+            and not stage_backend.supports_ring_rotation()
+        ):
+            reasons.append(
+                f"ring parallelism requires a ring-capable backend; "
+                f"{target.name.lower()} is not"
+            )
+        if reasons:
+            message = (
+                f"Rejecting attention_backend_override={target.name.lower()!r}: "
+                + "; ".join(reasons)
+                + "."
+            )
+            logger.warning(message)
+            raise ValueError(message)
+        return stage_backend
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -503,6 +628,7 @@ class DenoisingStage(PipelineStage):
             A dictionary containing all the prepared variables for the denoising loop.
         """
         assert self.transformer is not None
+        self._maybe_override_attention_backend(batch)
         pipeline = self.pipeline() if self.pipeline else None
         # NOTE: In warmup requests we may override req.num_inference_steps (e.g. set to 1)
         # for latency amortization, but cache-dit needs the *original* total steps to
@@ -1138,9 +1264,25 @@ class DenoisingStage(PipelineStage):
             batch.timings.attention_backend_identity = (
                 collect_runtime_attention_backend_identity(
                     (self.transformer, self.transformer_2),
-                    requested_backend=server_args.attention_backend,
+                    requested_backend=_qualification_requested_attention_backend(
+                        batch, server_args
+                    ),
                 )
             )
+            if batch.request_id.startswith(
+                (
+                    "wan-hybrid-qualification-reference-first-",
+                    "wan-hybrid-qualification-candidate-first-",
+                )
+            ):
+                device = get_local_torch_device()
+                batch.timings.worker_execution_topology = {
+                    "worker_pid": os.getpid(),
+                    "cuda_device": str(device),
+                    "cuda_stream_handle": int(
+                        torch.cuda.current_stream(device).cuda_stream
+                    ),
+                }
         return batch
 
     # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare

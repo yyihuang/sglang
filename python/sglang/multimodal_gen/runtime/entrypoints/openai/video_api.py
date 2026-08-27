@@ -75,6 +75,7 @@ def _build_sampling_params_from_request(
         "output_file_name": request_id,
         "seed": request.seed,
         "generator_device": request.generator_device,
+        "attention_backend_override": request.attention_backend_override,
     }
     if request.num_inference_steps is not None:
         sampling_kwargs["num_inference_steps"] = request.num_inference_steps

@@ -128,6 +128,7 @@ class SamplingParams:
     guidance_rescale: float = 0.0
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
+    attention_backend_override: str | None = None
 
     # TeaCache parameters
     enable_teacache: bool = False

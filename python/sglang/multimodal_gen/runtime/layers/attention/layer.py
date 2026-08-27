@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
+    wrap_attention_impl_forward,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
@@ -32,6 +33,43 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
+
+
+def prepare_attention_backend_override(
+    layer: nn.Module, target: AttentionBackendEnum
+) -> None:
+    """Build and cache an implementation for a request-scoped override."""
+    if target in layer._attn_impl_by_backend:
+        return
+    backend_cls = get_attn_backend(
+        layer.head_size,
+        layer.dtype,
+        supported_attention_backends=layer._supported_attention_backends,
+        selected_attention_backend=target,
+    )
+    resolved = backend_cls.get_enum()
+    if resolved is not target:
+        raise ValueError(
+            f"Attention backend override '{target}' resolved to '{resolved}' on "
+            f"{type(layer).__name__}; refusing the request instead of silently "
+            "falling back."
+        )
+    impl = backend_cls.get_impl_cls()(**layer._attn_impl_ctor_kwargs)
+    wrap_attention_impl_forward(impl)
+    layer._attn_impl_by_backend[target] = impl
+    layer._attn_backend_cls_by_backend[target] = backend_cls
+
+
+def apply_attention_backend_override(
+    layer: nn.Module, target: AttentionBackendEnum | None
+) -> None:
+    """Switch to a prepared implementation; None restores construction default."""
+    target = target or layer._default_attn_backend
+    if target is layer.backend:
+        return
+    layer.attn_impl = layer._attn_impl_by_backend[target]
+    layer._resolved_attn_backend_cls = layer._attn_backend_cls_by_backend[target]
+    layer.backend = target
 
 
 class UlyssesAttention(nn.Module):
@@ -63,7 +101,7 @@ class UlyssesAttention(nn.Module):
         )
         impl_cls = attn_backend.get_impl_cls()
 
-        self.attn_impl = impl_cls(
+        self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -72,11 +110,16 @@ class UlyssesAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         self._resolved_attn_backend_cls = attn_backend
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self._default_attn_backend = self.backend
+        self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._attn_backend_cls_by_backend = {self.backend: attn_backend}
+        self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
 
     @torch.compiler.disable
@@ -254,7 +297,7 @@ class LocalAttention(nn.Module):
             is_cross_attention=is_cross_attention,
         )
         impl_cls = attn_backend.get_impl_cls()
-        self.attn_impl = impl_cls(
+        self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             softmax_scale=self.softmax_scale,
@@ -262,11 +305,16 @@ class LocalAttention(nn.Module):
             causal=causal,
             **extra_impl_args,
         )
+        self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         self._resolved_attn_backend_cls = attn_backend
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self._default_attn_backend = self.backend
+        self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._attn_backend_cls_by_backend = {self.backend: attn_backend}
+        self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
 
     def forward(
@@ -340,7 +388,7 @@ class USPAttention(nn.Module):
             is_cross_attention=is_cross_attention,
         )
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
-        self.attn_impl = impl_cls(
+        self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -349,11 +397,16 @@ class USPAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         self._resolved_attn_backend_cls = attn_backend
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self._default_attn_backend = self.backend
+        self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._attn_backend_cls_by_backend = {self.backend: attn_backend}
+        self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate

@@ -36,6 +36,7 @@ class RequestTimings:
         self.wan_hybrid_hit_count: int = 0
         self.wan_hybrid_coverage: dict[str, Any] | None = None
         self.attention_backend_identity: dict[str, Any] | None = None
+        self.worker_execution_topology: dict[str, Any] | None = None
 
     @property
     def total_duration_s(self) -> float:
@@ -52,7 +53,7 @@ class RequestTimings:
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the timing data to a dictionary."""
-        return {
+        result = {
             "request_id": self.request_id,
             "stages": self.stages,
             "steps": self.steps,
@@ -61,6 +62,12 @@ class RequestTimings:
             "wan_hybrid_coverage": self.wan_hybrid_coverage,
             "attention_backend_identity": self.attention_backend_identity,
         }
+        if self.worker_execution_topology is not None:
+            result["worker_execution_topology"] = self.worker_execution_topology
+        return result
+
+
+RequestMetrics = RequestTimings
 
 
 def get_diffusion_perf_log_dir() -> str:

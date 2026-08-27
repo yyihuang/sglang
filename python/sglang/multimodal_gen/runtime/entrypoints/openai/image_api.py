@@ -62,6 +62,7 @@ def _build_sampling_params_from_request(
     true_cfg_scale: Optional[float] = None,
     negative_prompt: Optional[str] = None,
     enable_teacache: Optional[bool] = None,
+    attention_backend_override: Optional[str] = None,
     num_frames: int = 1,
 ) -> SamplingParams:
     if size is None:
@@ -87,6 +88,7 @@ def _build_sampling_params_from_request(
         generator_device=generator_device,
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
+        attention_backend_override=attention_backend_override,
         **({"guidance_scale": guidance_scale} if guidance_scale is not None else {}),
         **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
         **({"true_cfg_scale": true_cfg_scale} if true_cfg_scale is not None else {}),
@@ -122,6 +124,7 @@ async def generations(
         true_cfg_scale=request.true_cfg_scale,
         negative_prompt=request.negative_prompt,
         enable_teacache=request.enable_teacache,
+        attention_backend_override=request.attention_backend_override,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),

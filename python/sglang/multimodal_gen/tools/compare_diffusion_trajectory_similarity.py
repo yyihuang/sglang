@@ -1247,6 +1247,16 @@ def _extract_attention_backend_identity(result: Any) -> dict[str, Any] | None:
     return identity
 
 
+def _extract_worker_execution_topology(result: Any) -> dict[str, Any] | None:
+    metrics = getattr(result, "metrics", None)
+    if not isinstance(metrics, dict):
+        return None
+    topology = metrics.get("worker_execution_topology")
+    if not isinstance(topology, dict):
+        return None
+    return topology
+
+
 def validate_reference_attention_backend_identity(identity: Any) -> list[str]:
     """Validate identity emitted by actually executed FA backend instances."""
 
@@ -1346,58 +1356,17 @@ def _positive_ratio(numerator: float | None, denominator: float | None) -> float
     return numerator / denominator
 
 
-def run_variant(
+def _summarize_variant_results(
     *,
     variant_name: str,
-    server_kwargs: dict[str, Any],
-    sampling_kwargs: dict[str, Any],
     fp4_gemm_backend: str | None,
     warmup_runs: int,
     measure_runs: int,
-):
-    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-        DiffGenerator,
-    )
-
-    if warmup_runs < 0:
-        raise ValueError("warmup_runs must be >= 0.")
-    if measure_runs <= 0:
-        raise ValueError("measure_runs must be >= 1.")
-
-    with override_diffusion_fp4_backend(fp4_gemm_backend):
-        with DiffGenerator.from_pretrained(
-            local_mode=True, **server_kwargs
-        ) as generator:
-            for run_index in range(warmup_runs):
-                _normalize_single_result(
-                    generator.generate(
-                        sampling_params_kwargs=_request_sampling_kwargs(
-                            sampling_kwargs,
-                            variant_name=variant_name,
-                            phase="warmup",
-                            run_index=run_index,
-                        )
-                    )
-                )
-
-            measured_results = []
-            generation_times = []
-            for run_index in range(measure_runs):
-                start_time = time.perf_counter()
-                measured_results.append(
-                    _normalize_single_result(
-                        generator.generate(
-                            sampling_params_kwargs=_request_sampling_kwargs(
-                                sampling_kwargs,
-                                variant_name=variant_name,
-                                phase="measure",
-                                run_index=run_index,
-                            )
-                        )
-                    )
-                )
-                generation_times.append(time.perf_counter() - start_time)
-
+    measured_results: Sequence[Any],
+    generation_times: Sequence[float],
+    effective_attention_backend: str | None,
+    include_worker_execution_topology: bool,
+) -> dict[str, Any]:
     final_result = measured_results[-1]
     peak_memories = [float(result.peak_memory_mb) for result in measured_results]
     total_duration_ms = [
@@ -1418,7 +1387,11 @@ def run_variant(
         _extract_attention_backend_identity(result) for result in measured_results
     ]
     attention_backend_identity = None
-    if variant_name == "reference" and server_kwargs.get("attention_backend") == "fa":
+    if (
+        variant_name == "reference"
+        and effective_attention_backend is not None
+        and effective_attention_backend.lower() == "fa"
+    ):
         attention_backend_identity = _collapse_reference_attention_backend_identities(
             attention_backend_identities,
             location="reference measured runs",
@@ -1432,7 +1405,7 @@ def run_variant(
     ]
     output_summaries = [summarize_result_output(result) for result in measured_results]
 
-    return {
+    summary = {
         "result": final_result,
         "_measured_results": measured_results,
         "fp4_gemm_backend": fp4_gemm_backend or "default",
@@ -1468,6 +1441,220 @@ def run_variant(
         "per_run_output_summaries": output_summaries,
         "attention_backend_identity": attention_backend_identity,
     }
+    if include_worker_execution_topology:
+        summary["per_run_worker_execution_topology"] = [
+            _extract_worker_execution_topology(result) for result in measured_results
+        ]
+    return summary
+
+
+def _run_variant_with_generator(
+    generator: Any,
+    *,
+    variant_name: str,
+    sampling_kwargs: dict[str, Any],
+    fp4_gemm_backend: str | None,
+    warmup_runs: int,
+    measure_runs: int,
+    effective_attention_backend: str | None,
+    attention_backend_override: str | None = None,
+    run_order: str | None = None,
+    include_worker_execution_topology: bool = False,
+) -> dict[str, Any]:
+    if warmup_runs < 0:
+        raise ValueError("warmup_runs must be >= 0.")
+    if measure_runs <= 0:
+        raise ValueError("measure_runs must be >= 1.")
+
+    for run_index in range(warmup_runs):
+        _normalize_single_result(
+            generator.generate(
+                sampling_params_kwargs=_request_sampling_kwargs(
+                    sampling_kwargs,
+                    variant_name=variant_name,
+                    phase="warmup",
+                    run_index=run_index,
+                    run_order=run_order,
+                    attention_backend_override=attention_backend_override,
+                )
+            )
+        )
+
+    measured_results = []
+    generation_times = []
+    for run_index in range(measure_runs):
+        start_time = time.perf_counter()
+        measured_results.append(
+            _normalize_single_result(
+                generator.generate(
+                    sampling_params_kwargs=_request_sampling_kwargs(
+                        sampling_kwargs,
+                        variant_name=variant_name,
+                        phase="measure",
+                        run_index=run_index,
+                        run_order=run_order,
+                        attention_backend_override=attention_backend_override,
+                    )
+                )
+            )
+        )
+        generation_times.append(time.perf_counter() - start_time)
+    return _summarize_variant_results(
+        variant_name=variant_name,
+        fp4_gemm_backend=fp4_gemm_backend,
+        warmup_runs=warmup_runs,
+        measure_runs=measure_runs,
+        measured_results=measured_results,
+        generation_times=generation_times,
+        effective_attention_backend=effective_attention_backend,
+        include_worker_execution_topology=include_worker_execution_topology,
+    )
+
+
+def run_variant(
+    *,
+    variant_name: str,
+    server_kwargs: dict[str, Any],
+    sampling_kwargs: dict[str, Any],
+    fp4_gemm_backend: str | None,
+    warmup_runs: int,
+    measure_runs: int,
+):
+    # Preserve the isolated correctness path's fail-fast validation before any
+    # worker process is constructed.
+    if warmup_runs < 0:
+        raise ValueError("warmup_runs must be >= 0.")
+    if measure_runs <= 0:
+        raise ValueError("measure_runs must be >= 1.")
+
+    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+        DiffGenerator,
+    )
+
+    with override_diffusion_fp4_backend(fp4_gemm_backend):
+        with DiffGenerator.from_pretrained(
+            local_mode=True, **server_kwargs
+        ) as generator:
+            return _run_variant_with_generator(
+                generator,
+                variant_name=variant_name,
+                sampling_kwargs=sampling_kwargs,
+                fp4_gemm_backend=fp4_gemm_backend,
+                warmup_runs=warmup_runs,
+                measure_runs=measure_runs,
+                effective_attention_backend=server_kwargs.get("attention_backend"),
+            )
+
+
+def run_shared_performance_orders(
+    *,
+    candidate_server_kwargs: dict[str, Any],
+    reference_sampling_kwargs: dict[str, Any],
+    candidate_sampling_kwargs: dict[str, Any],
+    reference_fp4_gemm_backend: str | None,
+    candidate_fp4_gemm_backend: str | None,
+    warmup_runs: int,
+    measure_runs: int,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Run both AB/BA orders in one candidate-configured scheduler worker."""
+
+    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+        DiffGenerator,
+    )
+
+    if candidate_server_kwargs.get("attention_backend") != "wan_hybrid":
+        raise ValueError(
+            "shared performance requires a candidate-configured wan_hybrid server"
+        )
+    if reference_fp4_gemm_backend != candidate_fp4_gemm_backend:
+        raise ValueError(
+            "shared performance requires one identical FP4 GEMM backend"
+        )
+
+    variant_calls = {
+        "reference": {
+            "variant_name": "reference",
+            "sampling_kwargs": reference_sampling_kwargs,
+            "effective_attention_backend": "fa",
+            "attention_backend_override": "fa",
+        },
+        "candidate": {
+            "variant_name": "candidate",
+            "sampling_kwargs": candidate_sampling_kwargs,
+            "effective_attention_backend": "wan_hybrid",
+            "attention_backend_override": None,
+        },
+    }
+    order_runs = {}
+    with override_diffusion_fp4_backend(candidate_fp4_gemm_backend):
+        with DiffGenerator.from_pretrained(
+            local_mode=True, **candidate_server_kwargs
+        ) as generator:
+            for run_order in QUALIFICATION_RUN_ORDERS:
+                execution_order = (
+                    ("reference", "candidate")
+                    if run_order == "reference-first"
+                    else ("candidate", "reference")
+                )
+                runs = {}
+                for variant in execution_order:
+                    runs[variant] = _run_variant_with_generator(
+                        generator,
+                        **variant_calls[variant],
+                        fp4_gemm_backend=candidate_fp4_gemm_backend,
+                        warmup_runs=warmup_runs,
+                        measure_runs=measure_runs,
+                        run_order=run_order,
+                        include_worker_execution_topology=True,
+                    )
+                order_runs[run_order] = runs
+    return order_runs
+
+
+def _collapse_shared_worker_execution_topology(
+    order_runs: dict[str, dict[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    for run_order in QUALIFICATION_RUN_ORDERS:
+        for variant in ("reference", "candidate"):
+            run = order_runs.get(run_order, {}).get(variant, {})
+            observations = run.get("per_run_worker_execution_topology")
+            if (
+                not isinstance(observations, list)
+                or len(observations) != run.get("measure_runs")
+            ):
+                raise RuntimeError(
+                    f"{run_order}.{variant}: shared performance worker topology "
+                    "is incomplete"
+                )
+    observations = [
+        topology
+        for run_order in QUALIFICATION_RUN_ORDERS
+        for variant in ("reference", "candidate")
+        for topology in order_runs[run_order][variant].get(
+            "per_run_worker_execution_topology", []
+        )
+    ]
+    if not observations or any(not isinstance(value, dict) for value in observations):
+        raise RuntimeError("shared performance worker topology is missing")
+    first = observations[0]
+    if any(value != first for value in observations[1:]):
+        raise RuntimeError(
+            "reference and candidate did not use one GPU worker process and stream"
+        )
+    worker_pid = first.get("worker_pid")
+    cuda_device = first.get("cuda_device")
+    cuda_stream_handle = first.get("cuda_stream_handle")
+    if (
+        isinstance(worker_pid, bool)
+        or not isinstance(worker_pid, int)
+        or worker_pid <= 0
+        or not isinstance(cuda_device, str)
+        or not cuda_device.startswith("cuda")
+        or isinstance(cuda_stream_handle, bool)
+        or not isinstance(cuda_stream_handle, int)
+    ):
+        raise RuntimeError("shared performance worker topology is invalid")
+    return dict(first)
 
 
 def _request_sampling_kwargs(
@@ -1476,10 +1663,17 @@ def _request_sampling_kwargs(
     variant_name: str,
     phase: str,
     run_index: int,
+    run_order: str | None = None,
+    attention_backend_override: str | None = None,
 ) -> dict[str, Any]:
-    return sampling_kwargs | {
-        "request_id": f"wan-hybrid-qualification-{variant_name}-{phase}-{run_index}"
-    }
+    request_parts = ["wan-hybrid-qualification"]
+    if run_order is not None:
+        request_parts.append(run_order)
+    request_parts.extend((variant_name, phase, str(run_index)))
+    request = sampling_kwargs | {"request_id": "-".join(request_parts)}
+    if attention_backend_override is not None:
+        request["attention_backend_override"] = attention_backend_override
+    return request
 
 
 def _to_jsonable(result: dict[str, Any]) -> dict[str, Any]:
@@ -1793,22 +1987,20 @@ def main() -> None:
         candidate_server_kwargs=cand_server_kwargs,
         sampling_kwargs=result["sampling_kwargs"],
     )
-    result["execution_topology"] = {
-        "controller_pid": os.getpid(),
-        "controller_process_reused": True,
-        "variant_worker_process_sets": (
-            4 if args.comparison_mode == "performance" else 2
-        ),
-        "variant_worker_process_reused": False,
-        "variant_worker_lifecycle": (
-            "fresh local DiffGenerator scheduler process set per variant and run order"
-        ),
-        "same_gpu_worker_process": False,
-        "same_cuda_stream_proven": False,
-        "port_isolation": result["provenance"]["port_isolation"],
-    }
-
     if args.comparison_mode == "correctness":
+        result["execution_topology"] = {
+            "controller_pid": os.getpid(),
+            "controller_process_reused": True,
+            "variant_worker_process_sets": 2,
+            "variant_worker_process_reused": False,
+            "variant_worker_lifecycle": (
+                "fresh local DiffGenerator scheduler process set per variant and "
+                "run order"
+            ),
+            "same_gpu_worker_process": False,
+            "same_cuda_stream_proven": False,
+            "port_isolation": result["provenance"]["port_isolation"],
+        }
         reference_run, candidate_run = run_one_order(args.run_order)
         result.update(order_summary(reference_run, candidate_run))
         result["reference_attention_backend_identity"] = reference_run[
@@ -1838,10 +2030,40 @@ def main() -> None:
             result["candidate_generation"]["per_run_wan_hybrid_expected_hit_count"],
         )
     else:
+        shared_order_runs = run_shared_performance_orders(
+            candidate_server_kwargs=cand_server_kwargs,
+            reference_sampling_kwargs=ref_sampling_kwargs,
+            candidate_sampling_kwargs=cand_sampling_kwargs,
+            reference_fp4_gemm_backend=args.reference_fp4_gemm_backend,
+            candidate_fp4_gemm_backend=args.candidate_fp4_gemm_backend,
+            warmup_runs=args.warmup_runs,
+            measure_runs=args.measure_runs,
+        )
+        worker_topology = _collapse_shared_worker_execution_topology(
+            shared_order_runs
+        )
+        result["execution_topology"] = {
+            "controller_pid": os.getpid(),
+            "controller_process_reused": True,
+            "variant_worker_process_sets": 1,
+            "variant_worker_process_reused": True,
+            "variant_worker_lifecycle": (
+                "one long-lived candidate-configured DiffGenerator scheduler worker "
+                "reused for both variants and run orders"
+            ),
+            "same_gpu_worker_process": True,
+            "same_cuda_stream_proven": True,
+            "shared_model_instance": True,
+            "reference_attention_backend_override": "fa",
+            "candidate_attention_backend_override": None,
+            "worker_execution_topology": worker_topology,
+            "port_isolation": result["provenance"]["port_isolation"],
+        }
         order_results = {}
         reference_attention_backend_identities = []
         for run_order in QUALIFICATION_RUN_ORDERS:
-            reference_run, candidate_run = run_one_order(run_order)
+            reference_run = shared_order_runs[run_order]["reference"]
+            candidate_run = shared_order_runs[run_order]["candidate"]
             order_results[run_order] = order_summary(reference_run, candidate_run)
             reference_attention_backend_identities.append(
                 reference_run["attention_backend_identity"]

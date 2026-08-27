@@ -32,7 +32,19 @@ def collect_runtime_attention_backend_identity(
     for transformer in transformers:
         if transformer is None:
             continue
-        for module in transformer.modules():
+        named_modules = getattr(transformer, "named_modules", None)
+        modules = (
+            named_modules()
+            if callable(named_modules)
+            else (("", module) for module in transformer.modules())
+        )
+        for module_name, module in modules:
+            # A candidate-configured Wan model retains a dormant FA fallback
+            # beside each self-attention layer. A reference request switches the
+            # active layer itself to FA, so the fallback is intentionally not
+            # executed and must not count as an expected runtime observation.
+            if module_name.endswith("attn1_fallback"):
+                continue
             backend = getattr(module, "backend", None)
             if getattr(backend, "name", None) != "FA":
                 continue

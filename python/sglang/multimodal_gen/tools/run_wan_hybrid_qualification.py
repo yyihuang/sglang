@@ -895,7 +895,6 @@ def _validate_execution_topology(
     topology = report.get("execution_topology")
     if not isinstance(topology, dict):
         return ["missing execution topology"]
-    expected_process_sets = 4 if invocation.comparison_mode == "performance" else 2
     expected_ports = {
         "master_port": _invocation_integer_option(invocation, "--master-port"),
         "reference_scheduler_port": _invocation_integer_option(
@@ -915,20 +914,83 @@ def _validate_execution_topology(
         or topology["controller_pid"] <= 0
     ):
         errors.append("execution topology has no controller process identity")
-    expected_scalars = {
-        "controller_process_reused": True,
-        "variant_worker_process_sets": expected_process_sets,
-        "variant_worker_process_reused": False,
-        "same_gpu_worker_process": False,
-        "same_cuda_stream_proven": False,
-        "port_isolation": expected_ports,
-    }
-    if any(topology.get(name) != value for name, value in expected_scalars.items()):
-        errors.append("execution topology does not match isolated worker semantics")
-    if topology.get("variant_worker_lifecycle") != (
-        "fresh local DiffGenerator scheduler process set per variant and run order"
-    ):
-        errors.append("execution topology does not describe the worker lifecycle")
+    if invocation.comparison_mode == "performance":
+        expected_scalars = {
+            "controller_process_reused": True,
+            "variant_worker_process_sets": 1,
+            "variant_worker_process_reused": True,
+            "same_gpu_worker_process": True,
+            "same_cuda_stream_proven": True,
+            "shared_model_instance": True,
+            "reference_attention_backend_override": "fa",
+            "candidate_attention_backend_override": None,
+            "port_isolation": expected_ports,
+        }
+        if any(
+            topology.get(name) != value for name, value in expected_scalars.items()
+        ):
+            errors.append(
+                "execution topology does not match shared performance worker semantics"
+            )
+        if topology.get("variant_worker_lifecycle") != (
+            "one long-lived candidate-configured DiffGenerator scheduler worker "
+            "reused for both variants and run orders"
+        ):
+            errors.append("execution topology does not describe the worker lifecycle")
+        worker_topology = topology.get("worker_execution_topology")
+        if (
+            not isinstance(worker_topology, dict)
+            or isinstance(worker_topology.get("worker_pid"), bool)
+            or not isinstance(worker_topology.get("worker_pid"), int)
+            or worker_topology["worker_pid"] <= 0
+            or not isinstance(worker_topology.get("cuda_device"), str)
+            or not worker_topology["cuda_device"].startswith("cuda")
+            or isinstance(worker_topology.get("cuda_stream_handle"), bool)
+            or not isinstance(worker_topology.get("cuda_stream_handle"), int)
+        ):
+            errors.append("shared performance worker identity is missing")
+        order_results = report.get("order_results")
+        if isinstance(worker_topology, dict) and isinstance(order_results, dict):
+            expected_measure_runs = _invocation_integer_option(
+                invocation, "--measure-runs"
+            )
+            for run_order in QUALIFICATION_RUN_ORDERS:
+                order_result = order_results.get(run_order)
+                for variant in ("reference", "candidate"):
+                    generation = (
+                        order_result.get(f"{variant}_generation")
+                        if isinstance(order_result, dict)
+                        else None
+                    )
+                    observed = (
+                        generation.get("per_run_worker_execution_topology")
+                        if isinstance(generation, dict)
+                        else None
+                    )
+                    if observed != [worker_topology] * (expected_measure_runs or 0):
+                        errors.append(
+                            f"{run_order}.{variant}: shared worker/stream evidence "
+                            "is incomplete"
+                        )
+        elif not isinstance(order_results, dict):
+            errors.append("shared performance order results are missing")
+    else:
+        expected_scalars = {
+            "controller_process_reused": True,
+            "variant_worker_process_sets": 2,
+            "variant_worker_process_reused": False,
+            "same_gpu_worker_process": False,
+            "same_cuda_stream_proven": False,
+            "port_isolation": expected_ports,
+        }
+        if any(
+            topology.get(name) != value for name, value in expected_scalars.items()
+        ):
+            errors.append("execution topology does not match isolated worker semantics")
+        if topology.get("variant_worker_lifecycle") != (
+            "fresh local DiffGenerator scheduler process set per variant and run order"
+        ):
+            errors.append("execution topology does not describe the worker lifecycle")
     ports = [expected_ports[name] for name in expected_ports if name.endswith("port")]
     if any(port is None for port in ports) or len(set(ports)) != 4:
         errors.append("invocation does not use four distinct explicit ports")
