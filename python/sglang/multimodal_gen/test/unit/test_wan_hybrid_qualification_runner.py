@@ -25,6 +25,7 @@ from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import 
 )
 from sglang.multimodal_gen.tools.run_wan_hybrid_qualification import (
     WAN_HYBRID_DEFAULT_LAYER_INDICES,
+    WAN_HYBRID_SINGLE_BLOCK_LAYER_INDICES,
     WanQualificationConfig,
     _parse_args,
     build_qualification_plan,
@@ -98,8 +99,14 @@ def _coverage(
                 fallback = [index for index in expected_layers if index not in eligible]
                 control = []
             elif scenario == "single-block":
-                eligible = [0]
-                fallback = expected_layers[1:]
+                eligible = (
+                    list(WAN_HYBRID_SINGLE_BLOCK_LAYER_INDICES)
+                    if actual_timestep <= WAN_HYBRID_PROMOTION_MAX_TIMESTEP
+                    else []
+                )
+                fallback = [
+                    index for index in expected_layers if index not in eligible
+                ]
                 control = []
             else:
                 eligible = []
@@ -676,7 +683,17 @@ def test_plan_uses_generation_invocations_and_direct_full_transformer_evidence(
     assert all("--reference-attention-backend" in item.command for item in plan)
 
     single_block = next(item for item in plan if item.scenario == "single-block")
-    assert '{"wan_hybrid_layer_indices":[0]}' in single_block.command
+    assert (
+        json.dumps(
+            {
+                "wan_hybrid_layer_indices": WAN_HYBRID_SINGLE_BLOCK_LAYER_INDICES,
+                "wan_hybrid_max_timestep": WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        in single_block.command
+    )
     assert not any(item.scenario == "full-transformer" for item in plan)
     generation = next(item for item in plan if item.scenario == "generation")
     assert (

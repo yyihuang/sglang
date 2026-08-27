@@ -37,6 +37,7 @@ QUALIFICATION_SCENARIOS = ("single-block", "full-transformer", "generation")
 QUALIFICATION_MODES = ("correctness", "performance")
 WAN_TRANSFORMER_COMPONENTS = ("transformer", "transformer_2")
 WAN_HYBRID_DEFAULT_LAYER_INDICES = [39]
+WAN_HYBRID_SINGLE_BLOCK_LAYER_INDICES = [WAN_HYBRID_PROMOTION_LAYER_INDICES[0]]
 FORBIDDEN_VARIANT_MODEL_OVERRIDE_OPTIONS = frozenset(
     {
         "--reference-transformer-path",
@@ -158,7 +159,14 @@ def _scenario_candidate_args(scenario: str) -> tuple[str, ...]:
             "--candidate-attention-backend",
             "wan_hybrid",
             "--candidate-attention-backend-config",
-            '{"wan_hybrid_layer_indices":[0]}',
+            json.dumps(
+                {
+                    "wan_hybrid_layer_indices": WAN_HYBRID_SINGLE_BLOCK_LAYER_INDICES,
+                    "wan_hybrid_max_timestep": WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         )
     if scenario == "full-transformer":
         raise ValueError(
@@ -678,8 +686,17 @@ def _validate_wan_hybrid_coverage(
                 ]
                 expected_control = []
             elif scenario == "single-block":
-                expected_eligible = [0]
-                expected_fallback = expected_layers[1:]
+                if (
+                    isinstance(actual_timestep, int)
+                    and not isinstance(actual_timestep, bool)
+                    and actual_timestep <= WAN_HYBRID_PROMOTION_MAX_TIMESTEP
+                ):
+                    expected_eligible = list(WAN_HYBRID_SINGLE_BLOCK_LAYER_INDICES)
+                else:
+                    expected_eligible = []
+                expected_fallback = [
+                    index for index in expected_layers if index not in expected_eligible
+                ]
                 expected_control = []
             else:
                 expected_eligible = []
@@ -989,10 +1006,17 @@ def validate_qualification_report(
                 or "component_paths" in variant_server
             ):
                 errors.append(f"{variant} model override is forbidden")
-        if invocation.scenario == "generation" and isinstance(candidate_server, dict):
+        if invocation.scenario in ("single-block", "generation") and isinstance(
+            candidate_server, dict
+        ):
+            expected_layers = (
+                WAN_HYBRID_SINGLE_BLOCK_LAYER_INDICES
+                if invocation.scenario == "single-block"
+                else WAN_HYBRID_PROMOTION_LAYER_INDICES
+            )
             expected_config = json.dumps(
                 {
-                    "wan_hybrid_layer_indices": WAN_HYBRID_PROMOTION_LAYER_INDICES,
+                    "wan_hybrid_layer_indices": expected_layers,
                     "wan_hybrid_max_timestep": WAN_HYBRID_PROMOTION_MAX_TIMESTEP,
                 },
                 sort_keys=True,
@@ -1000,7 +1024,8 @@ def validate_qualification_report(
             )
             if candidate_server.get("attention_backend_config") != expected_config:
                 errors.append(
-                    "generation candidate is not locked to the promotion route at t521"
+                    f"{invocation.scenario} candidate is not locked to the "
+                    "promotion route at t521"
                 )
 
     sampling_kwargs = report.get("sampling_kwargs")
