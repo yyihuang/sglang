@@ -8,6 +8,7 @@ Denoising stage for diffusion pipelines.
 import gc
 import inspect
 import math
+import os
 import time
 import weakref
 from collections.abc import Callable
@@ -272,6 +273,17 @@ REQUEST_SWITCHABLE_ATTENTION_BACKENDS = frozenset(
         AttentionBackendEnum.SAGE_ATTN_3,
     }
 )
+
+
+def _qualification_requested_attention_backend(
+    batch: Req, server_args: ServerArgs
+) -> str | None:
+    """Return the backend requested by this qualification request."""
+
+    return (
+        batch.sampling_params.attention_backend_override
+        or server_args.attention_backend
+    )
 
 
 class DualTransformerExecutionMode(str, Enum):
@@ -1925,9 +1937,25 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             result.metrics.attention_backend_identity = (
                 collect_runtime_attention_backend_identity(
                     (self.transformer, self.transformer_2),
-                    requested_backend=server_args.attention_backend,
+                    requested_backend=_qualification_requested_attention_backend(
+                        batch, server_args
+                    ),
                 )
             )
+            if batch.request_id.startswith(
+                (
+                    "wan-hybrid-qualification-reference-first-",
+                    "wan-hybrid-qualification-candidate-first-",
+                )
+            ):
+                device = get_local_torch_device()
+                result.metrics.worker_execution_topology = {
+                    "worker_pid": os.getpid(),
+                    "cuda_device": str(device),
+                    "cuda_stream_handle": int(
+                        torch.cuda.current_stream(device).cuda_stream
+                    ),
+                }
         return result
 
     @torch.no_grad()

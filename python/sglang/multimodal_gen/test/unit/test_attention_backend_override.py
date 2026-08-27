@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
+    _qualification_requested_attention_backend,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
@@ -31,10 +32,13 @@ def _fake_backend_cls(enum, *, ring_capable=True):
 
 
 def _fake_layer(default=AttentionBackendEnum.FA) -> SimpleNamespace:
+    default_backend_cls = _fake_backend_cls(default)
     return SimpleNamespace(
         backend=default,
         _default_attn_backend=default,
         _attn_impl_by_backend={default: f"{default.name.lower()}_impl"},
+        _attn_backend_cls_by_backend={default: default_backend_cls},
+        _resolved_attn_backend_cls=default_backend_cls,
         _supported_attention_backends=None,
         _attn_impl_ctor_kwargs={"num_heads": 2},
         attn_impl=f"{default.name.lower()}_impl",
@@ -95,6 +99,17 @@ class TestMaybeOverrideAttentionBackend(unittest.TestCase):
         self.assertEqual(self.prepare_calls, [])
         self.assertEqual(self.apply_calls, [])
         self.assertIs(self.stage.attn_backend, self.default_backend_cls)
+
+    def test_qualification_identity_uses_effective_request_backend(self):
+        server_args = SimpleNamespace(attention_backend="wan_hybrid")
+        self.assertEqual(
+            _qualification_requested_attention_backend(_batch("fa"), server_args),
+            "fa",
+        )
+        self.assertEqual(
+            _qualification_requested_attention_backend(_batch(None), server_args),
+            "wan_hybrid",
+        )
 
     def test_override_switches_all_layers_then_fast_paths(self):
         self.stage._maybe_override_attention_backend(_batch("sage_attn"))
@@ -195,6 +210,10 @@ class TestLayerPrepareApply(unittest.TestCase):
             layer._attn_impl_by_backend[AttentionBackendEnum.SAGE_ATTN],
             "sage_attn_impl",
         )
+        self.assertIs(
+            layer._attn_backend_cls_by_backend[AttentionBackendEnum.SAGE_ATTN],
+            backend_cls,
+        )
         # prepare must not mutate the active impl
         self.assertEqual(layer.attn_impl, "fa_impl")
         self.assertIs(layer.backend, AttentionBackendEnum.FA)
@@ -211,17 +230,26 @@ class TestLayerPrepareApply(unittest.TestCase):
 
     def test_apply_flips_and_restores(self):
         layer = _fake_layer()
+        sage_backend_cls = _fake_backend_cls(AttentionBackendEnum.SAGE_ATTN)
         layer._attn_impl_by_backend[AttentionBackendEnum.SAGE_ATTN] = "sage_attn_impl"
+        layer._attn_backend_cls_by_backend[AttentionBackendEnum.SAGE_ATTN] = (
+            sage_backend_cls
+        )
 
         layer_module.apply_attention_backend_override(
             layer, AttentionBackendEnum.SAGE_ATTN
         )
         self.assertEqual(layer.attn_impl, "sage_attn_impl")
         self.assertIs(layer.backend, AttentionBackendEnum.SAGE_ATTN)
+        self.assertIs(layer._resolved_attn_backend_cls, sage_backend_cls)
 
         layer_module.apply_attention_backend_override(layer, None)
         self.assertEqual(layer.attn_impl, "fa_impl")
         self.assertIs(layer.backend, AttentionBackendEnum.FA)
+        self.assertIs(
+            layer._resolved_attn_backend_cls,
+            layer._attn_backend_cls_by_backend[AttentionBackendEnum.FA],
+        )
 
 
 if __name__ == "__main__":

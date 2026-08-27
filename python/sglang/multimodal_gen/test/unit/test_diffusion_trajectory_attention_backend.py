@@ -330,6 +330,19 @@ def test_request_metrics_transports_wan_hybrid_hit_count():
     assert metrics.to_dict()["wan_hybrid_coverage"] == {"expected_hit_count": 11}
 
 
+def test_request_metrics_conditionally_transports_worker_execution_topology():
+    metrics = RequestMetrics("request")
+
+    assert "worker_execution_topology" not in metrics.to_dict()
+    topology = {
+        "worker_pid": 4321,
+        "cuda_device": "cuda:0",
+        "cuda_stream_handle": 5678,
+    }
+    metrics.worker_execution_topology = topology
+    assert metrics.to_dict()["worker_execution_topology"] == topology
+
+
 def test_extract_wan_hybrid_coverage_requires_object_metric():
     coverage = {"schema_version": 1, "expected_hit_count": 2}
     result = SimpleNamespace(metrics={"wan_hybrid_coverage": coverage})

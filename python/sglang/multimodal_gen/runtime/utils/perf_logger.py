@@ -56,6 +56,7 @@ class RequestMetrics:
         self.wan_hybrid_hit_count: int = 0
         self.wan_hybrid_coverage: dict[str, Any] | None = None
         self.attention_backend_identity: dict[str, Any] | None = None
+        self.worker_execution_topology: dict[str, Any] | None = None
         self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
@@ -83,7 +84,7 @@ class RequestMetrics:
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the metrics data to a dictionary."""
-        return {
+        result = {
             "request_id": self.request_id,
             "stages": self.stages,
             "steps": self.steps,
@@ -96,6 +97,9 @@ class RequestMetrics:
                 for name, snapshot in self.memory_snapshots.items()
             },
         }
+        if self.worker_execution_topology is not None:
+            result["worker_execution_topology"] = self.worker_execution_topology
+        return result
 
 
 def get_diffusion_perf_log_dir() -> str:

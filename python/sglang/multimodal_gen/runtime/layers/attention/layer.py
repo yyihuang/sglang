@@ -306,6 +306,7 @@ def prepare_attention_backend_override(
     impl = backend_cls.get_impl_cls()(**layer._attn_impl_ctor_kwargs)
     wrap_attention_impl_forward(impl)
     layer._attn_impl_by_backend[target] = impl
+    layer._attn_backend_cls_by_backend[target] = backend_cls
 
 
 def apply_attention_backend_override(
@@ -316,6 +317,7 @@ def apply_attention_backend_override(
     if target is layer.backend:
         return
     layer.attn_impl = layer._attn_impl_by_backend[target]
+    layer._resolved_attn_backend_cls = layer._attn_backend_cls_by_backend[target]
     layer.backend = target
 
 
@@ -374,6 +376,7 @@ class UlyssesAttention(nn.Module):
         self.backend = attn_backend.get_enum()
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._attn_backend_cls_by_backend = {self.backend: attn_backend}
         self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
         self.causal = causal
@@ -639,6 +642,7 @@ class LocalAttention(nn.Module):
         self.backend = attn_backend.get_enum()
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._attn_backend_cls_by_backend = {self.backend: attn_backend}
         self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
 
@@ -805,6 +809,7 @@ class USPAttention(nn.Module):
         self.backend = attn_backend.get_enum()
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._attn_backend_cls_by_backend = {self.backend: attn_backend}
         self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
         self.causal = causal
