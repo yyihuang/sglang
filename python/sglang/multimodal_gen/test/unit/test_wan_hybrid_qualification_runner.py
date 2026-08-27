@@ -954,11 +954,11 @@ def test_generation_promotion_rejects_route_port_and_topology_tampering(tmp_path
     report["candidate_generation"]["per_run_wan_hybrid_hit_count"][0] = 5
     errors = validate_qualification_report(report, invocation, config)
 
-    assert "generation candidate is not locked to tail5 at t521" in errors
+    assert "generation candidate is not locked to the promotion route at t521" in errors
     assert "reference model override is forbidden" in errors
     assert "execution topology does not match isolated worker semantics" in errors
     assert "port provenance does not match the invocation" in errors
-    assert any("requires exactly 10 candidate hits" in error for error in errors)
+    assert any("requires exactly 6 candidate hits" in error for error in errors)
 
 
 def test_report_provenance_binds_revision_model_and_sampling(tmp_path):

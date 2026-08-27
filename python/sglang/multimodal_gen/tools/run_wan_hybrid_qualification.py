@@ -999,7 +999,9 @@ def validate_qualification_report(
                 separators=(",", ":"),
             )
             if candidate_server.get("attention_backend_config") != expected_config:
-                errors.append("generation candidate is not locked to tail5 at t521")
+                errors.append(
+                    "generation candidate is not locked to the promotion route at t521"
+                )
 
     sampling_kwargs = report.get("sampling_kwargs")
     if not isinstance(sampling_kwargs, dict):

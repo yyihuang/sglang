@@ -1120,7 +1120,7 @@ def run_wan_transformer_forward_performance_qualification(
         sorted(configured_layers) if configured_layers is not None else None
     )
     if configured_layers != list(WAN_HYBRID_PROMOTION_LAYER_INDICES):
-        raise ValueError("performance candidate must configure Wan tail5 layers 35..39")
+        raise ValueError("performance candidate must configure Wan promotion layers 37..39")
     if getattr(candidate_model, "wan_hybrid_max_timestep", None) != (
         WAN_HYBRID_PROMOTION_MAX_TIMESTEP
     ):
@@ -1131,7 +1131,7 @@ def run_wan_transformer_forward_performance_qualification(
         actual_timestep=actual_timestep,
     )
     if eligible_layers != list(WAN_HYBRID_PROMOTION_LAYER_INDICES):
-        raise ValueError("performance candidate tail5 route is not eligible at t521")
+        raise ValueError("performance candidate promotion route is not eligible at t521")
 
     fixed_input_device = _move_fixed_input_to_model(
         fixed_input_cpu, device=reference_device
@@ -1371,7 +1371,9 @@ def validate_wan_transformer_forward_performance_report(
         "candidate_backend_exercised": True,
     }
     if any(report.get(name) != value for name, value in expected_scalars.items()):
-        errors.append("performance report does not match tail5 transformer_2@t521")
+        errors.append(
+            "performance report does not match promotion-route transformer_2@t521"
+        )
     if report.get("timing_scope") != (
         "synchronized complete Wan transformer forward with output materialized"
     ):

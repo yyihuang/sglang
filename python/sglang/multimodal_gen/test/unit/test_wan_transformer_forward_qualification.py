@@ -178,7 +178,7 @@ def test_direct_cli_mode_dispatches_to_trajectory_free_performance_runner():
         select_direct_qualification_runner("other")
 
 
-def test_direct_performance_report_requires_tail5_hits_and_process_stream_proof():
+def test_direct_performance_report_requires_promotion_hits_and_process_stream_proof():
     binding = {
         "schema_version": 1,
         "component_name": "transformer_2",
@@ -205,10 +205,10 @@ def test_direct_performance_report_requires_tail5_hits_and_process_stream_proof(
     ).hexdigest()
 
     def variant_summary(variant: str) -> dict:
-        hits = 5 if variant == "candidate" else 0
+        hits = 3 if variant == "candidate" else 0
         request_ids = [f"{variant}-{index}" for index in range(5)]
         all_layers = list(range(40))
-        hybrid_layers = [35, 36, 37, 38, 39] if variant == "candidate" else []
+        hybrid_layers = [37, 38, 39] if variant == "candidate" else []
 
         def coverage(request_id: str) -> dict:
             return {
@@ -298,8 +298,8 @@ def test_direct_performance_report_requires_tail5_hits_and_process_stream_proof(
         "component_name": "transformer_2",
         "evidence_binding": binding,
         "invocation_input_sha256": binding["fixed_input_sha256"],
-        "candidate_wan_hybrid_layer_indices": [35, 36, 37, 38, 39],
-        "candidate_wan_hybrid_eligible_layer_indices": [35, 36, 37, 38, 39],
+        "candidate_wan_hybrid_layer_indices": [37, 38, 39],
+        "candidate_wan_hybrid_eligible_layer_indices": [37, 38, 39],
         "candidate_wan_hybrid_max_timestep": 521,
         "candidate_backend_exercised": True,
         "execution_topology": {
@@ -341,7 +341,7 @@ def test_direct_performance_report_requires_tail5_hits_and_process_stream_proof(
                 "required_run_orders": ["reference-first", "candidate-first"],
                 "warmup_runs_equals": 2,
                 "measure_runs_equals": 5,
-                "candidate_hit_count_equals": 5,
+                "candidate_hit_count_equals": 3,
                 "speedup_min": 1.0,
             },
             "failures": [],
