@@ -9,6 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    WAN_HYBRID_EXACT_SERVING_BOUNDARY,
+)
 from sglang.multimodal_gen.runtime.qualification.attention_backend_identity import (
     collect_runtime_attention_backend_identity,
 )
@@ -78,6 +81,7 @@ def _coverage(
     steps = []
     expected_hits = 0
     route_events = 0
+    successful_calls = []
     for step_index in range(num_steps):
         component = "transformer" if step_index < num_steps // 2 else "transformer_2"
         actual_timestep = (
@@ -131,6 +135,17 @@ def _coverage(
             )
             expected_hits += len(eligible)
             route_events += 40
+            successful_calls.extend(
+                {
+                    "step_index": step_index,
+                    "actual_timestep": actual_timestep,
+                    "component_name": component,
+                    "cfg_branch_index": branch_index,
+                    "layer_index": layer_index,
+                    "serving_boundary": WAN_HYBRID_EXACT_SERVING_BOUNDARY,
+                }
+                for layer_index in eligible
+            )
         steps.append(
             {
                 "step_index": step_index,
@@ -150,6 +165,7 @@ def _coverage(
         "eligible_hybrid_miss_count": 0,
         "num_route_events": route_events,
         "num_success_events": expected_hits,
+        "successful_calls": successful_calls,
         "steps": steps,
     }
 
@@ -530,6 +546,7 @@ def _full_transformer_forward_report(
         "capture_request_id": capture_request_id,
         "capture_coordinates": capture_coordinates,
         "capture_sampling_sha256": capture_sampling_sha256,
+        "capture_input_sha256": "d" * 64,
     }
     capture_manifest_binding = {
         "schema_version": 1,
@@ -560,6 +577,17 @@ def _full_transformer_forward_report(
         layers = list(range(40))
         hybrid_layers = WAN_HYBRID_DEFAULT_LAYER_INDICES if candidate else []
         hits = len(hybrid_layers)
+        successful_calls = [
+            {
+                "step_index": capture_coordinates["step_index"],
+                "actual_timestep": capture_coordinates["actual_timestep"],
+                "component_name": component_name,
+                "cfg_branch_index": capture_coordinates["cfg_branch_index"],
+                "layer_index": layer_index,
+                "serving_boundary": WAN_HYBRID_EXACT_SERVING_BOUNDARY,
+            }
+            for layer_index in hybrid_layers
+        ]
         return {
             "schema_version": 2,
             "request_id": request_id,
@@ -570,6 +598,7 @@ def _full_transformer_forward_report(
             "eligible_hybrid_miss_count": 0,
             "num_route_events": 40,
             "num_success_events": hits,
+            "successful_calls": successful_calls,
             "steps": [
                 {
                     "step_index": capture_coordinates["step_index"],

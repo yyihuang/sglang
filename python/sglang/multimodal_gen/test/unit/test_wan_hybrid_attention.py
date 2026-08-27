@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 import torch
 from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    WAN_HYBRID_EXACT_SERVING_BOUNDARY,
     WanHybridAttentionBackend,
     WanHybridEvidenceCollector,
     WanHybridAttentionImpl,
@@ -14,6 +15,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
     read_wan_hybrid_hit_count,
     record_wan_attention_route,
     reset_wan_hybrid_hit_count,
+    validate_wan_hybrid_exact_serving_boundary_evidence,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -265,8 +267,46 @@ class TestWanHybridAttentionBackend(unittest.TestCase):
         self.assertEqual(coverage["expected_hit_count"], 1)
         self.assertEqual(coverage["actual_hit_count"], 1)
         self.assertEqual(coverage["unattributed_actual_hit_count"], 0)
+        self.assertEqual(
+            coverage["successful_calls"],
+            [
+                {
+                    "step_index": 3,
+                    "actual_timestep": 777,
+                    "component_name": "transformer",
+                    "cfg_branch_index": 1,
+                    "layer_index": 7,
+                    "serving_boundary": WAN_HYBRID_EXACT_SERVING_BOUNDARY,
+                }
+            ],
+        )
+        self.assertEqual(
+            validate_wan_hybrid_exact_serving_boundary_evidence(coverage), []
+        )
         self.assertEqual(read_wan_hybrid_hit_count(), 0)
         fake_flashinfer.wan_hybrid_attention.assert_called_once()
+
+    def test_public_forward_rejects_non_caller_owned_output(self):
+        impl = _make_impl()
+        query, key, value = _exact_cuda_inputs()
+        output = torch.empty(1, dtype=torch.bfloat16)
+        replacement = torch.empty(1, dtype=torch.bfloat16)
+        fake_flashinfer = ModuleType("flashinfer")
+        fake_flashinfer.is_wan_hybrid_attention_available = Mock(return_value=True)
+        fake_flashinfer.wan_hybrid_attention = Mock(return_value=replacement)
+
+        with (
+            patch.dict("sys.modules", {"flashinfer": fake_flashinfer}),
+            patch.object(
+                impl,
+                "_get_workspace_and_output",
+                return_value=(object(), output),
+            ),
+            self.assertRaisesRegex(RuntimeError, "caller-owned BF16 output storage"),
+        ):
+            impl.forward(query, key, value, None)
+
+        self.assertEqual(read_wan_hybrid_hit_count(), 0)
 
     def test_unavailable_public_backend_fails_closed_without_hit(self):
         impl = _make_impl()

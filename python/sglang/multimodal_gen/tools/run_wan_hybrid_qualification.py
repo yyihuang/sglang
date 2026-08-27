@@ -18,6 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    validate_wan_hybrid_exact_serving_boundary_evidence,
+)
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MIN_QUALIFICATION_MEASURE_RUNS,
     MIN_QUALIFICATION_WARMUP_RUNS,
@@ -614,6 +617,10 @@ def _validate_wan_hybrid_coverage(
     errors = []
     if coverage.get("schema_version") != 2:
         errors.append(f"{location}: unsupported coverage schema")
+    errors.extend(
+        f"{location}: {error}"
+        for error in validate_wan_hybrid_exact_serving_boundary_evidence(coverage)
+    )
     if not isinstance(coverage.get("request_id"), str) or not coverage["request_id"]:
         errors.append(f"{location}: request identity is missing")
     steps = coverage.get("steps")

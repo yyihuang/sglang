@@ -100,7 +100,10 @@ captures every trajectory step and evaluates every same-variant and
 cross-variant run pair. Performance disables trajectory capture, executes both
 reference-first and candidate-first orders, and passes only when both median
 speedups are at least 1.0 and every measured candidate run reports a positive
-backend hit count.
+backend hit count. Every successful hybrid call also records and validates the
+exact serving boundary (`B=1, S=4800, H=40, D=128`, NHD, noncausal, raw
+post-RoPE BF16 Q/K/V, and caller-owned BF16 output storage). A hit count without
+the corresponding per-call boundary record is not qualification evidence.
 
 The qualification runner builds fixed single-block, full-transformer, and
 generation matrices without depending on a particular cluster layout. Pass the
@@ -141,8 +144,10 @@ python -m sglang.multimodal_gen.tools.capture_wan_transformer_inputs \
 ```
 
 Each worker manifest binds the request, sampling parameters, model/component
-identity, step/timestep/CFG branch, and CPU tensor artifact. Use each manifest
-to load the real component twice and run a direct forward in both orders:
+identity, step/timestep/CFG branch, and CPU tensor artifact. Reports retain the
+capture artifact, canonical fixed-input, and canonical invocation digests;
+these digests are not interchangeable. Correctness uses separately configured
+reference and candidate instances and runs both explicit execution orders:
 
 ```bash
 python -m sglang.multimodal_gen.tools.run_wan_transformer_forward_report \
@@ -155,8 +160,11 @@ Repeat for `candidate-first` and `transformer_2`, then provide all four reports
 to a `full-transformer` qualification. The harness reuses the trajectory
 evaluator over snapshots from every `model.blocks` entry, computes the complete
 5-by-5 cross-variant product and all ten same-instance run pairs, and separately
-checks the final transformer output. Hook capture is a correctness path and must
-not be used for performance timing.
+checks the final transformer output. Direct performance instead prepares FA
+once and switches the same candidate model instance request-locally between FA
+and its construction-default `wan_hybrid` implementation. Both orders reuse the
+same model, fixed input object, CUDA device, process, and stream. Hook capture
+is a correctness path and must not be used for performance timing.
 
 ### LoRA support
 
