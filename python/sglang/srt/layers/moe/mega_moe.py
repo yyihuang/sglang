@@ -200,7 +200,11 @@ def _run_flashinfer_mega_routed(
     )
     flashinfer_layer = moe.experts.flashinfer_megamoe_layer
     if not getattr(moe.experts, "_flashinfer_megamoe_warmed_up", False):
-        if get_is_capture_mode():
+        # Graph runners execute eager warmup forwards while model_capture_mode
+        # is set, before the CUDA stream is actually captured.  FlashInfer's
+        # collective workspace warmup belongs in that pre-capture window; only
+        # reject the first use once CUDA recording has really started.
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "FlashInfer MegaMoE reached CUDA graph capture before its "
                 "collective eager warmup. Run one eager model warmup first."
