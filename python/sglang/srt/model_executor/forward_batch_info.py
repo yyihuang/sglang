@@ -310,7 +310,8 @@ def prefill_graph_tolerates_sum_len() -> bool:
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
     from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 
-    if not get_moe_a2a_backend().is_megamoe():
+    backend = get_moe_a2a_backend()
+    if not (backend.is_megamoe() or backend.is_flashinfer_megamoe()):
         return False
     return not (is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled())
 

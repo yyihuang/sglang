@@ -482,6 +482,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if get_moe_a2a_backend().is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_flashinfer_megamoe_experts_weights,
+            )
+
+            build_flashinfer_megamoe_experts_weights(layer)
+            return
+
         _should_use_aiter_moe = (
             _use_aiter
             and (

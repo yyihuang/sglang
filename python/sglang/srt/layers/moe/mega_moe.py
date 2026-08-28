@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -79,7 +80,28 @@ def _get_mega_moe_symm_buffer(
 
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
-    if not get_moe_a2a_backend().is_megamoe():
+    a2a_backend = get_moe_a2a_backend()
+    if a2a_backend.is_flashinfer_megamoe():
+        if not getattr(moe.experts, "_flashinfer_megamoe_weights_built", False):
+            raise RuntimeError(
+                "FlashInfer MegaMoE was selected, but its BF16 expert weights "
+                "were not prepared after model loading."
+            )
+        global_num_tokens = get_dp_global_num_tokens()
+        if global_num_tokens and not is_dsa_enable_prefill_cp():
+            max_tokens_per_rank = max(global_num_tokens)
+        else:
+            max_tokens_per_rank = hidden_states.shape[0]
+        cap = get_exec().moe.flashinfer_megamoe_max_tokens_per_rank
+        if max_tokens_per_rank > cap:
+            raise ValueError(
+                "FlashInfer MegaMoE token capacity exceeded: "
+                f"required={max_tokens_per_rank}, capacity={cap}. Raise "
+                "--flashinfer-megamoe-max-tokens-per-rank or lower the batch limit."
+            )
+        return True
+
+    if not a2a_backend.is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
@@ -107,7 +129,8 @@ def forward_mega_moe(
     num_tokens = hidden_states.shape[0]
 
     sbo_overlap_flag = (
-        moe.alt_stream is not None
+        not get_moe_a2a_backend().is_flashinfer_megamoe()
+        and moe.alt_stream is not None
         and moe.num_fused_shared_experts == 0
         and num_tokens > 0
         and get_is_capture_mode()
@@ -123,15 +146,71 @@ def forward_mega_moe(
         mega_stream_ctx = nullcontext()
 
     with mega_stream_ctx:
-        y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
-        )
+        if get_moe_a2a_backend().is_flashinfer_megamoe():
+            y = _run_flashinfer_mega_routed(
+                moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            )
+        else:
+            y = _run_mega_routed(
+                moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            )
 
     if sbo_overlap_flag:
         current_stream.wait_stream(moe.alt_stream)
 
     if shared_output is not None:
         y.add_(shared_output)
+    return y
+
+
+def _run_flashinfer_mega_routed(
+    moe: DeepseekV2MoE,
+    hidden_states: torch.Tensor,
+    forward_batch: Optional[ForwardBatch],
+    input_ids_global: Optional[torch.Tensor],
+    num_tokens: int,
+) -> torch.Tensor:
+    from flashinfer.moe_ep import MoEEpTensors
+
+    if num_tokens > 0:
+        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+        topk_output = moe.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=(
+                forward_batch.num_token_non_padded
+                if forward_batch is not None
+                else None
+            ),
+            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                layer_id=moe.layer_id,
+            ),
+            **topk_kwargs,
+        )
+    else:
+        topk_output = moe.topk.empty_topk_output(
+            hidden_states.device, layer_id=moe.layer_id
+        )
+
+    tensors = MoEEpTensors(
+        hidden_states=hidden_states,
+        topk_ids=topk_output.topk_ids.to(torch.int64),
+        topk_weights=topk_output.topk_weights.to(torch.float32),
+    )
+    flashinfer_layer = moe.experts.flashinfer_megamoe_layer
+    if not getattr(moe.experts, "_flashinfer_megamoe_warmed_up", False):
+        if get_is_capture_mode():
+            raise RuntimeError(
+                "FlashInfer MegaMoE reached CUDA graph capture before its "
+                "collective eager warmup. Run one eager model warmup first."
+            )
+        flashinfer_layer.warmup(tensors)
+        moe.experts._flashinfer_megamoe_warmed_up = True
+
+    y = flashinfer_layer(tensors)
+    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+        y.mul_(moe.routed_scaling_factor)
     return y
 
 
@@ -293,6 +372,97 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
         .reshape(num_groups, mn, packed_sf_k)
     )
     return torch.empty_like(sf).copy_(result)
+
+
+def build_flashinfer_megamoe_experts_weights(experts) -> None:
+    """Build one public FlashInfer MoE-EP layer and transfer weight ownership.
+
+    FlashInfer preprocesses the canonical BF16 expert weights at construction.
+    Once that succeeds, the original SGLang Parameters must be released: keeping
+    them would retain a second full expert-weight copy for every model layer.
+    """
+    if getattr(experts, "_flashinfer_megamoe_weights_built", False):
+        return
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEWeightPack,
+        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    config = experts.moe_runner_config
+    if experts.with_bias:
+        raise ValueError("FlashInfer MegaMoE does not support expert bias tensors.")
+    if config.activation != "silu" or not config.is_gated:
+        raise ValueError(
+            "FlashInfer BF16 MegaMoE currently requires gated SiLU experts."
+        )
+    if config.apply_router_weight_on_input:
+        raise ValueError(
+            "FlashInfer MegaMoE applies routing weights during the fused layer; "
+            "apply_router_weight_on_input is unsupported."
+        )
+    if experts.num_fused_shared_experts:
+        raise ValueError(
+            "FlashInfer MegaMoE requires shared-expert fusion to be disabled."
+        )
+    if experts.moe_tp_size != 1:
+        raise ValueError(
+            "FlashInfer MegaMoE requires moe_tp_size=1 so each EP rank owns "
+            "complete local expert matrices."
+        )
+    if experts.num_local_experts * experts.moe_ep_size != experts.num_experts:
+        raise ValueError(
+            "FlashInfer MegaMoE requires an even, non-redundant expert partition."
+        )
+    if (
+        experts.w13_weight.dtype != torch.bfloat16
+        or experts.w2_weight.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "FlashInfer MegaMoE requires canonical BF16 w13 and w2 weights."
+        )
+
+    ep_group = get_moe_ep_group().device_group
+    bootstrap = BootstrapConfig(
+        world_size=experts.moe_ep_size,
+        rank=experts.moe_ep_rank,
+        stream=torch.cuda.current_stream().cuda_stream,
+        process_group=ep_group,
+        device=torch.cuda.current_device(),
+    )
+    fleet_params = FleetParams(
+        num_experts=experts.num_experts,
+        max_tokens_per_rank=(
+            get_exec().moe.flashinfer_megamoe_max_tokens_per_rank
+        ),
+        token_hidden_size=experts.hidden_size,
+    )
+    kernel_config = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=experts.intermediate_size_per_partition,
+        top_k=experts.top_k,
+        activation_clamp=config.swiglu_limit,
+    )
+    weights = MoEWeightPack(
+        experts.w13_weight.detach(),
+        experts.w2_weight.detach(),
+    )
+    flashinfer_layer = MoEEpLayer(
+        bootstrap=bootstrap,
+        fleet_params=fleet_params,
+        weights=weights,
+        backend=MegaConfig(megakernel=kernel_config),
+    )
+
+    experts.flashinfer_megamoe_layer = flashinfer_layer
+    experts._flashinfer_megamoe_weights_built = True
+    experts._flashinfer_megamoe_warmed_up = False
+    experts.register_parameter("w13_weight", None)
+    experts.register_parameter("w2_weight", None)
 
 
 def build_mega_moe_experts_weights(experts) -> None:

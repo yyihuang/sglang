@@ -2394,6 +2394,7 @@ class ServerArgs:
             "mori",
             "ascend_fuseep",
             "flashinfer",
+            "flashinfer_megamoe",
             "megamoe",
             "deepep_v2",
             "ascend_tp",
@@ -2409,6 +2410,7 @@ class ServerArgs:
                 "mori",
                 "ascend_fuseep",
                 "flashinfer",
+                "flashinfer_megamoe",
                 "megamoe",
                 "deepep_v2",
                 "pplx",
@@ -2425,6 +2427,12 @@ class ServerArgs:
         "--moe-a2a-backend megamoe.",
         NS("exec.moe"),
     ] = False
+    flashinfer_megamoe_max_tokens_per_rank: A[
+        int,
+        "Maximum local tokens reserved by each FlashInfer MegaMoE layer. "
+        "The value must cover every eager and CUDA-graph MoE forward.",
+        NS("exec.moe"),
+    ] = 4096
     deepep_v2_mode: A[
         Literal["direct", "hybrid"],
         "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "
@@ -5133,7 +5141,13 @@ class ServerArgs:
             (
                 "unvalidated a2a backend",
                 lambda: resolved_view(self).moe_a2a_backend
-                not in ("none", "deepep", "megamoe", "flashinfer"),
+                not in (
+                    "none",
+                    "deepep",
+                    "megamoe",
+                    "flashinfer",
+                    "flashinfer_megamoe",
+                ),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
@@ -7618,6 +7632,39 @@ class ServerArgs:
                 "combine. Use --moe-a2a-backend deepep."
             )
 
+    def _validate_flashinfer_megamoe_model(self) -> None:
+        """Validate the model surface implemented by the whole-layer adapter."""
+        if (
+            parse_connector_type(resolved_view(self).model_path)
+            == ConnectorType.INSTANCE
+        ):
+            raise ValueError(
+                "FlashInfer MegaMoE cannot validate weights supplied through an "
+                "instance connector; load an unquantized model from a model path."
+            )
+
+        architectures = (
+            getattr(self.get_model_config().hf_config, "architectures", None) or []
+        )
+        architecture = architectures[0] if architectures else None
+        validated_architectures = (
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+        )
+        if architecture not in validated_architectures:
+            raise ValueError(
+                "FlashInfer MegaMoE is currently wired only through the DeepSeek "
+                f"V2/V3 whole-layer path; got {architecture!r}. Supported "
+                f"architectures are {sorted(validated_architectures)}."
+            )
+        quantization = resolved_view(self).quantization
+        if quantization is not None:
+            raise ValueError(
+                "--moe-a2a-backend flashinfer_megamoe currently requires "
+                f"unquantized BF16 expert weights; got quantization={quantization!r}."
+            )
+
     def _validate_deepep_v2_speculative_draft(self) -> None:
         """Reject an explicit or inherited DeepEP v2 draft backend."""
         view = resolved_view(self)
@@ -7783,6 +7830,13 @@ class ServerArgs:
                 "flashinfer_cutedsl",
                 "flashinfer_trtllm_routed",
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
+
+        if a2a_backend == "flashinfer_megamoe":
+            self._validate_flashinfer_megamoe_model()
+            logger.warning(
+                "FlashInfer MegaMoE is enabled with a static EP layout and "
+                "unquantized BF16 expert weights."
+            )
 
         if a2a_backend == "mori":
             if cfg.deepep_mode == "auto":

@@ -45,6 +45,50 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_flashinfer_megamoe_cli_and_resolution(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--tp",
+                "8",
+                "--ep",
+                "1",
+                "--moe-a2a-backend",
+                "flashinfer_megamoe",
+                "--flashinfer-megamoe-max-tokens-per-rank",
+                "512",
+            ]
+        )
+        args.resolve_once()
+        args.get_model_config = lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
+        )
+        args._handle_a2a_moe()
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        view = resolved_view(args)
+        self.assertEqual(view.moe_a2a_backend, "flashinfer_megamoe")
+        self.assertEqual(view.ep_size, 8)
+        self.assertEqual(view.flashinfer_megamoe_max_tokens_per_rank, 512)
+        self.assertTrue(view.disable_shared_experts_fusion)
+
+    def test_flashinfer_megamoe_rejects_non_owning_options(self):
+        with self.assertRaisesRegex(ValueError, "owns dispatch, expert compute"):
+            ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="flashinfer_megamoe",
+                moe_runner_backend="triton",
+            ).resolve_once()
+
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="flashinfer_megamoe",
+                flashinfer_megamoe_max_tokens_per_rank=0,
+            ).resolve_once()
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",

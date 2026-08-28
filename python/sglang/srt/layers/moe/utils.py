@@ -40,6 +40,7 @@ class MoeA2ABackend(Enum):
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
@@ -68,6 +69,9 @@ class MoeA2ABackend(Enum):
 
     def is_flashinfer(self):
         return self == MoeA2ABackend.FLASHINFER
+
+    def is_flashinfer_megamoe(self):
+        return self == MoeA2ABackend.FLASHINFER_MEGAMOE
 
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP

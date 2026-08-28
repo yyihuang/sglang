@@ -165,6 +165,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
+        or a2a_backend.is_flashinfer_megamoe()
         or a2a_backend.is_ascend_fuseep()
     ):
         # ascend_fuseep bypasses the dispatcher abstraction (see
