@@ -60,8 +60,9 @@ class TestPrepareServerArgs(CustomTestCase):
                 "128",
             ]
         )
-        args.resolve_once()
-        args.get_model_config = lambda: SimpleNamespace(
+        # The dummy-model path stops before model-aware resolution. Seed the
+        # memo before resolution, then exercise the MoE handler explicitly.
+        args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(
                 architectures=["DeepseekV3ForCausalLM"],
                 hidden_size=7168,
@@ -70,6 +71,7 @@ class TestPrepareServerArgs(CustomTestCase):
                 num_experts_per_tok=8,
             )
         )
+        args.resolve_once()
         args._handle_a2a_moe()
 
         from sglang.srt.arg_groups.overrides import resolved_view
