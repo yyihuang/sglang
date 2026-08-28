@@ -2429,10 +2429,10 @@ class ServerArgs:
     ] = False
     flashinfer_megamoe_max_tokens_per_rank: A[
         int,
-        "Maximum local tokens reserved by each FlashInfer MegaMoE layer. "
-        "The value must cover every eager and CUDA-graph MoE forward.",
+        "Fixed per-launch token rows for the SM100 BF16 rank-major FlashInfer "
+        "MegaMoE backend. Larger eager prefills are split into 128-row chunks.",
         NS("exec.moe"),
-    ] = 4096
+    ] = 128
     deepep_v2_mode: A[
         Literal["direct", "hybrid"],
         "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "
@@ -4852,6 +4852,7 @@ class ServerArgs:
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
         self._apply_deepep_adjustments()
+        self._apply_flashinfer_megamoe_cuda_graph_adjustments()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
@@ -4894,6 +4895,52 @@ class ServerArgs:
                         max_bs=aligned[-1],
                     ),
                 )
+
+    def _apply_flashinfer_megamoe_cuda_graph_adjustments(self):
+        """Keep graph captures inside the fixed rank-major launch contract."""
+        cfg = resolving_view(self)
+        if resolved_view(self).moe_a2a_backend != "flashinfer_megamoe":
+            return
+
+        graph_config = cfg.cuda_graph_config
+        decode = graph_config.decode
+        if decode.backend != Backend.DISABLED:
+            if decode.bs is not None and any(bs > 128 for bs in decode.bs):
+                raise ValueError(
+                    "FlashInfer rank-major MegaMoE CUDA graph decode buckets "
+                    "must be <= 128 token rows; larger forwards run eagerly."
+                )
+            if decode.max_bs is not None and decode.max_bs > 128:
+                raise ValueError(
+                    "FlashInfer rank-major MegaMoE requires "
+                    "cuda_graph_config[decode].max_bs <= 128."
+                )
+            if decode.max_bs is None:
+                graph_config = with_phase(
+                    graph_config, Phase.DECODE, max_bs=128
+                )
+
+        prefill = graph_config.prefill
+        if prefill.backend != Backend.DISABLED:
+            if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
+                raise ValueError(
+                    "FlashInfer rank-major MegaMoE requires prefill CUDA graph "
+                    "to be disabled; eager prefill uses collective-safe "
+                    "fixed-128 chunking."
+                )
+            logger.info(
+                "Disabling prefill CUDA graph for FlashInfer rank-major "
+                "MegaMoE; eager prefill uses fixed-128 chunks."
+            )
+            graph_config = with_phase(
+                graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            )
+
+        if graph_config != cfg.cuda_graph_config:
+            self._declare(
+                "_apply_flashinfer_megamoe_cuda_graph_adjustments",
+                cuda_graph_config=graph_config,
+            )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -7643,22 +7690,71 @@ class ServerArgs:
                 "instance connector; load an unquantized model from a model path."
             )
 
-        architectures = (
-            getattr(self.get_model_config().hf_config, "architectures", None) or []
-        )
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
+        architectures = getattr(hf_config, "architectures", None) or []
         architecture = architectures[0] if architectures else None
-        validated_architectures = (
-            "DeepseekV2ForCausalLM",
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-        )
-        if architecture not in validated_architectures:
+        if architecture != "DeepseekV3ForCausalLM":
             raise ValueError(
-                "FlashInfer MegaMoE is currently wired only through the DeepSeek "
-                f"V2/V3 whole-layer path; got {architecture!r}. Supported "
-                f"architectures are {sorted(validated_architectures)}."
+                "FlashInfer rank-major MegaMoE is validated only for "
+                f"DeepseekV3ForCausalLM; got {architecture!r}."
             )
-        quantization = resolved_view(self).quantization
+        exact_geometry = {
+            "hidden_size": (getattr(hf_config, "hidden_size", None), 7168),
+            "moe_intermediate_size": (
+                getattr(hf_config, "moe_intermediate_size", None),
+                2048,
+            ),
+            "n_routed_experts": (
+                getattr(hf_config, "n_routed_experts", None),
+                256,
+            ),
+            "num_experts_per_tok": (
+                getattr(hf_config, "num_experts_per_tok", None),
+                8,
+            ),
+        }
+        for name, (actual, expected) in exact_geometry.items():
+            if actual != expected:
+                raise ValueError(
+                    "FlashInfer rank-major MegaMoE requires "
+                    f"{name}={expected}, got {actual}."
+                )
+        view = resolved_view(self)
+        exact_parallel = {
+            "tp_size": (view.tp_size, 8),
+            "ep_size": (view.ep_size, 8),
+            "dp_size": (view.dp_size, 1),
+            "pp_size": (view.pp_size, 1),
+            "attn_cp_size": (view.attn_cp_size, 1),
+            "dcp_size": (view.dcp_size, 1),
+            "dwdp_size": (view.dwdp_size, 1),
+            "moe_dp_size": (view.moe_dp_size, 1),
+        }
+        for name, (actual, expected) in exact_parallel.items():
+            if actual != expected:
+                raise ValueError(
+                    "FlashInfer rank-major MegaMoE requires equal rank-local row "
+                    f"counts and chunk order, and therefore {name}={expected}, "
+                    f"got {actual}."
+                )
+        # With DP attention disabled, MLP-sync pads global rows to attn_tp_size.
+        # A2A then selects SCATTERED MLP mode and LayerCommunicator tensor-splits
+        # the ordered rows into equal contiguous rank-local shards. EP spans the
+        # same TP group, so every rank launches the same fixed-128 chunk count
+        # and ordering (on different rank-local row contents).
+        if view.enable_dp_attention or view.enable_prefill_cp:
+            raise ValueError(
+                "FlashInfer rank-major MegaMoE requires DP attention and prefill "
+                "context parallelism to be disabled so all TP8/EP8 ranks execute "
+                "equal rank-local row counts and chunk order."
+            )
+        if view.speculative_algorithm is not None:
+            raise ValueError(
+                "FlashInfer rank-major MegaMoE is not validated with speculative "
+                "decoding because it changes the per-request decode width."
+            )
+        quantization = view.quantization
         if quantization is not None:
             raise ValueError(
                 "--moe-a2a-backend flashinfer_megamoe currently requires "

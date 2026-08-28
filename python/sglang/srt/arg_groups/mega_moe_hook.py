@@ -55,9 +55,10 @@ def validate_flashinfer_megamoe_args(server_args: ServerArgs) -> None:
     if cfg.moe_a2a_backend != "flashinfer_megamoe":
         return
 
-    if cfg.flashinfer_megamoe_max_tokens_per_rank <= 0:
+    if cfg.flashinfer_megamoe_max_tokens_per_rank != 128:
         raise ValueError(
-            "--flashinfer-megamoe-max-tokens-per-rank must be positive."
+            "--flashinfer-megamoe-max-tokens-per-rank is fixed at 128 for the "
+            "SM100 BF16 rank-major backend."
         )
     if cfg.moe_runner_backend != "auto":
         raise ValueError(

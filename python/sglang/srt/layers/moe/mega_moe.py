@@ -33,7 +33,6 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
-from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -43,6 +42,21 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_FLASHINFER_MEGAMOE_TOKENS_PER_RANK = 128
+_FLASHINFER_MEGAMOE_HIDDEN_SIZE = 7168
+_FLASHINFER_MEGAMOE_TOP_K = 8
+
+
+def _flashinfer_megamoe_chunk_ranges(num_tokens: int) -> tuple[tuple[int, int], ...]:
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}.")
+    return tuple(
+        (
+            start,
+            min(start + _FLASHINFER_MEGAMOE_TOKENS_PER_RANK, num_tokens),
+        )
+        for start in range(0, num_tokens, _FLASHINFER_MEGAMOE_TOKENS_PER_RANK)
+    )
 
 
 def _get_mega_moe_symm_buffer(
@@ -86,18 +100,6 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
             raise RuntimeError(
                 "FlashInfer MegaMoE was selected, but its BF16 expert weights "
                 "were not prepared after model loading."
-            )
-        global_num_tokens = get_dp_global_num_tokens()
-        if global_num_tokens and not is_dsa_enable_prefill_cp():
-            max_tokens_per_rank = max(global_num_tokens)
-        else:
-            max_tokens_per_rank = hidden_states.shape[0]
-        cap = get_exec().moe.flashinfer_megamoe_max_tokens_per_rank
-        if max_tokens_per_rank > cap:
-            raise ValueError(
-                "FlashInfer MegaMoE token capacity exceeded: "
-                f"required={max_tokens_per_rank}, capacity={cap}. Raise "
-                "--flashinfer-megamoe-max-tokens-per-rank or lower the batch limit."
             )
         return True
 
@@ -172,50 +174,138 @@ def _run_flashinfer_mega_routed(
 ) -> torch.Tensor:
     from flashinfer.moe_ep import MoEEpTensors
 
-    if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.num_token_non_padded
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
-        )
-    else:
-        topk_output = moe.topk.empty_topk_output(
-            hidden_states.device, layer_id=moe.layer_id
-        )
+    if num_tokens == 0:
+        # The fixed backend is collective.  The admitted TP8/EP8, DP1 layout
+        # gives every EP rank the same local row count, so an all-empty forward
+        # may keep SGLang's existing empty-tensor semantics without a launch.
+        return hidden_states
 
-    tensors = MoEEpTensors(
-        hidden_states=hidden_states,
-        topk_ids=topk_output.topk_ids.to(torch.int64),
-        topk_weights=topk_output.topk_weights.to(torch.float32),
+    router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+    topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+    topk_output = moe.topk(
+        hidden_states,
+        router_logits,
+        num_token_non_padded=(
+            forward_batch.num_token_non_padded
+            if forward_batch is not None
+            else None
+        ),
+        expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+            layer_id=moe.layer_id,
+        ),
+        **topk_kwargs,
     )
+
     flashinfer_layer = moe.experts.flashinfer_megamoe_layer
-    if not getattr(moe.experts, "_flashinfer_megamoe_warmed_up", False):
-        # Graph runners execute eager warmup forwards while model_capture_mode
-        # is set, before the CUDA stream is actually captured.  FlashInfer's
-        # collective workspace warmup belongs in that pre-capture window; only
-        # reject the first use once CUDA recording has really started.
+    if num_tokens > _FLASHINFER_MEGAMOE_TOKENS_PER_RANK:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "FlashInfer MegaMoE reached CUDA graph capture before its "
-                "collective eager warmup. Run one eager model warmup first."
+                "FlashInfer MegaMoE CUDA graphs support at most 128 token rows; "
+                "larger eager prefills are chunked before capture."
             )
-        flashinfer_layer.warmup(tensors)
-        moe.experts._flashinfer_megamoe_warmed_up = True
+        y = torch.empty_like(hidden_states)
+    else:
+        y = None
 
-    y = flashinfer_layer(tensors)
+    # Server validation admits only TP8 == EP8 with DP/CP/PP disabled. SGLang's
+    # MLP-sync padding aligns the global rows to attn_tp_size, and an A2A backend
+    # selects SCATTERED MLP mode: LayerCommunicator tensor-splits that ordered
+    # global tensor into equal contiguous rank-local shards before reduce-scatter.
+    # The row contents differ by rank, but every EP rank therefore has the same
+    # local row count and executes the same ordered chunk sequence. Do not relax
+    # this contract without adding cross-rank chunk-count coordination.
+    for start, stop in _flashinfer_megamoe_chunk_ranges(num_tokens):
+        chunk_tokens = stop - start
+        padded_hidden, padded_topk_ids, padded_topk_weights = (
+            _stage_flashinfer_megamoe_chunk(
+                hidden_states[start:stop],
+                topk_output.topk_ids[start:stop],
+                topk_output.topk_weights[start:stop],
+                hidden_buffer=moe.experts._flashinfer_megamoe_hidden_buffer,
+                topk_ids_buffer=moe.experts._flashinfer_megamoe_topk_ids_buffer,
+                topk_weights_buffer=(
+                    moe.experts._flashinfer_megamoe_topk_weights_buffer
+                ),
+            )
+        )
+        tensors = MoEEpTensors(
+            hidden_states=padded_hidden,
+            topk_ids=padded_topk_ids,
+            topk_weights=padded_topk_weights,
+        )
+        if not getattr(moe.experts, "_flashinfer_megamoe_warmed_up", False):
+            # Graph runners execute eager warmup forwards while model_capture_mode
+            # is set, before the CUDA stream is actually captured. FlashInfer's
+            # collective workspace warmup belongs in that pre-capture window; only
+            # reject the first use once CUDA recording has really started.
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "FlashInfer MegaMoE reached CUDA graph capture before its "
+                    "collective eager warmup. Run one eager model warmup first."
+                )
+            flashinfer_layer.warmup(tensors)
+            moe.experts._flashinfer_megamoe_warmed_up = True
+
+        chunk_y = flashinfer_layer(tensors)[:chunk_tokens]
+        if y is None:
+            y = chunk_y
+        else:
+            y[start:stop].copy_(chunk_y)
+
+    assert y is not None
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
         y.mul_(moe.routed_scaling_factor)
     return y
+
+
+def _stage_flashinfer_megamoe_chunk(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    hidden_buffer: torch.Tensor,
+    topk_ids_buffer: torch.Tensor,
+    topk_weights_buffer: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Copy one real-token chunk into the fixed rank-major input buffers.
+
+    The buffers are allocated during expert construction.  Copying and zeroing
+    are graph-recordable, so this helper adds no allocator work during capture.
+    Dummy rows route to valid expert 0 with zero weight and therefore cannot
+    contribute to the sliced real-token output.
+    """
+    num_tokens = hidden_states.shape[0]
+    if not 0 < num_tokens <= _FLASHINFER_MEGAMOE_TOKENS_PER_RANK:
+        raise ValueError(
+            "FlashInfer MegaMoE chunks must contain 1..128 real token rows; "
+            f"got {num_tokens}."
+        )
+    expected_hidden = (num_tokens, _FLASHINFER_MEGAMOE_HIDDEN_SIZE)
+    expected_topk = (num_tokens, _FLASHINFER_MEGAMOE_TOP_K)
+    if tuple(hidden_states.shape) != expected_hidden:
+        raise ValueError(
+            f"FlashInfer MegaMoE hidden chunk must have shape {expected_hidden}; "
+            f"got {tuple(hidden_states.shape)}."
+        )
+    if tuple(topk_ids.shape) != expected_topk:
+        raise ValueError(
+            f"FlashInfer MegaMoE topk_ids chunk must have shape {expected_topk}; "
+            f"got {tuple(topk_ids.shape)}."
+        )
+    if tuple(topk_weights.shape) != expected_topk:
+        raise ValueError(
+            f"FlashInfer MegaMoE topk_weights chunk must have shape {expected_topk}; "
+            f"got {tuple(topk_weights.shape)}."
+        )
+
+    hidden_buffer[:num_tokens].copy_(hidden_states)
+    topk_ids_buffer[:num_tokens].copy_(topk_ids)
+    topk_weights_buffer[:num_tokens].copy_(topk_weights)
+    if num_tokens < _FLASHINFER_MEGAMOE_TOKENS_PER_RANK:
+        hidden_buffer[num_tokens:].zero_()
+        topk_ids_buffer[num_tokens:].zero_()
+        topk_weights_buffer[num_tokens:].zero_()
+    return hidden_buffer, topk_ids_buffer, topk_weights_buffer
 
 
 def _run_mega_routed(
@@ -390,11 +480,13 @@ def build_flashinfer_megamoe_experts_weights(experts) -> None:
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
         FleetParams,
         MegaConfig,
         MoEEpLayer,
         MoEWeightPack,
-        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig,
     )
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
@@ -423,6 +515,24 @@ def build_flashinfer_megamoe_experts_weights(experts) -> None:
         raise ValueError(
             "FlashInfer MegaMoE requires an even, non-redundant expert partition."
         )
+    exact_geometry = {
+        "moe_ep_size": (experts.moe_ep_size, 8),
+        "num_experts": (experts.num_experts, 256),
+        "num_local_experts": (experts.num_local_experts, 32),
+        "hidden_size": (experts.hidden_size, _FLASHINFER_MEGAMOE_HIDDEN_SIZE),
+        "intermediate_size": (experts.intermediate_size_per_partition, 2048),
+        "top_k": (experts.top_k, _FLASHINFER_MEGAMOE_TOP_K),
+    }
+    for name, (actual, expected) in exact_geometry.items():
+        if actual != expected:
+            raise ValueError(
+                "FlashInfer rank-major MegaMoE requires "
+                f"{name}={expected}, got {actual}."
+            )
+    if config.swiglu_limit is not None:
+        raise ValueError(
+            "FlashInfer rank-major MegaMoE does not support a SwiGLU clamp."
+        )
     if (
         experts.w13_weight.dtype != torch.bfloat16
         or experts.w2_weight.dtype != torch.bfloat16
@@ -435,21 +545,21 @@ def build_flashinfer_megamoe_experts_weights(experts) -> None:
     bootstrap = BootstrapConfig(
         world_size=experts.moe_ep_size,
         rank=experts.moe_ep_rank,
-        stream=torch.cuda.current_stream().cuda_stream,
+        stream=0,
         process_group=ep_group,
         device=torch.cuda.current_device(),
     )
     fleet_params = FleetParams(
-        num_experts=experts.num_experts,
-        max_tokens_per_rank=(
-            get_exec().moe.flashinfer_megamoe_max_tokens_per_rank
-        ),
-        token_hidden_size=experts.hidden_size,
+        num_experts=256,
+        max_tokens_per_rank=_FLASHINFER_MEGAMOE_TOKENS_PER_RANK,
+        token_hidden_size=_FLASHINFER_MEGAMOE_HIDDEN_SIZE,
+        dtype_bytes=2,
+        algorithm=EpAlgorithm.LOW_LATENCY,
+        layout=EpLayout.RANK_MAJOR,
     )
-    kernel_config = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
-        intermediate_size=experts.intermediate_size_per_partition,
-        top_k=experts.top_k,
-        activation_clamp=config.swiglu_limit,
+    kernel_config = Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig(
+        intermediate_size=2048,
+        top_k=_FLASHINFER_MEGAMOE_TOP_K,
     )
     weights = MoEWeightPack(
         experts.w13_weight.detach(),
@@ -463,6 +573,36 @@ def build_flashinfer_megamoe_experts_weights(experts) -> None:
     )
 
     experts.flashinfer_megamoe_layer = flashinfer_layer
+    experts.register_buffer(
+        "_flashinfer_megamoe_hidden_buffer",
+        torch.empty(
+            _FLASHINFER_MEGAMOE_TOKENS_PER_RANK,
+            _FLASHINFER_MEGAMOE_HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            device=experts.w13_weight.device,
+        ),
+        persistent=False,
+    )
+    experts.register_buffer(
+        "_flashinfer_megamoe_topk_ids_buffer",
+        torch.empty(
+            _FLASHINFER_MEGAMOE_TOKENS_PER_RANK,
+            _FLASHINFER_MEGAMOE_TOP_K,
+            dtype=torch.int64,
+            device=experts.w13_weight.device,
+        ),
+        persistent=False,
+    )
+    experts.register_buffer(
+        "_flashinfer_megamoe_topk_weights_buffer",
+        torch.empty(
+            _FLASHINFER_MEGAMOE_TOKENS_PER_RANK,
+            _FLASHINFER_MEGAMOE_TOP_K,
+            dtype=torch.float32,
+            device=experts.w13_weight.device,
+        ),
+        persistent=False,
+    )
     experts._flashinfer_megamoe_weights_built = True
     experts._flashinfer_megamoe_warmed_up = False
     experts.register_parameter("w13_weight", None)

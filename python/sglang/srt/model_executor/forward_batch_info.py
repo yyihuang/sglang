@@ -311,7 +311,10 @@ def prefill_graph_tolerates_sum_len() -> bool:
     from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 
     backend = get_moe_a2a_backend()
-    if not (backend.is_megamoe() or backend.is_flashinfer_megamoe()):
+    # The fixed FlashInfer rank-major backend requires every EP rank to launch
+    # the same sequence of 128-row chunks.  Only legacy MegaMoE accepts the
+    # rank-local SUM_LEN replay contract here.
+    if not backend.is_megamoe():
         return False
     return not (is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled())
 
