@@ -57,12 +57,18 @@ class TestPrepareServerArgs(CustomTestCase):
                 "--moe-a2a-backend",
                 "flashinfer_megamoe",
                 "--flashinfer-megamoe-max-tokens-per-rank",
-                "512",
+                "128",
             ]
         )
         args.resolve_once()
         args.get_model_config = lambda: SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV3ForCausalLM"],
+                hidden_size=7168,
+                moe_intermediate_size=2048,
+                n_routed_experts=256,
+                num_experts_per_tok=8,
+            )
         )
         args._handle_a2a_moe()
 
@@ -71,8 +77,15 @@ class TestPrepareServerArgs(CustomTestCase):
         view = resolved_view(args)
         self.assertEqual(view.moe_a2a_backend, "flashinfer_megamoe")
         self.assertEqual(view.ep_size, 8)
-        self.assertEqual(view.flashinfer_megamoe_max_tokens_per_rank, 512)
+        self.assertEqual(view.flashinfer_megamoe_max_tokens_per_rank, 128)
         self.assertTrue(view.disable_shared_experts_fusion)
+        self.assertEqual(view.cuda_graph_config.decode.max_bs, 128)
+        self.assertTrue(
+            all(bs <= 128 for bs in view.cuda_graph_config.decode.bs)
+        )
+        self.assertEqual(
+            view.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
 
     def test_flashinfer_megamoe_rejects_non_owning_options(self):
         with self.assertRaisesRegex(ValueError, "owns dispatch, expert compute"):
@@ -82,7 +95,7 @@ class TestPrepareServerArgs(CustomTestCase):
                 moe_runner_backend="triton",
             ).resolve_once()
 
-        with self.assertRaisesRegex(ValueError, "must be positive"):
+        with self.assertRaisesRegex(ValueError, "fixed at 128"):
             ServerArgs(
                 model_path="dummy",
                 moe_a2a_backend="flashinfer_megamoe",
