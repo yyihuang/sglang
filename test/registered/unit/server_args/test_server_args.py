@@ -72,7 +72,8 @@ class TestPrepareServerArgs(CustomTestCase):
             )
         )
         args.resolve_once()
-        args._handle_cuda_graph_config()
+        args._parse_cuda_graph_config()
+        args._apply_flashinfer_megamoe_cuda_graph_adjustments()
         args._handle_a2a_moe()
 
         from sglang.srt.arg_groups.overrides import resolved_view
