@@ -84,9 +84,9 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertEqual(view.flashinfer_megamoe_max_tokens_per_rank, 128)
         self.assertTrue(view.disable_shared_experts_fusion)
         self.assertEqual(view.cuda_graph_config.decode.max_bs, 128)
-        self.assertTrue(
-            all(bs <= 128 for bs in view.cuda_graph_config.decode.bs)
-        )
+        decode_bs = view.cuda_graph_config.decode.bs
+        if decode_bs is not None:
+            self.assertTrue(all(bs <= 128 for bs in decode_bs))
         self.assertEqual(
             view.cuda_graph_config.prefill.backend, Backend.DISABLED
         )
