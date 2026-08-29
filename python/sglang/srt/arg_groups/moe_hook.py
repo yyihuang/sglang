@@ -464,7 +464,7 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
             "instance connector; load an unquantized model from a model path."
         )
 
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
     architectures = getattr(hf_config, "architectures", None) or []
     architecture = architectures[0] if architectures else None
