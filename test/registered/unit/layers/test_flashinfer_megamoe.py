@@ -215,8 +215,9 @@ class TestFlashInferMegaMoEFixedChunks(unittest.TestCase):
                 )
                 if num_tokens < 128:
                     self.assertEqual(hidden_buffer[num_tokens:].count_nonzero().item(), 0)
-                    self.assertEqual(
-                        topk_ids_buffer[num_tokens:].count_nonzero().item(), 0
+                    torch.testing.assert_close(
+                        topk_ids_buffer[num_tokens:],
+                        torch.full_like(topk_ids_buffer[num_tokens:], -1),
                     )
                     self.assertEqual(
                         topk_weights_buffer[num_tokens:].count_nonzero().item(), 0
