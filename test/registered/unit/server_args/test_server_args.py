@@ -111,6 +111,9 @@ class TestPrepareServerArgs(CustomTestCase):
         # The dummy-model path stops before model-aware resolution. Seed the
         # memo before resolution, then exercise the MoE handler explicitly.
         args._model_config = SimpleNamespace(
+            is_multimodal=False,
+            is_multimodal_breakable_cuda_graph_supported=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
             hf_config=SimpleNamespace(
                 architectures=["DeepseekV3ForCausalLM"],
                 hidden_size=7168,
