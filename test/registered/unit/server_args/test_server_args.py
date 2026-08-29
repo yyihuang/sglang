@@ -15,10 +15,8 @@ from sglang.srt.arg_groups.attention_hook import (
     handle_deterministic_inference,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
-    apply_flashinfer_megamoe_cuda_graph_adjustments,
     disable_tc_piecewise_cudagraph_if_incompatible,
     handle_cuda_graph_config,
-    parse_cuda_graph_config,
 )
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
@@ -122,8 +120,7 @@ class TestPrepareServerArgs(CustomTestCase):
             )
         )
         args.resolve_once()
-        parse_cuda_graph_config(args)
-        apply_flashinfer_megamoe_cuda_graph_adjustments(args)
+        handle_cuda_graph_config(args)
         handle_a2a_moe(args)
 
         from sglang.srt.arg_groups.overrides import resolved_view
