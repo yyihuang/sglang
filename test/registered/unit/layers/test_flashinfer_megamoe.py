@@ -185,7 +185,9 @@ class TestFlashInferMegaMoEFixedChunks(unittest.TestCase):
         topk_ids_buffer = torch.full((128, 8), -1, dtype=torch.int64)
         topk_weights_buffer = torch.full((128, 8), -1, dtype=torch.float32)
 
-        for num_tokens in (1, 127, 128):
+        # Start at the full shape, then shrink, so the partial cases prove that
+        # stale real hidden/weight rows survive while every tail route is masked.
+        for num_tokens in (128, 1, 127):
             with self.subTest(num_tokens=num_tokens):
                 hidden = torch.full(
                     (num_tokens, 7168), 3, dtype=torch.bfloat16
@@ -194,6 +196,8 @@ class TestFlashInferMegaMoEFixedChunks(unittest.TestCase):
                 topk_weights = torch.full(
                     (num_tokens, 8), 0.25, dtype=torch.float16
                 )
+                hidden_tail_before = hidden_buffer[num_tokens:].clone()
+                topk_weights_tail_before = topk_weights_buffer[num_tokens:].clone()
                 staged = _stage_flashinfer_megamoe_chunk(
                     hidden,
                     topk_ids,
@@ -214,13 +218,15 @@ class TestFlashInferMegaMoEFixedChunks(unittest.TestCase):
                     topk_weights_buffer[:num_tokens], topk_weights.to(torch.float32)
                 )
                 if num_tokens < 128:
-                    self.assertEqual(hidden_buffer[num_tokens:].count_nonzero().item(), 0)
+                    torch.testing.assert_close(
+                        hidden_buffer[num_tokens:], hidden_tail_before
+                    )
                     torch.testing.assert_close(
                         topk_ids_buffer[num_tokens:],
                         torch.full_like(topk_ids_buffer[num_tokens:], -1),
                     )
-                    self.assertEqual(
-                        topk_weights_buffer[num_tokens:].count_nonzero().item(), 0
+                    torch.testing.assert_close(
+                        topk_weights_buffer[num_tokens:], topk_weights_tail_before
                     )
 
     def test_stage_rejects_more_than_one_fixed_chunk(self):

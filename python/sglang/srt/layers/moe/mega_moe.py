@@ -307,11 +307,12 @@ def _stage_flashinfer_megamoe_chunk(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Copy one real-token chunk into the fixed rank-major input buffers.
 
-    The buffers are allocated during expert construction.  Copying and zeroing
-    are graph-recordable, so this helper adds no allocator work during capture.
-    Dummy rows use the generated dispatch kernel's negative expert-ID sentinel,
-    so they are excluded from routing and expert compute. Their weights remain
-    zero as a second, output-side safeguard.
+    The buffers are allocated during expert construction.  Prefix copies and
+    the expert-ID sentinel fill are graph-recordable, so this helper adds no
+    allocator work during capture. Dummy rows use the generated dispatch
+    kernel's negative expert-ID sentinel and are excluded from routing and
+    expert compute. Their hidden-state and weight tails are intentionally left
+    stale because dispatch ignores both whenever the expert ID is negative.
     """
     num_tokens = hidden_states.shape[0]
     if not 0 < num_tokens <= _FLASHINFER_MEGAMOE_TOKENS_PER_RANK:
@@ -341,9 +342,7 @@ def _stage_flashinfer_megamoe_chunk(
     topk_ids_buffer[:num_tokens].copy_(topk_ids)
     topk_weights_buffer[:num_tokens].copy_(topk_weights)
     if num_tokens < _FLASHINFER_MEGAMOE_TOKENS_PER_RANK:
-        hidden_buffer[num_tokens:].zero_()
         topk_ids_buffer[num_tokens:].fill_(-1)
-        topk_weights_buffer[num_tokens:].zero_()
     return hidden_buffer, topk_ids_buffer, topk_weights_buffer
 
 
