@@ -47,6 +47,15 @@ ARTIFACT_HASH_KEYS = {
 }
 
 
+def _server_hosts(binding: dict) -> dict[str, str]:
+    hosts = binding.get("server_hosts")
+    if not isinstance(hosts, dict) or set(hosts) != {"baseline", "candidate"}:
+        raise ValueError("server_hosts must contain exactly baseline and candidate")
+    if any(not isinstance(hosts[arm], str) or not hosts[arm].strip() for arm in hosts):
+        raise ValueError("server_hosts values must be nonempty strings")
+    return hosts
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -57,6 +66,7 @@ def _sha256(path: Path) -> str:
 
 def _server_command(binding: dict, arm: str) -> list[str]:
     backend = "triton" if arm == "baseline" else "flashinfer"
+    hosts = _server_hosts(binding)
     return [
         binding.get("python_executable", "python3"),
         "-m",
@@ -64,7 +74,7 @@ def _server_command(binding: dict, arm: str) -> list[str]:
         "--model-path",
         binding["model_path"],
         "--host",
-        binding.get("server_host", "127.0.0.1"),
+        hosts[arm],
         "--port",
         str(binding["ports"][arm]),
         "--tp-size",
@@ -110,6 +120,10 @@ def main() -> int:
         parser.error("compute_capability must be [10, 3]")
     if set(binding.get("ports", {})) != {"baseline", "candidate"}:
         parser.error("ports must contain exactly baseline and candidate")
+    try:
+        server_hosts = _server_hosts(binding)
+    except ValueError as exc:
+        parser.error(str(exc))
     artifacts = binding.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != set(ARTIFACT_HASH_KEYS):
         parser.error(f"artifacts must contain exactly {sorted(ARTIFACT_HASH_KEYS)}")
@@ -141,7 +155,7 @@ def main() -> int:
         "servers": {
             arm: {
                 "command": _server_command(binding, arm),
-                "base_url": f"http://{binding.get('server_host', '127.0.0.1')}:{binding['ports'][arm]}",
+                "base_url": f"http://{server_hosts[arm]}:{binding['ports'][arm]}",
                 "pythonpath_prepend": binding["flashinfer_python_path"] if arm == "candidate" else None,
                 "rank_logs": binding["rank_logs"][arm],
             }

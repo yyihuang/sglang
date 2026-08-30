@@ -15,6 +15,7 @@ from tools.gdn_public_qualification.contract import (
     audit_receipt,
     expected_provenance,
 )
+from tools.gdn_public_qualification.render_plan import _server_command, _server_hosts
 
 
 def _prompt_rows(correct_count: int) -> list[dict]:
@@ -195,6 +196,39 @@ class QualificationContractTest(unittest.TestCase):
         receipt["performance"]["workloads"][1]["observations"] = _observations(1.30)
         with self.assertRaisesRegex(QualificationError, "resolved regression"):
             audit_receipt(receipt)
+
+    def test_09_server_hosts_are_per_arm_and_fail_closed(self):
+        binding = {
+            "server_hosts": {
+                "baseline": "gb300-a.internal",
+                "candidate": "gb300-b.internal",
+            },
+            "ports": {"baseline": 31000, "candidate": 31001},
+            "model_path": "/model",
+        }
+        self.assertEqual(
+            _server_hosts(binding),
+            {"baseline": "gb300-a.internal", "candidate": "gb300-b.internal"},
+        )
+        baseline = _server_command(binding, "baseline")
+        candidate = _server_command(binding, "candidate")
+        self.assertEqual(baseline[baseline.index("--host") + 1], "gb300-a.internal")
+        self.assertEqual(candidate[candidate.index("--host") + 1], "gb300-b.internal")
+
+        invalid_hosts = (
+            None,
+            {"baseline": "gb300-a.internal"},
+            {
+                "baseline": "gb300-a.internal",
+                "candidate": "gb300-b.internal",
+                "extra": "gb300-c.internal",
+            },
+            {"baseline": "", "candidate": "gb300-b.internal"},
+            {"baseline": "gb300-a.internal", "candidate": 7},
+        )
+        for hosts in invalid_hosts:
+            with self.subTest(hosts=hosts), self.assertRaises(ValueError):
+                _server_hosts({"server_hosts": hosts})
 
 
 if __name__ == "__main__":

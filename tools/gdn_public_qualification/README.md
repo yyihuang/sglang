@@ -17,6 +17,11 @@ emits a private plan and pins:
 - TP4 ranks 0–3 on compute capability 10.3 in the named container and model
   revision.
 
+The private binding names separate `server_hosts.baseline` and
+`server_hosts.candidate` values. This represents the required two-node layout:
+one resident TP4 server on each four-GPU GB300 node, so ABBA observations
+alternate between already-loaded arms instead of including model-reload time.
+
 ## Campaign shape
 
 The control server uses the Triton prefill and decode backends. The candidate
@@ -50,8 +55,8 @@ routes. Missing route evidence fails closed.
 
 Create a private binding JSON with the staged model directory, the exact paths
 for every key in `render_plan.ARTIFACT_HASH_KEYS`, separate baseline/candidate
-ports and rank-log paths, the candidate FlashInfer Python path, CUDA version,
-GPU name, and container image. Then, inside the allocated compute job:
+hosts, ports, and rank-log paths, the candidate FlashInfer Python path, CUDA
+version, GPU name, and container image. Then, inside the allocated compute job:
 
 ```bash
 python -m tools.gdn_public_qualification.render_plan bindings.json --output plan.json
