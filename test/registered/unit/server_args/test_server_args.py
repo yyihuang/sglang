@@ -120,6 +120,7 @@ class TestPrepareServerArgs(CustomTestCase):
             is_multimodal=False,
             is_multimodal_breakable_cuda_graph_supported=False,
             is_multimodal_piecewise_cuda_graph_supported=False,
+            is_piecewise_cuda_graph_disabled_model=False,
             hf_config=SimpleNamespace(
                 architectures=["DeepseekV3ForCausalLM"],
                 hidden_size=7168,
