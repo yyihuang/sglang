@@ -228,6 +228,7 @@ class TestFlashInferMegaMoEActiveChunks(unittest.TestCase):
                 "sglang.srt.layers.moe.mega_moe.ExpertLocationDispatchInfo.init_new",
                 return_value=object(),
             ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
         ):
             output = _run_flashinfer_mega_routed(moe, hidden, None, None, num_tokens)
 
