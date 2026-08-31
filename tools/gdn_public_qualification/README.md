@@ -41,13 +41,31 @@ route markers, this proves that the campaign exercised the real MTP/target-
 verify server configuration rather than merely declaring it in a plan.
 
 For each arm, `collect.py accuracy` runs all 1,314 GSM8K prompts once. The KL
-client records baseline output-token log probabilities for all 48 sealed helper
-prompts, then scores those exact token sequences on the candidate. The resulting
-`exp(logr) - 1 - logr` quantity is SGLang's historical log-ratio surrogate, not
-a full-vocabulary KL divergence. The receipt names it
-`max_sample_sglang_logratio_surrogate`; the auditor recomputes every per-sample
-mean and applies the unchanged exclusive `0.0035` gate to the maximum of the 48
-samples. It also reports the campaign mean for continuity.
+reference command separately generates 512 fixed output token IDs for each of
+the 48 sealed helper prompts. It then teacher-forces those sequences on the
+baseline; the candidate command teacher-forces the identical prompt and output
+IDs. At every scored output position, both commands request `token_ids_logprob`
+for ascending token IDs `0..vocab_size-1`. Requests are split into fixed 8,192-
+ID transport chunks, but every chunk is retained in hash-addressed little-
+endian float32 shards. This is complete vocabulary coverage, not selected-token
+evidence and not a top-k approximation.
+
+The collector fails closed unless `/server_info` reports TP4 and `/model_info`
+matches the exact model and tokenizer paths bound into the plan. The two
+manifests must also share the sealed model-manifest hash, vocabulary size,
+token-ID order, prompt hashes, output-token hashes, scored positions, and shard
+boundaries. Every returned token ID must equal the requested ID, every log
+probability must be finite, and each position's complete probability mass must
+be within `5e-4` of one.
+
+The metric is the forward full-distribution divergence
+`D_KL(P_baseline || Q_candidate)`. The auditor reads and hashes both sets of raw
+shards, independently rechecks alignment and normalization, and computes a KL
+value at every token position. It takes the arithmetic mean over positions in
+each sealed sample, then applies the unchanged strict `< 0.0035` gate to the
+maximum of the 48 sample means. The receipt and audit also report the mean of
+the sample means and the maximum individual-position KL; neither replaces the
+maximum-sample gate.
 
 Each throughput workload follows `baseline, candidate, candidate, baseline`
 four times, producing eight observations per arm per workload. An observation
@@ -104,17 +122,36 @@ launch servers or alter route, accuracy, KL, or performance acceptance gates.
 
 ## Use
 
-Create a private binding JSON with the staged model directory, the exact paths
-for every key in `render_plan.ARTIFACT_HASH_KEYS`, separate baseline/candidate
-hosts, ports, and rank-log paths, the candidate FlashInfer Python path, CUDA
-version, GPU name, and container image. Then, inside the allocated compute job:
+Create a private binding JSON with the staged model and tokenizer directories,
+the tokenizer vocabulary size, the exact paths for every key in
+`render_plan.ARTIFACT_HASH_KEYS`, separate baseline/candidate hosts, ports, and
+rank-log paths, the candidate FlashInfer Python path, CUDA version, GPU name,
+and container image. Then, inside the allocated compute job:
 
 ```bash
 python -m tools.gdn_public_qualification.render_plan bindings.json --output plan.json
 python -m tools.gdn_public_qualification.collect mtp-probe --help
-python -m tools.gdn_public_qualification.collect --help
+python -m tools.gdn_public_qualification.collect kl-reference \
+  --base-url "$BASELINE_URL" --input-ids "$LONG48_IDS" \
+  --input-ids-sha256 "$LONG48_SHA256" --model-path "$MODEL_PATH" \
+  --tokenizer-path "$TOKENIZER_PATH" --vocab-size "$VOCAB_SIZE" \
+  --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
+  --output kl-baseline-manifest.json
+python -m tools.gdn_public_qualification.collect kl-candidate \
+  --base-url "$CANDIDATE_URL" --reference kl-baseline-manifest.json \
+  --input-ids "$LONG48_IDS" --input-ids-sha256 "$LONG48_SHA256" \
+  --model-path "$MODEL_PATH" --tokenizer-path "$TOKENIZER_PATH" \
+  --vocab-size "$VOCAB_SIZE" \
+  --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
+  --output kl-candidate-manifest.json
 python -m tools.gdn_public_qualification.audit result.json --output audit.json
 ```
+
+`result.json` references each KL manifest with a path relative to the result
+file and its SHA256. Keep each manifest beside its generated `.shards`
+directory. The auditor resolves only safe relative paths below the result
+directory and refuses missing, reused, truncated, re-ordered, or hash-drifted
+distribution evidence.
 
 Keep `bindings.json`, `plan.json`, raw model outputs, rank logs, results, and the
 audit receipt in the durable campaign evidence directory. Record their SHA256

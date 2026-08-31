@@ -23,7 +23,7 @@ def main() -> int:
     raw = args.receipt.read_bytes()
     receipt = json.loads(raw)
     try:
-        audit = audit_receipt(receipt)
+        audit = audit_receipt(receipt, args.receipt.resolve().parent)
     except QualificationError as exc:
         parser.error(str(exc))
     audit["receipt_sha256"] = hashlib.sha256(raw).hexdigest()

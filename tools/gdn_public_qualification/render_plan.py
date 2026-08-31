@@ -18,7 +18,13 @@ from tools.gdn_public_qualification.contract import (
     FLASHINFER_COMMIT,
     HASHES,
     KL_SAMPLE_COUNT,
+    KL_DIRECTION,
     KL_METRIC,
+    KL_NORMALIZATION_ATOL,
+    KL_POSITION_AGGREGATION,
+    KL_SAMPLE_AGGREGATION,
+    KL_TOKEN_ID_ORDER,
+    KL_VOCAB_CHUNK_SIZE,
     MAX_KL_EXCLUSIVE,
     MIN_SCORE,
     MODEL_ID,
@@ -71,6 +77,24 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _model_vocab_size(model_path: Path) -> int:
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"staged model config is missing: {config_path}")
+    try:
+        config = json.loads(config_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"staged model config is not valid JSON: {config_path}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"staged model config must be an object: {config_path}")
+    vocab_size = config.get("vocab_size")
+    if vocab_size is None and isinstance(config.get("text_config"), dict):
+        vocab_size = config["text_config"].get("vocab_size")
+    if type(vocab_size) is not int or vocab_size <= 1:
+        raise ValueError("staged model config has no valid vocabulary size")
+    return vocab_size
+
+
 def _server_command(binding: dict, arm: str) -> list[str]:
     backend = "triton" if arm == "baseline" else "flashinfer"
     hosts = _server_hosts(binding)
@@ -80,6 +104,8 @@ def _server_command(binding: dict, arm: str) -> list[str]:
         "sglang.launch_server",
         "--model-path",
         binding["model_path"],
+        "--tokenizer-path",
+        binding["tokenizer_path"],
         "--host",
         hosts[arm],
         "--port",
@@ -131,6 +157,21 @@ def main() -> int:
     ).stdout.strip()
     if not isinstance(binding.get("model_path"), str) or not Path(binding["model_path"]).is_dir():
         parser.error("model_path must name the staged model directory")
+    if not isinstance(binding.get("tokenizer_path"), str) or not Path(binding["tokenizer_path"]).is_dir():
+        parser.error("tokenizer_path must name the staged tokenizer directory")
+    if Path(binding["tokenizer_path"]).resolve() != Path(binding["model_path"]).resolve():
+        parser.error("tokenizer_path must be the tokenizer inside the sealed model directory")
+    if type(binding.get("vocab_size")) is not int or binding["vocab_size"] <= 1:
+        parser.error("vocab_size must be an integer > 1")
+    try:
+        configured_vocab_size = _model_vocab_size(Path(binding["model_path"]))
+    except ValueError as exc:
+        parser.error(str(exc))
+    if binding["vocab_size"] != configured_vocab_size:
+        parser.error(
+            f"vocab_size {binding['vocab_size']} != staged model config value "
+            f"{configured_vocab_size}"
+        )
     if binding.get("container_image") != CONTAINER_IMAGE:
         parser.error(f"container_image must be {CONTAINER_IMAGE}")
     if binding.get("compute_capability") != [10, 3]:
@@ -191,8 +232,19 @@ def main() -> int:
             "input_ids": artifacts["longbench_first48_ids"],
             "sample_count": KL_SAMPLE_COUNT,
             "metric": KL_METRIC,
-            "aggregation": "maximum_across_48_sealed_samples",
+            "direction": KL_DIRECTION,
+            "position_aggregation": KL_POSITION_AGGREGATION,
+            "sample_aggregation": KL_SAMPLE_AGGREGATION,
             "maximum_exclusive": MAX_KL_EXCLUSIVE,
+            "full_vocabulary_per_scored_position": True,
+            "top_k_truncation_allowed": False,
+            "vocab_size": binding["vocab_size"],
+            "token_id_order": KL_TOKEN_ID_ORDER,
+            "vocab_chunk_size": KL_VOCAB_CHUNK_SIZE,
+            "normalization_atol": KL_NORMALIZATION_ATOL,
+            "model_path": binding["model_path"],
+            "tokenizer_path": binding["tokenizer_path"],
+            "tokenizer_authority_sha256": HASHES["model_manifest_sha256"],
         },
         "mtp_probe": {
             "arms": ["baseline", "candidate"],

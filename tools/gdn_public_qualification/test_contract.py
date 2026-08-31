@@ -4,16 +4,26 @@ import copy
 import hashlib
 import json
 import math
+import struct
+import tempfile
 import unittest
+from pathlib import Path
 
-from tools.gdn_public_qualification.collect import ROUTE_RE
+from tools.gdn_public_qualification.collect import ROUTE_RE, _extract_distribution_rows
 from tools.gdn_public_qualification.contract import (
     ABBA_ORDER,
     BOOTSTRAP_SAMPLES,
     BOOTSTRAP_SEED,
     EXACT_T4_ROUTE,
     HASHES,
+    KL_DIRECTION,
+    KL_DISTRIBUTION_SCHEMA,
     KL_METRIC,
+    KL_NORMALIZATION_ATOL,
+    KL_POSITION_AGGREGATION,
+    KL_SAMPLE_AGGREGATION,
+    KL_TOKEN_ID_ORDER,
+    KL_VOCAB_CHUNK_SIZE,
     MTP_PROBE_MAX_NEW_TOKENS,
     MTP_PROBE_PROMPT_INDEX,
     MTP_SPECULATIVE_EAGLE_TOPK,
@@ -94,7 +104,89 @@ def _mtp_probe_arm(arm: str) -> dict:
     }
 
 
-def _receipt() -> dict:
+def _write_json(path: Path, value: object) -> str:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_kl_evidence(
+    root: Path,
+    baseline_probabilities: tuple[float, float] = (0.5, 0.5),
+    candidate_probabilities: tuple[float, float] = (0.5, 0.5),
+) -> tuple[dict[str, dict[str, str]], float]:
+    root.mkdir(parents=True)
+    manifest_specs = {}
+    baseline_manifest_sha = None
+    float_rows = {}
+    for arm, probabilities in (
+        ("baseline", baseline_probabilities),
+        ("candidate", candidate_probabilities),
+    ):
+        arm_root = root / arm
+        shard_root = arm_root / "shards"
+        shard_root.mkdir(parents=True)
+        logprobs = tuple(math.log(value) for value in probabilities)
+        float_rows[arm] = struct.unpack("<2f", struct.pack("<2f", *logprobs))
+        records = []
+        for sample_index in range(48):
+            shard_path = shard_root / f"sample-{sample_index:03d}.f32le"
+            shard_path.write_bytes(struct.pack("<2f", *logprobs))
+            output_ids = [1]
+            records.append(
+                {
+                    "sample_index": sample_index,
+                    "input_ids_sha256": hashlib.sha256(f"input-{sample_index}".encode()).hexdigest(),
+                    "output_ids": output_ids,
+                    "output_ids_sha256": hashlib.sha256(json.dumps(output_ids, separators=(",", ":")).encode()).hexdigest(),
+                    "position_count": 1,
+                    "shards": [
+                        {
+                            "path": f"shards/{shard_path.name}",
+                            "token_start": 0,
+                            "token_end": 2,
+                            "shape": [1, 2],
+                            "byte_count": 8,
+                            "sha256": hashlib.sha256(shard_path.read_bytes()).hexdigest(),
+                        }
+                    ],
+                }
+            )
+        manifest = {
+            "schema": KL_DISTRIBUTION_SCHEMA,
+            "arm": arm,
+            "sample_count": 48,
+            "input_ids_sha256": HASHES["longbench_first48_ids_sha256"],
+            "model_manifest_sha256": HASHES["model_manifest_sha256"],
+            "model_path": "/sealed/model",
+            "tokenizer_path": "/sealed/model",
+            "vocab_size": 2,
+            "token_id_order": KL_TOKEN_ID_ORDER,
+            "dtype": "float32",
+            "byte_order": "little",
+            "normalization_atol": KL_NORMALIZATION_ATOL,
+            "vocab_chunk_size": KL_VOCAB_CHUNK_SIZE,
+            "records": records,
+        }
+        if arm == "candidate":
+            manifest["reference_manifest_sha256"] = baseline_manifest_sha
+        manifest_path = arm_root / "manifest.json"
+        digest = _write_json(manifest_path, manifest)
+        if arm == "baseline":
+            baseline_manifest_sha = digest
+        manifest_specs[f"{arm}_manifest"] = {
+            "path": str(manifest_path.relative_to(root)),
+            "sha256": digest,
+        }
+    baseline_values = float_rows["baseline"]
+    candidate_values = float_rows["candidate"]
+    kl_value = sum(
+        math.exp(p_value) * (p_value - q_value)
+        for p_value, q_value in zip(baseline_values, candidate_values)
+    )
+    return manifest_specs, max(0.0, kl_value)
+
+
+def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict:
     provenance = expected_provenance()
     provenance.update(
         {
@@ -126,16 +218,13 @@ def _receipt() -> dict:
             },
             "kl": {
                 "metric": KL_METRIC,
-                "mean_kl": 0.0,
-                "max_kl": 0.0,
-                "records": [
-                    {
-                        "sample_index": index,
-                        "baseline_logprobs": [0.0, -1.0],
-                        "candidate_logprobs": [0.0, -1.0],
-                    }
-                    for index in range(48)
-                ],
+                "direction": KL_DIRECTION,
+                "position_aggregation": KL_POSITION_AGGREGATION,
+                "sample_aggregation": KL_SAMPLE_AGGREGATION,
+                "mean_sample_kl": kl_value,
+                "max_sample_kl": kl_value,
+                "max_position_kl": kl_value,
+                **kl_specs,
             },
         },
         "mtp_probe": {
@@ -201,42 +290,67 @@ def _receipt() -> dict:
 
 
 class QualificationContractTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_directory = tempfile.TemporaryDirectory()
+        self.evidence_root = Path(self.temp_directory.name)
+        self.kl_specs, self.kl_value = _write_kl_evidence(self.evidence_root / "default")
+
+    def tearDown(self):
+        self.temp_directory.cleanup()
+
+    def _audit(self, receipt: dict, root: Path | None = None) -> dict:
+        return audit_receipt(receipt, root or (self.evidence_root / "default"))
+
+    def _rewrite_manifest(self, arm: str, mutate) -> None:
+        root = self.evidence_root / "default"
+        spec = self.kl_specs[f"{arm}_manifest"]
+        path = root / spec["path"]
+        manifest = json.loads(path.read_text())
+        mutate(manifest)
+        spec["sha256"] = _write_json(path, manifest)
+        if arm == "baseline":
+            candidate_spec = self.kl_specs["candidate_manifest"]
+            candidate_path = root / candidate_spec["path"]
+            candidate = json.loads(candidate_path.read_text())
+            candidate["reference_manifest_sha256"] = spec["sha256"]
+            candidate_spec["sha256"] = _write_json(candidate_path, candidate)
+
     def test_01_complete_receipt_passes(self):
-        audit = audit_receipt(_receipt())
+        audit = self._audit(_receipt(self.kl_specs, self.kl_value))
         self.assertTrue(audit["passed"])
         self.assertAlmostEqual(audit["performance"]["aggregate_geomean"], 1.10)
 
     def test_02_provenance_drift_fails_closed(self):
-        receipt = _receipt()
+        receipt = _receipt(self.kl_specs, self.kl_value)
         receipt["provenance"]["flashinfer_commit"] = "b" * 40
         with self.assertRaisesRegex(QualificationError, "flashinfer_commit"):
-            audit_receipt(receipt)
+            self._audit(receipt)
 
     def test_03_prompt_exactly_once_gate(self):
-        receipt = _receipt()
+        receipt = _receipt(self.kl_specs, self.kl_value)
         receipt["accuracy"]["arms"]["candidate"]["prompts"][37]["request_count"] = 2
         with self.assertRaisesRegex(QualificationError, "exactly once"):
-            audit_receipt(receipt)
+            self._audit(receipt)
 
     def test_04_score_no_drop_and_kl_gates(self):
         with self.subTest("candidate score drop"):
-            receipt = _receipt()
+            receipt = _receipt(self.kl_specs, self.kl_value)
             receipt["accuracy"]["arms"]["baseline"] = _accuracy_arm(1224)
             with self.assertRaisesRegex(QualificationError, "accuracy dropped"):
-                audit_receipt(receipt)
+                self._audit(receipt)
         with self.subTest("KL threshold"):
-            receipt = _receipt()
-            value = math.exp(0.1) - 1.0 - 0.1
-            row = receipt["accuracy"]["kl"]["records"][0]
-            row["baseline_logprobs"] = [0.0]
-            row["candidate_logprobs"] = [-0.1]
-            receipt["accuracy"]["kl"]["mean_kl"] = value / 48
-            receipt["accuracy"]["kl"]["max_kl"] = value
-            with self.assertRaisesRegex(QualificationError, "maximum sample .*not < 0.0035"):
-                audit_receipt(receipt)
+            threshold_root = self.evidence_root / "threshold"
+            specs, value = _write_kl_evidence(
+                threshold_root,
+                baseline_probabilities=(0.5, 0.5),
+                candidate_probabilities=(0.55, 0.45),
+            )
+            receipt = _receipt(specs, value)
+            with self.assertRaisesRegex(QualificationError, "maximum sample full-vocabulary KL .*not < 0.0035"):
+                self._audit(receipt, threshold_root)
 
     def test_05_tp4_exact_route_and_zero_baseline_gate(self):
-        receipt = _receipt()
+        receipt = _receipt(self.kl_specs, self.kl_value)
         baseline_rank = receipt["routes"]["arms"]["baseline"][2]
         baseline_rank["decode_routes"] = [EXACT_T4_ROUTE]
         baseline_rank["route_observations"] = [
@@ -249,10 +363,10 @@ class QualificationContractTest(unittest.TestCase):
         ]
         baseline_rank["marker_count"] = 1
         with self.assertRaisesRegex(QualificationError, "baseline rank 2 recorded optimized"):
-            audit_receipt(receipt)
+            self._audit(receipt)
 
     def test_06_candidate_must_prove_exact_t4_route(self):
-        receipt = _receipt()
+        receipt = _receipt(self.kl_specs, self.kl_value)
         receipt["routes"]["arms"]["candidate"][1]["route_observations"] = [
             {
                 "route": receipt["routes"]["expected_candidate_routes"]["prefill"][0],
@@ -262,35 +376,35 @@ class QualificationContractTest(unittest.TestCase):
             }
         ]
         with self.assertRaisesRegex(QualificationError, "exact optimized T=4 route"):
-            audit_receipt(receipt)
+            self._audit(receipt)
 
     def test_07_mtp_probe_requires_exact_resolved_server_config(self):
-        receipt = _receipt()
+        receipt = _receipt(self.kl_specs, self.kl_value)
         receipt["mtp_probe"]["arms"]["candidate"]["server_config"][
             "linear_attn_verify_backend"
         ] = "triton"
         with self.assertRaisesRegex(QualificationError, "server configuration differs"):
-            audit_receipt(receipt)
+            self._audit(receipt)
 
     def test_08_abba_eight_observations_gate(self):
-        receipt = _receipt()
+        receipt = _receipt(self.kl_specs, self.kl_value)
         receipt["performance"]["workloads"][0]["observations"][1]["arm"] = "baseline"
         with self.assertRaisesRegex(QualificationError, "ABBA"):
-            audit_receipt(receipt)
+            self._audit(receipt)
 
     def test_09_aggregate_geomean_and_lower_ci_gate(self):
-        receipt = _receipt()
+        receipt = _receipt(self.kl_specs, self.kl_value)
         for workload in receipt["performance"]["workloads"]:
             workload["observations"] = _observations(1.0)
         with self.assertRaisesRegex(QualificationError, "geomean .* is not > 1"):
-            audit_receipt(receipt)
+            self._audit(receipt)
 
     def test_10_resolved_workload_regression_gate(self):
-        receipt = _receipt()
+        receipt = _receipt(self.kl_specs, self.kl_value)
         receipt["performance"]["workloads"][0]["observations"] = _observations(0.95)
         receipt["performance"]["workloads"][1]["observations"] = _observations(1.30)
         with self.assertRaisesRegex(QualificationError, "resolved regression"):
-            audit_receipt(receipt)
+            self._audit(receipt)
 
     def test_11_server_hosts_are_per_arm_and_fail_closed(self):
         binding = {
@@ -300,6 +414,7 @@ class QualificationContractTest(unittest.TestCase):
             },
             "ports": {"baseline": 31000, "candidate": 31001},
             "model_path": "/model",
+            "tokenizer_path": "/model",
         }
         self.assertEqual(
             _server_hosts(binding),
@@ -357,6 +472,82 @@ class QualificationContractTest(unittest.TestCase):
                 "phase=decode t=4 gates_present=True"
             )
         )
+
+    def test_13_full_vocabulary_coverage_fails_closed(self):
+        self._rewrite_manifest(
+            "baseline",
+            lambda manifest: manifest["records"][0]["shards"][0].update(
+                {"token_end": 1, "shape": [1, 1], "byte_count": 4}
+            ),
+        )
+        with self.assertRaisesRegex(QualificationError, "does not cover the full vocabulary"):
+            self._audit(_receipt(self.kl_specs, self.kl_value))
+
+    def test_14_tokenizer_and_position_alignment_fail_closed(self):
+        with self.subTest("tokenizer"):
+            self._rewrite_manifest(
+                "candidate",
+                lambda manifest: manifest.update({"tokenizer_path": "/different/tokenizer"}),
+            )
+            with self.assertRaisesRegex(QualificationError, "tokenizer_path alignment differs"):
+                self._audit(_receipt(self.kl_specs, self.kl_value))
+
+        # setUp is not re-entered between subtests, so restore fresh evidence in
+        # a separate root for the independent position-alignment case.
+        position_root = self.evidence_root / "position"
+        specs, value = _write_kl_evidence(position_root)
+        candidate_path = position_root / specs["candidate_manifest"]["path"]
+        candidate = json.loads(candidate_path.read_text())
+        candidate["records"][0]["output_ids"] = [0]
+        candidate["records"][0]["output_ids_sha256"] = hashlib.sha256(b"[0]").hexdigest()
+        specs["candidate_manifest"]["sha256"] = _write_json(candidate_path, candidate)
+        with self.assertRaisesRegex(QualificationError, "output_ids_sha256 alignment differs"):
+            self._audit(_receipt(specs, value), position_root)
+
+    def test_15_probability_mass_must_be_normalized(self):
+        mass_root = self.evidence_root / "mass"
+        specs, value = _write_kl_evidence(
+            mass_root,
+            baseline_probabilities=(0.4, 0.4),
+            candidate_probabilities=(0.4, 0.4),
+        )
+        with self.assertRaisesRegex(QualificationError, "baseline probability mass .* is not normalized"):
+            self._audit(_receipt(specs, value), mass_root)
+
+    def test_16_kl_direction_and_aggregation_are_exact(self):
+        for key, invalid in (
+            ("direction", "Q_candidate||P_baseline"),
+            ("position_aggregation", "maximum_over_positions"),
+            ("sample_aggregation", "mean_across_samples"),
+        ):
+            with self.subTest(key=key):
+                receipt = _receipt(self.kl_specs, self.kl_value)
+                receipt["accuracy"]["kl"][key] = invalid
+                with self.assertRaisesRegex(QualificationError, key.replace("_", " ")):
+                    self._audit(receipt)
+
+    def test_17_distribution_shard_hash_drift_fails_closed(self):
+        shard = self.evidence_root / "default" / "baseline" / "shards" / "sample-000.f32le"
+        shard.write_bytes(struct.pack("<2f", math.log(0.6), math.log(0.4)))
+        with self.assertRaisesRegex(QualificationError, "shard 0 SHA256 mismatch"):
+            self._audit(_receipt(self.kl_specs, self.kl_value))
+
+    def test_18_collector_requires_exact_requested_token_ids(self):
+        result = {
+            "meta_info": {
+                "input_token_logprobs": [[math.log(0.5), 1, None]],
+                "input_token_ids_logprobs": [
+                    [[math.log(0.5), 0, None], [math.log(0.5), 1, None]]
+                ],
+            }
+        }
+        self.assertEqual(
+            _extract_distribution_rows(result, [1], 0, 2, 0),
+            [[math.log(0.5), math.log(0.5)]],
+        )
+        result["meta_info"]["input_token_ids_logprobs"][0].pop()
+        with self.assertRaisesRegex(ValueError, "vocabulary row is incomplete"):
+            _extract_distribution_rows(result, [1], 0, 2, 0)
 
 
 if __name__ == "__main__":

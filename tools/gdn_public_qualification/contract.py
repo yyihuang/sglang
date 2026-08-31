@@ -12,11 +12,14 @@ import json
 import math
 import random
 import re
+import struct
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
-SCHEMA = "gdn-public-qualification-result-v1"
-PLAN_SCHEMA = "gdn-public-qualification-plan-v1"
+SCHEMA = "gdn-public-qualification-result-v2"
+PLAN_SCHEMA = "gdn-public-qualification-plan-v2"
 ROUTE_ARTIFACT_SCHEMA = "gdn-noncp-final-sglang-route-artifact-v1"
+KL_DISTRIBUTION_SCHEMA = "gdn-full-vocabulary-logprob-distribution-v1"
 
 SGLANG_INTEGRATION_COMMIT = "d1aeb7785547d6de57ff9b199662726664af8099"
 SGLANG_INTEGRATION_TREE = "5e9a389267abe5e7354f7730dc022a2d0f4b0e3d"
@@ -61,7 +64,14 @@ GSM8K_SHOTS = 5
 MIN_SCORE = 0.93
 MAX_KL_EXCLUSIVE = 0.0035
 KL_SAMPLE_COUNT = 48
-KL_METRIC = "max_sample_sglang_logratio_surrogate"
+KL_METRIC = "full_vocabulary_forward_kl_p_baseline_q_candidate"
+KL_DIRECTION = "P_baseline||Q_candidate"
+KL_POSITION_AGGREGATION = "arithmetic_mean_over_scored_positions_per_sample"
+KL_SAMPLE_AGGREGATION = "maximum_across_48_sealed_samples"
+KL_TOKEN_ID_ORDER = "ascending_integer_ids_0_to_vocab_size_minus_1"
+KL_VOCAB_CHUNK_SIZE = 8192
+KL_NORMALIZATION_ATOL = 5e-4
+KL_NEGATIVE_ATOL = 1e-6
 TP_SIZE = 4
 TP_RANKS = [0, 1, 2, 3]
 MTP_PROBE_PROMPT_INDEX = 0
@@ -95,6 +105,7 @@ BOOTSTRAP_SAMPLES = 20_000
 BOOTSTRAP_SEED = 2026083001
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ROUTE_RE = {
     "prefill": re.compile(
         r"^flashinfer\.gdn_prefill\.noncp\.[a-z0-9_.-]+$"
@@ -198,44 +209,187 @@ def _validate_prompt_rows(rows: object, arm: str) -> float:
     return sum(scores) / PROMPT_COUNT
 
 
-def _recompute_kl(kl: Mapping[str, object]) -> list[float]:
-    """Return the existing SGLang log-ratio surrogate for each sealed sample.
+def _resolve_evidence_path(root: Path, value: object, label: str) -> Path:
+    require(isinstance(value, str) and bool(value), f"{label} path is required")
+    relative = Path(value)
+    require(not relative.is_absolute() and ".." not in relative.parts, f"{label} path must be a safe relative path")
+    resolved_root = root.resolve()
+    resolved = (resolved_root / relative).resolve()
+    require(resolved.is_relative_to(resolved_root), f"{label} path escapes the evidence root")
+    require(resolved.is_file(), f"missing {label} file {relative}")
+    return resolved
 
-    For one output-token log-probability pair, the source implementation uses
-    ``exp(log_p - log_q) - 1 - (log_p - log_q)``.  Each sample is the mean of
-    those terms over its output tokens.  This is not full-vocabulary P||Q, so
-    the metric is named explicitly and the acceptance gate uses the maximum
-    sample rather than the historically weaker mean across all 48 samples.
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _load_kl_manifest(spec: object, evidence_root: Path, arm: str) -> tuple[dict, Path]:
+    require(isinstance(spec, Mapping), f"{arm} KL manifest reference must be an object")
+    path = _resolve_evidence_path(evidence_root, spec.get("path"), f"{arm} KL manifest")
+    expected_sha = spec.get("sha256")
+    require(isinstance(expected_sha, str) and bool(_SHA256_RE.fullmatch(expected_sha)), f"{arm} KL manifest SHA256 is required")
+    require(_file_sha256(path) == expected_sha, f"{arm} KL manifest SHA256 mismatch")
+    try:
+        manifest = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QualificationError(f"{arm} KL manifest is not valid JSON") from exc
+    require(isinstance(manifest, dict), f"{arm} KL manifest must be an object")
+    require(manifest.get("schema") == KL_DISTRIBUTION_SCHEMA, f"{arm} KL distribution schema differs")
+    require(manifest.get("arm") == arm, f"{arm} KL manifest arm differs")
+    return manifest, path.parent
+
+
+def _validate_kl_manifest_identity(manifest: Mapping[str, object], arm: str) -> None:
+    require(manifest.get("sample_count") == KL_SAMPLE_COUNT, f"{arm} KL sample count must be 48")
+    require(manifest.get("input_ids_sha256") == HASHES["longbench_first48_ids_sha256"], f"{arm} KL input IDs hash mismatch")
+    require(manifest.get("token_id_order") == KL_TOKEN_ID_ORDER, f"{arm} KL token-ID order differs")
+    require(manifest.get("dtype") == "float32", f"{arm} KL dtype must be float32")
+    require(manifest.get("byte_order") == "little", f"{arm} KL byte order must be little")
+    require(manifest.get("normalization_atol") == KL_NORMALIZATION_ATOL, f"{arm} KL normalization tolerance differs")
+    require(manifest.get("vocab_chunk_size") == KL_VOCAB_CHUNK_SIZE, f"{arm} KL vocabulary chunk size differs")
+    require(manifest.get("model_manifest_sha256") == HASHES["model_manifest_sha256"], f"{arm} KL model manifest hash differs")
+    for key in ("model_path", "tokenizer_path"):
+        require(isinstance(manifest.get(key), str) and bool(manifest[key]), f"{arm} KL {key} is required")
+    vocab_size = manifest.get("vocab_size")
+    require(type(vocab_size) is int and vocab_size > 1, f"{arm} KL vocab_size must be an integer > 1")
+    rows = manifest.get("records")
+    require(isinstance(rows, list) and len(rows) == KL_SAMPLE_COUNT, f"{arm} KL must contain exactly 48 records")
+    require([row.get("sample_index") for row in rows if isinstance(row, Mapping)] == list(range(KL_SAMPLE_COUNT)), f"{arm} KL sample indices must be exactly 0..47 in order")
+
+
+def _read_f32_matrix(path: Path, expected_values: int, label: str):
+    expected_bytes = expected_values * 4
+    require(path.stat().st_size == expected_bytes, f"{label} byte count differs")
+    raw = path.read_bytes()
+    try:
+        import numpy as np
+    except ModuleNotFoundError:
+        require(expected_values <= 1_000_000, "NumPy is required to audit production KL distribution shards")
+        return [value[0] for value in struct.iter_unpack("<f", raw)]
+    return np.frombuffer(raw, dtype="<f4").astype(np.float64, copy=False)
+
+
+def _row_stats(baseline, candidate) -> tuple[float, float, float]:
+    """Return baseline mass, candidate mass, and full-vocabulary P||Q."""
+
+    try:
+        import numpy as np
+    except ModuleNotFoundError:
+        baseline_values = [float(value) for value in baseline]
+        candidate_values = [float(value) for value in candidate]
+        require(all(math.isfinite(value) for value in baseline_values + candidate_values), "KL logprobs must be finite")
+        require(all(value <= 1e-6 for value in baseline_values + candidate_values), "KL logprobs must not be positive")
+        probabilities = [math.exp(value) for value in baseline_values]
+        return (
+            math.fsum(probabilities),
+            math.fsum(math.exp(value) for value in candidate_values),
+            math.fsum(probability * (p_value - q_value) for probability, p_value, q_value in zip(probabilities, baseline_values, candidate_values)),
+        )
+    require(bool(np.isfinite(baseline).all()) and bool(np.isfinite(candidate).all()), "KL logprobs must be finite")
+    require(float(np.max(baseline)) <= 1e-6 and float(np.max(candidate)) <= 1e-6, "KL logprobs must not be positive")
+    baseline_probability = np.exp(baseline)
+    return (
+        float(np.sum(baseline_probability, dtype=np.float64)),
+        float(np.sum(np.exp(candidate), dtype=np.float64)),
+        float(np.sum(baseline_probability * (baseline - candidate), dtype=np.float64)),
+    )
+
+
+def _validate_kl_record(row: object, sample_index: int, vocab_size: int, arm: str) -> tuple[int, list[Mapping[str, object]]]:
+    require(isinstance(row, Mapping), f"{arm} KL sample {sample_index} must be an object")
+    require(row.get("sample_index") == sample_index, f"{arm} KL sample {sample_index} index differs")
+    output_ids = row.get("output_ids")
+    require(isinstance(output_ids, list) and bool(output_ids) and all(type(token) is int and 0 <= token < vocab_size for token in output_ids), f"{arm} KL sample {sample_index} output IDs are invalid")
+    require(row.get("position_count") == len(output_ids), f"{arm} KL sample {sample_index} position count differs")
+    require(row.get("output_ids_sha256") == _json_sha256(output_ids), f"{arm} KL sample {sample_index} output ID hash differs")
+    require(isinstance(row.get("input_ids_sha256"), str) and bool(_SHA256_RE.fullmatch(row["input_ids_sha256"])), f"{arm} KL sample {sample_index} input ID hash is required")
+    shards = row.get("shards")
+    require(isinstance(shards, list) and bool(shards), f"{arm} KL sample {sample_index} shards are required")
+    cursor = 0
+    for shard_index, shard in enumerate(shards):
+        require(isinstance(shard, Mapping), f"{arm} KL sample {sample_index} shard {shard_index} must be an object")
+        start = shard.get("token_start")
+        end = shard.get("token_end")
+        require(type(start) is int and type(end) is int and start == cursor and start < end <= vocab_size, f"{arm} KL sample {sample_index} shard {shard_index} vocabulary coverage differs")
+        require(end - start <= KL_VOCAB_CHUNK_SIZE, f"{arm} KL sample {sample_index} shard {shard_index} is too wide")
+        require(shard.get("shape") == [len(output_ids), end - start], f"{arm} KL sample {sample_index} shard {shard_index} shape differs")
+        require(shard.get("byte_count") == len(output_ids) * (end - start) * 4, f"{arm} KL sample {sample_index} shard {shard_index} byte count differs")
+        require(isinstance(shard.get("sha256"), str) and bool(_SHA256_RE.fullmatch(shard["sha256"])), f"{arm} KL sample {sample_index} shard {shard_index} SHA256 is required")
+        cursor = end
+    require(cursor == vocab_size, f"{arm} KL sample {sample_index} does not cover the full vocabulary")
+    return len(output_ids), shards
+
+
+def _recompute_kl(kl: Mapping[str, object], evidence_root: Path | None) -> tuple[list[float], float]:
+    """Recompute exact full-vocabulary D_KL(P_baseline || Q_candidate).
+
+    Each scored teacher-forced output position is normalized over every token
+    ID. Position KL values are averaged within a sample; the strict campaign
+    gate is the maximum of those 48 sealed sample means.
     """
 
-    rows = kl.get("records")
-    require(isinstance(rows, list) and len(rows) == KL_SAMPLE_COUNT, "KL must contain exactly 48 sealed samples")
-    require([row.get("sample_index") for row in rows if isinstance(row, Mapping)] == list(range(KL_SAMPLE_COUNT)), "KL sample indices must be exactly 0..47 in order")
+    require(evidence_root is not None, "an evidence root is required for KL distribution manifests")
+    baseline_manifest, baseline_root = _load_kl_manifest(kl.get("baseline_manifest"), evidence_root, "baseline")
+    candidate_manifest, candidate_root = _load_kl_manifest(kl.get("candidate_manifest"), evidence_root, "candidate")
+    _validate_kl_manifest_identity(baseline_manifest, "baseline")
+    _validate_kl_manifest_identity(candidate_manifest, "candidate")
+    for key in ("input_ids_sha256", "model_manifest_sha256", "model_path", "tokenizer_path", "vocab_size", "token_id_order", "dtype", "byte_order", "normalization_atol", "vocab_chunk_size"):
+        require(candidate_manifest.get(key) == baseline_manifest.get(key), f"KL baseline/candidate {key} alignment differs")
+    baseline_spec = kl["baseline_manifest"]
+    require(candidate_manifest.get("reference_manifest_sha256") == baseline_spec.get("sha256"), "candidate KL reference manifest hash differs")
+
+    vocab_size = baseline_manifest["vocab_size"]
+    baseline_rows = baseline_manifest["records"]
+    candidate_rows = candidate_manifest["records"]
     sample_means = []
-    for sample_index, row in enumerate(rows):
-        require(isinstance(row, Mapping), f"KL sample {sample_index} must be an object")
-        baseline = row.get("baseline_logprobs")
-        candidate = row.get("candidate_logprobs")
-        require(isinstance(baseline, list) and isinstance(candidate, list), f"KL sample {sample_index} logprobs must be lists")
-        require(len(baseline) == len(candidate) and len(baseline) > 0, f"KL sample {sample_index} logprob lengths differ or are empty")
-        terms = []
-        for token_index, (baseline_value, candidate_value) in enumerate(zip(baseline, candidate)):
-            require(isinstance(baseline_value, (int, float)) and isinstance(candidate_value, (int, float)), f"KL sample {sample_index} token {token_index} is not numeric")
-            baseline_value = float(baseline_value)
-            candidate_value = float(candidate_value)
-            require(math.isfinite(baseline_value) and math.isfinite(candidate_value), f"KL sample {sample_index} token {token_index} is not finite")
-            logr = baseline_value - candidate_value
-            try:
-                term = math.exp(logr) - 1.0 - logr
-            except OverflowError as exc:
-                raise QualificationError(f"KL sample {sample_index} overflowed") from exc
-            require(math.isfinite(term), f"KL sample {sample_index} term is not finite")
-            terms.append(term)
-        sample_means.append(sum(terms) / len(terms))
-    return sample_means
+    max_position_kl = 0.0
+    observed_paths: set[Path] = set()
+    for sample_index, (baseline_row, candidate_row) in enumerate(zip(baseline_rows, candidate_rows)):
+        position_count, baseline_shards = _validate_kl_record(baseline_row, sample_index, vocab_size, "baseline")
+        candidate_position_count, candidate_shards = _validate_kl_record(candidate_row, sample_index, vocab_size, "candidate")
+        require(candidate_position_count == position_count, f"KL sample {sample_index} position alignment differs")
+        for key in ("input_ids_sha256", "output_ids_sha256", "output_ids", "position_count"):
+            require(candidate_row.get(key) == baseline_row.get(key), f"KL sample {sample_index} {key} alignment differs")
+        require(len(candidate_shards) == len(baseline_shards), f"KL sample {sample_index} shard count differs")
+        baseline_mass = [0.0] * position_count
+        candidate_mass = [0.0] * position_count
+        position_kl = [0.0] * position_count
+        for shard_index, (baseline_shard, candidate_shard) in enumerate(zip(baseline_shards, candidate_shards)):
+            for key in ("token_start", "token_end", "shape", "byte_count"):
+                require(candidate_shard.get(key) == baseline_shard.get(key), f"KL sample {sample_index} shard {shard_index} {key} alignment differs")
+            width = baseline_shard["token_end"] - baseline_shard["token_start"]
+            matrices = []
+            for arm, shard, root in (("baseline", baseline_shard, baseline_root), ("candidate", candidate_shard, candidate_root)):
+                path = _resolve_evidence_path(root, shard.get("path"), f"{arm} KL shard")
+                require(path not in observed_paths, f"KL shard path is reused: {path.name}")
+                observed_paths.add(path)
+                require(_file_sha256(path) == shard.get("sha256"), f"{arm} KL sample {sample_index} shard {shard_index} SHA256 mismatch")
+                matrices.append(_read_f32_matrix(path, position_count * width, f"{arm} KL sample {sample_index} shard {shard_index}"))
+            baseline_values, candidate_values = matrices
+            for position in range(position_count):
+                start = position * width
+                end = start + width
+                p_mass, q_mass, kl_value = _row_stats(baseline_values[start:end], candidate_values[start:end])
+                baseline_mass[position] += p_mass
+                candidate_mass[position] += q_mass
+                position_kl[position] += kl_value
+        for position, (p_mass, q_mass, kl_value) in enumerate(zip(baseline_mass, candidate_mass, position_kl)):
+            require(abs(p_mass - 1.0) <= KL_NORMALIZATION_ATOL, f"KL sample {sample_index} position {position} baseline probability mass {p_mass:.9f} is not normalized")
+            require(abs(q_mass - 1.0) <= KL_NORMALIZATION_ATOL, f"KL sample {sample_index} position {position} candidate probability mass {q_mass:.9f} is not normalized")
+            require(math.isfinite(kl_value), f"KL sample {sample_index} position {position} is not finite")
+            require(kl_value >= -KL_NEGATIVE_ATOL, f"KL sample {sample_index} position {position} is negative")
+            position_kl[position] = max(0.0, kl_value)
+        sample_means.append(math.fsum(position_kl) / position_count)
+        max_position_kl = max(max_position_kl, max(position_kl))
+    return sample_means, max_position_kl
 
 
-def validate_accuracy(accuracy: Mapping[str, object]) -> dict[str, object]:
+def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None = None) -> dict[str, object]:
     arms = accuracy.get("arms")
     require(isinstance(arms, Mapping) and set(arms) == {"baseline", "candidate"}, "accuracy arms must be exactly baseline and candidate")
     scores = {}
@@ -251,15 +405,17 @@ def validate_accuracy(accuracy: Mapping[str, object]) -> dict[str, object]:
     kl = accuracy.get("kl")
     require(isinstance(kl, Mapping), "accuracy.kl must be an object")
     require(kl.get("metric") == KL_METRIC, f"KL metric must be {KL_METRIC}")
-    sample_values = _recompute_kl(kl)
+    require(kl.get("direction") == KL_DIRECTION, f"KL direction must be {KL_DIRECTION}")
+    require(kl.get("position_aggregation") == KL_POSITION_AGGREGATION, f"KL position aggregation must be {KL_POSITION_AGGREGATION}")
+    require(kl.get("sample_aggregation") == KL_SAMPLE_AGGREGATION, f"KL sample aggregation must be {KL_SAMPLE_AGGREGATION}")
+    sample_values, max_position_kl = _recompute_kl(kl, evidence_root)
     mean_kl = sum(sample_values) / len(sample_values)
     max_kl = max(sample_values)
-    reported_mean = kl.get("mean_kl")
-    reported_max = kl.get("max_kl")
-    require(isinstance(reported_mean, (int, float)) and math.isclose(float(reported_mean), mean_kl, rel_tol=0, abs_tol=1e-15), "reported mean KL surrogate does not match raw logprobs")
-    require(isinstance(reported_max, (int, float)) and math.isclose(float(reported_max), max_kl, rel_tol=0, abs_tol=1e-15), "reported max KL surrogate does not match raw logprobs")
-    require(max_kl < MAX_KL_EXCLUSIVE, f"maximum sample KL surrogate {max_kl:.9f} is not < 0.0035")
-    return {**scores, "kl_metric": KL_METRIC, "mean_kl": mean_kl, "max_kl": max_kl}
+    for key, computed in (("mean_sample_kl", mean_kl), ("max_sample_kl", max_kl), ("max_position_kl", max_position_kl)):
+        reported = kl.get(key)
+        require(isinstance(reported, (int, float)) and math.isclose(float(reported), computed, rel_tol=0, abs_tol=1e-12), f"reported {key} does not match full-vocabulary distributions")
+    require(max_kl < MAX_KL_EXCLUSIVE, f"maximum sample full-vocabulary KL {max_kl:.9f} is not < 0.0035")
+    return {**scores, "kl_metric": KL_METRIC, "kl_direction": KL_DIRECTION, "mean_sample_kl": mean_kl, "max_sample_kl": max_kl, "max_position_kl": max_position_kl}
 
 
 def _json_sha256(value: object) -> str:
@@ -466,7 +622,7 @@ def validate_campaign(campaign: Mapping[str, object]) -> dict[str, float]:
     return {"physical_turnaround_seconds": physical, "measured_runtime_seconds": measured}
 
 
-def audit_receipt(receipt: Mapping[str, object]) -> dict[str, object]:
+def audit_receipt(receipt: Mapping[str, object], evidence_root: Path | None = None) -> dict[str, object]:
     require(receipt.get("schema") == SCHEMA, f"schema must be {SCHEMA}")
     for section in (
         "provenance",
@@ -479,12 +635,12 @@ def audit_receipt(receipt: Mapping[str, object]) -> dict[str, object]:
         require(isinstance(receipt.get(section), Mapping), f"{section} must be an object")
     validate_provenance(receipt["provenance"])
     campaign = validate_campaign(receipt["campaign"])
-    accuracy = validate_accuracy(receipt["accuracy"])
+    accuracy = validate_accuracy(receipt["accuracy"], evidence_root)
     mtp_probe = validate_mtp_probe(receipt["mtp_probe"])
     routes = validate_routes(receipt["routes"])
     performance = validate_performance(receipt["performance"])
     return {
-        "schema": "gdn-public-qualification-audit-v1",
+        "schema": "gdn-public-qualification-audit-v2",
         "passed": True,
         "campaign": campaign,
         "accuracy": accuracy,

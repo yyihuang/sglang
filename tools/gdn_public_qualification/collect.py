@@ -21,7 +21,12 @@ import requests
 
 from tools.gdn_public_qualification.contract import (
     GSM8K_SHOTS,
+    HASHES,
+    KL_DISTRIBUTION_SCHEMA,
+    KL_NORMALIZATION_ATOL,
     KL_SAMPLE_COUNT,
+    KL_TOKEN_ID_ORDER,
+    KL_VOCAB_CHUNK_SIZE,
     MTP_PROBE_MAX_NEW_TOKENS,
     MTP_PROBE_PROMPT_INDEX,
     MTP_SPECULATIVE_EAGLE_TOPK,
@@ -175,6 +180,229 @@ def _json_sha256(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _require_numpy():
+    try:
+        import numpy as np
+    except ModuleNotFoundError as exc:
+        raise ValueError("NumPy from the pinned SGLang runtime is required for full-vocabulary KL collection") from exc
+    return np
+
+
+def _kl_server_identity(args: argparse.Namespace) -> dict[str, object]:
+    if args.model_manifest_sha256 != HASHES["model_manifest_sha256"]:
+        raise ValueError("KL model manifest hash differs from the sealed qualification authority")
+    if args.input_ids_sha256 != HASHES["longbench_first48_ids_sha256"]:
+        raise ValueError("KL input IDs hash differs from the sealed 48-sample authority")
+    if type(args.vocab_size) is not int or args.vocab_size <= 1:
+        raise ValueError("KL vocab_size must be an integer > 1")
+    if Path(args.tokenizer_path).resolve() != Path(args.model_path).resolve():
+        raise ValueError("KL tokenizer path must be the tokenizer inside the sealed model directory")
+    config_path = Path(args.model_path) / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"KL model config is missing: {config_path}")
+    config = json.loads(config_path.read_text())
+    if not isinstance(config, dict):
+        raise ValueError(f"KL model config must be an object: {config_path}")
+    configured_vocab_size = config.get("vocab_size")
+    if configured_vocab_size is None and isinstance(config.get("text_config"), dict):
+        configured_vocab_size = config["text_config"].get("vocab_size")
+    if configured_vocab_size != args.vocab_size:
+        raise ValueError(
+            f"KL vocab_size {args.vocab_size} != sealed model config value "
+            f"{configured_vocab_size!r}"
+        )
+    server_info = _get(args.base_url, "/server_info", args.timeout)
+    model_info = _get(args.base_url, "/model_info", args.timeout)
+    if not isinstance(server_info, dict) or not isinstance(model_info, dict):
+        raise ValueError("KL server identity endpoints must return objects")
+    if server_info.get("tp_size") != TP_SIZE:
+        raise ValueError(f"KL server tp_size {server_info.get('tp_size')!r} != {TP_SIZE}")
+    expected = {
+        "model_path": args.model_path,
+        "tokenizer_path": args.tokenizer_path,
+    }
+    observed = {key: model_info.get(key) for key in expected}
+    if observed != expected:
+        raise ValueError(f"KL server model/tokenizer identity {observed!r} != {expected!r}")
+    return {
+        **expected,
+        "model_manifest_sha256": args.model_manifest_sha256,
+        "vocab_size": args.vocab_size,
+    }
+
+
+def _prepare_kl_output(output: Path) -> Path:
+    if output.exists():
+        raise ValueError(f"KL manifest output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shard_root = output.parent / f"{output.name}.shards"
+    if shard_root.exists():
+        raise ValueError(f"KL shard directory already exists: {shard_root}")
+    shard_root.mkdir()
+    return shard_root
+
+
+def _extract_distribution_rows(
+    result: object,
+    output_ids: list[int],
+    token_start: int,
+    token_end: int,
+    sample_index: int,
+) -> list[list[float]]:
+    if not isinstance(result, dict) or not isinstance(result.get("meta_info"), dict):
+        raise ValueError(f"KL sample {sample_index} response has no meta_info")
+    meta_info = result["meta_info"]
+    selected = meta_info.get("input_token_logprobs")
+    distributions = meta_info.get("input_token_ids_logprobs")
+    position_count = len(output_ids)
+    if not (
+        isinstance(selected, list)
+        and isinstance(distributions, list)
+        and len(selected) >= position_count
+        and len(distributions) >= position_count
+    ):
+        raise ValueError(f"KL sample {sample_index} returned incomplete teacher-forced positions")
+    selected = selected[-position_count:]
+    distributions = distributions[-position_count:]
+    width = token_end - token_start
+    expected_ids = list(range(token_start, token_end))
+    output = []
+    for position, (selected_row, distribution_row, expected_output_id) in enumerate(
+        zip(selected, distributions, output_ids)
+    ):
+        if not (
+            isinstance(selected_row, (list, tuple))
+            and len(selected_row) >= 2
+            and selected_row[1] == expected_output_id
+        ):
+            raise ValueError(f"KL sample {sample_index} position {position} teacher-forced token alignment differs")
+        if not isinstance(distribution_row, list) or len(distribution_row) != width:
+            raise ValueError(f"KL sample {sample_index} position {position} vocabulary row is incomplete")
+        token_ids = []
+        values = []
+        for entry in distribution_row:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                raise ValueError(f"KL sample {sample_index} position {position} vocabulary entry is malformed")
+            value, token_id = entry[:2]
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > 1e-6:
+                raise ValueError(f"KL sample {sample_index} position {position} has an invalid logprob")
+            if type(token_id) is not int:
+                raise ValueError(f"KL sample {sample_index} position {position} has a non-integer token ID")
+            token_ids.append(token_id)
+            values.append(float(value))
+        if token_ids != expected_ids:
+            raise ValueError(f"KL sample {sample_index} position {position} token IDs are not the exact requested vocabulary chunk")
+        output.append(values)
+    return output
+
+
+def _write_f32le(path: Path, matrix) -> None:
+    payload = matrix.astype("<f4", copy=False).tobytes(order="C")
+    with path.open("xb") as handle:
+        handle.write(payload)
+
+
+def _collect_kl_distribution(
+    args: argparse.Namespace,
+    arm: str,
+    identity: dict[str, object],
+    input_ids: list[list[int]],
+    continuations: list[list[int]],
+    reference_manifest_sha256: str | None = None,
+) -> None:
+    """Collect all vocabulary IDs in bounded chunks; no top-k path is used."""
+
+    np = _require_numpy()
+    shard_root = _prepare_kl_output(args.output)
+    records = []
+    collection_start = time.perf_counter()
+    _flush(args.base_url, args.timeout)
+    for sample_index, (prompt_ids, output_ids) in enumerate(zip(input_ids, continuations)):
+        position_count = len(output_ids)
+        probability_mass = np.zeros(position_count, dtype=np.float64)
+        shards = []
+        joined = prompt_ids + output_ids
+        for token_start in range(0, args.vocab_size, KL_VOCAB_CHUNK_SIZE):
+            token_end = min(token_start + KL_VOCAB_CHUNK_SIZE, args.vocab_size)
+            result = _as_results(
+                _post(
+                    args.base_url,
+                    "/generate",
+                    {
+                        "input_ids": [joined],
+                        "sampling_params": {"temperature": 0.0, "max_new_tokens": 0},
+                        "return_logprob": True,
+                        "return_text_in_logprobs": False,
+                        # Include one predecessor position, then select and verify
+                        # the exact output-token tail from both returned arrays.
+                        "logprob_start_len": max(0, len(prompt_ids) - 1),
+                        "token_ids_logprob": list(range(token_start, token_end)),
+                    },
+                    args.timeout,
+                ),
+                1,
+            )[0]
+            rows = _extract_distribution_rows(
+                result,
+                output_ids,
+                token_start,
+                token_end,
+                sample_index,
+            )
+            matrix = np.asarray(rows, dtype=np.float32)
+            expected_shape = (position_count, token_end - token_start)
+            if matrix.shape != expected_shape or not bool(np.isfinite(matrix).all()):
+                raise ValueError(f"KL sample {sample_index} chunk {token_start}:{token_end} matrix is invalid")
+            probability_mass += np.sum(np.exp(matrix.astype(np.float64)), axis=1, dtype=np.float64)
+            file_name = f"sample-{sample_index:03d}-vocab-{token_start:06d}-{token_end:06d}.f32le"
+            shard_path = shard_root / file_name
+            _write_f32le(shard_path, matrix)
+            shards.append(
+                {
+                    "path": f"{shard_root.name}/{file_name}",
+                    "token_start": token_start,
+                    "token_end": token_end,
+                    "shape": [position_count, token_end - token_start],
+                    "byte_count": position_count * (token_end - token_start) * 4,
+                    "sha256": _sha256(shard_path),
+                }
+            )
+        bad_positions = np.flatnonzero(np.abs(probability_mass - 1.0) > KL_NORMALIZATION_ATOL)
+        if bad_positions.size:
+            position = int(bad_positions[0])
+            raise ValueError(
+                f"KL sample {sample_index} position {position} probability mass "
+                f"{float(probability_mass[position]):.9f} is not normalized"
+            )
+        records.append(
+            {
+                "sample_index": sample_index,
+                "input_ids_sha256": _json_sha256(prompt_ids),
+                "output_ids": output_ids,
+                "output_ids_sha256": _json_sha256(output_ids),
+                "position_count": position_count,
+                "shards": shards,
+            }
+        )
+    manifest = {
+        "schema": KL_DISTRIBUTION_SCHEMA,
+        "arm": arm,
+        "sample_count": KL_SAMPLE_COUNT,
+        "input_ids_sha256": args.input_ids_sha256,
+        **identity,
+        "token_id_order": KL_TOKEN_ID_ORDER,
+        "dtype": "float32",
+        "byte_order": "little",
+        "normalization_atol": KL_NORMALIZATION_ATOL,
+        "vocab_chunk_size": KL_VOCAB_CHUNK_SIZE,
+        "collection_runtime_seconds": time.perf_counter() - collection_start,
+        "records": records,
+    }
+    if reference_manifest_sha256 is not None:
+        manifest["reference_manifest_sha256"] = reference_manifest_sha256
+    _write_json(args.output, manifest)
+
+
 def collect_mtp_probe(args: argparse.Namespace) -> None:
     """Run one real T=4 NEXTN request against an already loaded TP4 server."""
 
@@ -238,8 +466,11 @@ def collect_mtp_probe(args: argparse.Namespace) -> None:
 
 
 def collect_kl_reference(args: argparse.Namespace) -> None:
+    """Generate sealed continuations, then score their full baseline distributions."""
+
     _require_hash(args.input_ids, args.input_ids_sha256)
-    input_ids = _load_input_ids(args.input_ids, 48)
+    input_ids = _load_input_ids(args.input_ids, KL_SAMPLE_COUNT)
+    identity = _kl_server_identity(args)
     _flush(args.base_url, args.timeout)
     results = _as_results(
         _post(
@@ -253,61 +484,69 @@ def collect_kl_reference(args: argparse.Namespace) -> None:
             },
             args.timeout,
         ),
-        48,
+        KL_SAMPLE_COUNT,
     )
-    records = []
+    continuations = []
     for sample_index, result in enumerate(results):
         output_ids = result.get("output_ids")
-        output_logprobs = result.get("meta_info", {}).get("output_token_logprobs")
-        if not isinstance(output_ids, list) or not isinstance(output_logprobs, list):
-            raise ValueError(f"KL reference sample {sample_index} has no token logprobs")
-        records.append(
-            {
-                "sample_index": sample_index,
-                "input_ids": input_ids[sample_index],
-                "output_ids": output_ids,
-                "baseline_logprobs": [row[0] for row in output_logprobs],
-            }
-        )
-    _write_json(args.output, {"records": records})
+        if not (
+            isinstance(output_ids, list)
+            and len(output_ids) == 512
+            and all(type(token) is int and 0 <= token < args.vocab_size for token in output_ids)
+        ):
+            raise ValueError(f"KL reference sample {sample_index} must return exactly 512 in-vocabulary token IDs")
+        continuations.append(output_ids)
+    _collect_kl_distribution(args, "baseline", identity, input_ids, continuations)
 
 
 def collect_kl_candidate(args: argparse.Namespace) -> None:
+    reference_sha256 = _sha256(args.reference)
     reference = json.loads(args.reference.read_text())
+    if not isinstance(reference, dict) or reference.get("schema") != KL_DISTRIBUTION_SCHEMA:
+        raise ValueError("KL reference must be a full-vocabulary distribution manifest")
+    if reference.get("arm") != "baseline" or reference.get("sample_count") != KL_SAMPLE_COUNT:
+        raise ValueError("KL reference must contain exactly 48 baseline samples")
+    identity = _kl_server_identity(args)
+    for key, expected in {
+        "input_ids_sha256": HASHES["longbench_first48_ids_sha256"],
+        "model_manifest_sha256": args.model_manifest_sha256,
+        "model_path": identity["model_path"],
+        "tokenizer_path": identity["tokenizer_path"],
+        "vocab_size": args.vocab_size,
+        "token_id_order": KL_TOKEN_ID_ORDER,
+    }.items():
+        if reference.get(key) != expected:
+            raise ValueError(f"KL reference {key} differs from the candidate server authority")
     records = reference.get("records")
-    if not isinstance(records, list) or len(records) != 48:
-        raise ValueError("KL reference must contain exactly 48 samples")
-    joined = [row["input_ids"] + row["output_ids"] for row in records]
-    _flush(args.base_url, args.timeout)
-    results = _as_results(
-        _post(
-            args.base_url,
-            "/generate",
-            {
-                "input_ids": joined,
-                "sampling_params": {"temperature": 0.0, "max_new_tokens": 0},
-                "return_logprob": True,
-                "return_text_in_logprobs": False,
-                "logprob_start_len": 0,
-            },
-            args.timeout,
-        ),
-        48,
+    if not isinstance(records, list) or len(records) != KL_SAMPLE_COUNT:
+        raise ValueError("KL reference must contain exactly 48 ordered records")
+    input_ids = _load_input_ids(args.input_ids, KL_SAMPLE_COUNT)
+    _require_hash(args.input_ids, args.input_ids_sha256)
+    if args.input_ids_sha256 != reference.get("input_ids_sha256"):
+        raise ValueError("candidate input-ID artifact differs from the baseline manifest")
+    continuations = []
+    for sample_index, (tokens, row) in enumerate(zip(input_ids, records)):
+        if not isinstance(row, dict) or row.get("sample_index") != sample_index:
+            raise ValueError(f"KL reference sample {sample_index} identity differs")
+        if row.get("input_ids_sha256") != _json_sha256(tokens):
+            raise ValueError(f"KL reference sample {sample_index} input IDs differ")
+        output_ids = row.get("output_ids")
+        if not (
+            isinstance(output_ids, list)
+            and len(output_ids) == 512
+            and all(type(token) is int and 0 <= token < args.vocab_size for token in output_ids)
+            and row.get("output_ids_sha256") == _json_sha256(output_ids)
+        ):
+            raise ValueError(f"KL reference sample {sample_index} output IDs are invalid")
+        continuations.append(output_ids)
+    _collect_kl_distribution(
+        args,
+        "candidate",
+        identity,
+        input_ids,
+        continuations,
+        reference_manifest_sha256=reference_sha256,
     )
-    output = []
-    for sample_index, (reference_row, result) in enumerate(zip(records, results)):
-        token_count = len(reference_row["output_ids"])
-        input_logprobs = result.get("meta_info", {}).get("input_token_logprobs")
-        if not isinstance(input_logprobs, list) or len(input_logprobs) < token_count:
-            raise ValueError(f"KL candidate sample {sample_index} has incomplete logprobs")
-        output.append(
-            {
-                "sample_index": sample_index,
-                "baseline_logprobs": reference_row["baseline_logprobs"],
-                "candidate_logprobs": [row[0] for row in input_logprobs[-token_count:]],
-            }
-        )
-    _write_json(args.output, {"records": output})
 
 
 def collect_performance(args: argparse.Namespace) -> None:
@@ -406,6 +645,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     kl_candidate = server_parser("kl-candidate", collect_kl_candidate)
     kl_candidate.add_argument("--reference", type=Path, required=True)
+    kl_candidate.add_argument("--input-ids", type=Path, required=True)
+    kl_candidate.add_argument("--input-ids-sha256", required=True)
+
+    for child in (kl_reference, kl_candidate):
+        child.add_argument("--model-path", required=True)
+        child.add_argument("--tokenizer-path", required=True)
+        child.add_argument("--model-manifest-sha256", required=True)
+        child.add_argument("--vocab-size", type=int, required=True)
 
     mtp_probe = server_parser("mtp-probe", collect_mtp_probe)
     mtp_probe.add_argument("--arm", choices=("baseline", "candidate"), required=True)
