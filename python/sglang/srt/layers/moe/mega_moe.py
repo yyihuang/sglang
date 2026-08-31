@@ -252,23 +252,10 @@ def _run_flashinfer_mega_routed(
     # local row count and executes the same ordered chunk sequence. Do not relax
     # this contract without adding cross-rank chunk-count coordination.
     for start, stop in _flashinfer_megamoe_chunk_ranges(num_tokens):
-        chunk_tokens = stop - start
-        padded_hidden, padded_topk_ids, padded_topk_weights = (
-            _stage_flashinfer_megamoe_chunk(
-                hidden_states[start:stop],
-                topk_output.topk_ids[start:stop],
-                topk_output.topk_weights[start:stop],
-                hidden_buffer=moe.experts._flashinfer_megamoe_hidden_buffer,
-                topk_ids_buffer=moe.experts._flashinfer_megamoe_topk_ids_buffer,
-                topk_weights_buffer=(
-                    moe.experts._flashinfer_megamoe_topk_weights_buffer
-                ),
-            )
-        )
         tensors = MoEEpTensors(
-            hidden_states=padded_hidden,
-            topk_ids=padded_topk_ids,
-            topk_weights=padded_topk_weights,
+            hidden_states=hidden_states[start:stop],
+            topk_ids=topk_output.topk_ids[start:stop],
+            topk_weights=topk_output.topk_weights[start:stop],
         )
         if not getattr(moe.experts, "_flashinfer_megamoe_warmed_up", False):
             # Graph runners execute eager warmup forwards while model_capture_mode
@@ -283,7 +270,7 @@ def _run_flashinfer_mega_routed(
             flashinfer_layer.warmup(tensors)
             moe.experts._flashinfer_megamoe_warmed_up = True
 
-        chunk_y = flashinfer_layer(tensors)[:chunk_tokens]
+        chunk_y = flashinfer_layer(tensors)
         if y is None:
             y = chunk_y
         else:
@@ -293,56 +280,6 @@ def _run_flashinfer_mega_routed(
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
         y.mul_(moe.routed_scaling_factor)
     return y
-
-
-def _stage_flashinfer_megamoe_chunk(
-    hidden_states: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    *,
-    hidden_buffer: torch.Tensor,
-    topk_ids_buffer: torch.Tensor,
-    topk_weights_buffer: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Copy one real-token chunk into the fixed rank-major input buffers.
-
-    The buffers are allocated during expert construction.  Prefix copies and
-    the expert-ID sentinel fill are graph-recordable, so this helper adds no
-    allocator work during capture. Dummy rows use the generated dispatch
-    kernel's negative expert-ID sentinel and are excluded from routing and
-    expert compute. Their hidden-state and weight tails are intentionally left
-    stale because dispatch ignores both whenever the expert ID is negative.
-    """
-    num_tokens = hidden_states.shape[0]
-    if not 0 < num_tokens <= _FLASHINFER_MEGAMOE_TOKENS_PER_RANK:
-        raise ValueError(
-            "FlashInfer MegaMoE chunks must contain 1..128 real token rows; "
-            f"got {num_tokens}."
-        )
-    expected_hidden = (num_tokens, _FLASHINFER_MEGAMOE_HIDDEN_SIZE)
-    expected_topk = (num_tokens, _FLASHINFER_MEGAMOE_TOP_K)
-    if tuple(hidden_states.shape) != expected_hidden:
-        raise ValueError(
-            f"FlashInfer MegaMoE hidden chunk must have shape {expected_hidden}; "
-            f"got {tuple(hidden_states.shape)}."
-        )
-    if tuple(topk_ids.shape) != expected_topk:
-        raise ValueError(
-            f"FlashInfer MegaMoE topk_ids chunk must have shape {expected_topk}; "
-            f"got {tuple(topk_ids.shape)}."
-        )
-    if tuple(topk_weights.shape) != expected_topk:
-        raise ValueError(
-            f"FlashInfer MegaMoE topk_weights chunk must have shape {expected_topk}; "
-            f"got {tuple(topk_weights.shape)}."
-        )
-
-    hidden_buffer[:num_tokens].copy_(hidden_states)
-    topk_ids_buffer[:num_tokens].copy_(topk_ids)
-    topk_weights_buffer[:num_tokens].copy_(topk_weights)
-    if num_tokens < _FLASHINFER_MEGAMOE_TOKENS_PER_RANK:
-        topk_ids_buffer[num_tokens:].fill_(-1)
-    return hidden_buffer, topk_ids_buffer, topk_weights_buffer
 
 
 def _run_mega_routed(
@@ -611,36 +548,6 @@ def build_flashinfer_megamoe_experts_weights(experts) -> None:
     )
 
     experts.flashinfer_megamoe_layer = flashinfer_layer
-    experts.register_buffer(
-        "_flashinfer_megamoe_hidden_buffer",
-        torch.empty(
-            _FLASHINFER_MEGAMOE_TOKENS_PER_RANK,
-            _FLASHINFER_MEGAMOE_HIDDEN_SIZE,
-            dtype=torch.bfloat16,
-            device=experts.w13_weight.device,
-        ),
-        persistent=False,
-    )
-    experts.register_buffer(
-        "_flashinfer_megamoe_topk_ids_buffer",
-        torch.empty(
-            _FLASHINFER_MEGAMOE_TOKENS_PER_RANK,
-            _FLASHINFER_MEGAMOE_TOP_K,
-            dtype=torch.int64,
-            device=experts.w13_weight.device,
-        ),
-        persistent=False,
-    )
-    experts.register_buffer(
-        "_flashinfer_megamoe_topk_weights_buffer",
-        torch.empty(
-            _FLASHINFER_MEGAMOE_TOKENS_PER_RANK,
-            _FLASHINFER_MEGAMOE_TOP_K,
-            dtype=torch.float32,
-            device=experts.w13_weight.device,
-        ),
-        persistent=False,
-    )
     experts._flashinfer_megamoe_weights_built = True
     experts._flashinfer_megamoe_warmed_up = False
     experts.register_parameter("w13_weight", None)

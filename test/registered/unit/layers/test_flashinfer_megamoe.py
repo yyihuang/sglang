@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.layers.moe.mega_moe import (
     _flashinfer_megamoe_chunk_ranges,
-    _stage_flashinfer_megamoe_chunk,
+    _run_flashinfer_mega_routed,
     build_flashinfer_megamoe_experts_weights,
 )
 
@@ -22,6 +22,13 @@ class _WeightPack:
     def __init__(self, w13, w2):
         self.w13 = w13
         self.w2 = w2
+
+
+class _TensorBundle:
+    def __init__(self, *, hidden_states, topk_ids, topk_weights):
+        self.hidden_states = hidden_states
+        self.topk_ids = topk_ids
+        self.topk_weights = topk_weights
 
 
 class _FakeMoEEpLayer(torch.nn.Module):
@@ -77,6 +84,7 @@ def _fake_flashinfer_modules():
     moe_ep.MegaConfig = _Config
     moe_ep.MoEEpLayer = _FakeMoEEpLayer
     moe_ep.MoEWeightPack = _WeightPack
+    moe_ep.MoEEpTensors = _TensorBundle
     moe_ep.Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig = _Config
     flashinfer = types.ModuleType("flashinfer")
     flashinfer.__path__ = []
@@ -124,12 +132,9 @@ class TestFlashInferMegaMoEWeightOwnership(unittest.TestCase):
             2048,
         )
         self.assertEqual(call["backend"].kwargs["megakernel"].kwargs["top_k"], 8)
-        self.assertEqual(
-            tuple(experts._flashinfer_megamoe_hidden_buffer.shape), (128, 7168)
-        )
-        self.assertEqual(
-            tuple(experts._flashinfer_megamoe_topk_ids_buffer.shape), (128, 8)
-        )
+        self.assertFalse(hasattr(experts, "_flashinfer_megamoe_hidden_buffer"))
+        self.assertFalse(hasattr(experts, "_flashinfer_megamoe_topk_ids_buffer"))
+        self.assertFalse(hasattr(experts, "_flashinfer_megamoe_topk_weights_buffer"))
 
     def test_invalid_weight_dtype_keeps_original_parameters(self):
         experts = _Experts(dtype=torch.float32)
@@ -165,7 +170,7 @@ class TestFlashInferMegaMoEWeightOwnership(unittest.TestCase):
         build.assert_called_once_with(experts)
 
 
-class TestFlashInferMegaMoEFixedChunks(unittest.TestCase):
+class TestFlashInferMegaMoEActiveChunks(unittest.TestCase):
     def test_chunk_ranges_cover_fixed_boundaries(self):
         expected = {
             0: (),
@@ -180,65 +185,55 @@ class TestFlashInferMegaMoEFixedChunks(unittest.TestCase):
             with self.subTest(num_tokens=num_tokens):
                 self.assertEqual(_flashinfer_megamoe_chunk_ranges(num_tokens), ranges)
 
-    def test_stage_1_127_128_rows_without_new_buffers(self):
-        hidden_buffer = torch.full((128, 7168), -1, dtype=torch.bfloat16)
-        topk_ids_buffer = torch.full((128, 8), -1, dtype=torch.int64)
-        topk_weights_buffer = torch.full((128, 8), -1, dtype=torch.float32)
+    def test_routed_forward_passes_actual_chunk_shapes(self):
+        calls = []
 
-        # Start at the full shape, then shrink, so the partial cases prove that
-        # stale real hidden/weight rows survive while every tail route is masked.
-        for num_tokens in (128, 1, 127):
-            with self.subTest(num_tokens=num_tokens):
-                hidden = torch.full(
-                    (num_tokens, 7168), 3, dtype=torch.bfloat16
+        class Layer:
+            def __call__(self, tensors):
+                calls.append(
+                    (
+                        tuple(tensors.hidden_states.shape),
+                        tuple(tensors.topk_ids.shape),
+                        tuple(tensors.topk_weights.shape),
+                        tensors.topk_ids.dtype,
+                    )
                 )
-                topk_ids = torch.full((num_tokens, 8), 7, dtype=torch.int32)
-                topk_weights = torch.full(
-                    (num_tokens, 8), 0.25, dtype=torch.float16
-                )
-                hidden_tail_before = hidden_buffer[num_tokens:].clone()
-                topk_weights_tail_before = topk_weights_buffer[num_tokens:].clone()
-                staged = _stage_flashinfer_megamoe_chunk(
-                    hidden,
-                    topk_ids,
-                    topk_weights,
-                    hidden_buffer=hidden_buffer,
-                    topk_ids_buffer=topk_ids_buffer,
-                    topk_weights_buffer=topk_weights_buffer,
-                )
+                return tensors.hidden_states.clone()
 
-                self.assertIs(staged[0], hidden_buffer)
-                self.assertIs(staged[1], topk_ids_buffer)
-                self.assertIs(staged[2], topk_weights_buffer)
-                torch.testing.assert_close(hidden_buffer[:num_tokens], hidden)
-                torch.testing.assert_close(
-                    topk_ids_buffer[:num_tokens], topk_ids.to(torch.int64)
-                )
-                torch.testing.assert_close(
-                    topk_weights_buffer[:num_tokens], topk_weights.to(torch.float32)
-                )
-                if num_tokens < 128:
-                    torch.testing.assert_close(
-                        hidden_buffer[num_tokens:], hidden_tail_before
-                    )
-                    torch.testing.assert_close(
-                        topk_ids_buffer[num_tokens:],
-                        torch.full_like(topk_ids_buffer[num_tokens:], -1),
-                    )
-                    torch.testing.assert_close(
-                        topk_weights_buffer[num_tokens:], topk_weights_tail_before
-                    )
+        num_tokens = 129
+        hidden = (
+            torch.arange(num_tokens, dtype=torch.bfloat16)
+            .view(num_tokens, 1)
+            .expand(num_tokens, 7168)
+            .contiguous()
+        )
+        ids = torch.zeros((num_tokens, 8), dtype=torch.int32)
+        weights = torch.full((num_tokens, 8), 0.125, dtype=torch.float32)
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(
+                flashinfer_megamoe_layer=Layer(),
+                _flashinfer_megamoe_warmed_up=True,
+                should_fuse_routed_scaling_factor_in_topk=True,
+            ),
+            gate=lambda *_args, **_kwargs: object(),
+            topk=lambda *_args, **_kwargs: SimpleNamespace(
+                topk_ids=ids, topk_weights=weights
+            ),
+            is_hash=False,
+            layer_id=0,
+        )
+        with patch.dict(sys.modules, _fake_flashinfer_modules()):
+            output = _run_flashinfer_mega_routed(moe, hidden, None, None, num_tokens)
 
-    def test_stage_rejects_more_than_one_fixed_chunk(self):
-        with self.assertRaisesRegex(ValueError, "1..128"):
-            _stage_flashinfer_megamoe_chunk(
-                torch.zeros((129, 7168), dtype=torch.bfloat16),
-                torch.zeros((129, 8), dtype=torch.int64),
-                torch.zeros((129, 8), dtype=torch.float32),
-                hidden_buffer=torch.empty((128, 7168), dtype=torch.bfloat16),
-                topk_ids_buffer=torch.empty((128, 8), dtype=torch.int64),
-                topk_weights_buffer=torch.empty((128, 8), dtype=torch.float32),
-            )
+        self.assertEqual(tuple(output.shape), tuple(hidden.shape))
+        torch.testing.assert_close(output, hidden)
+        self.assertEqual(
+            calls,
+            [
+                ((128, 7168), (128, 8), (128, 8), torch.int32),
+                ((1, 7168), (1, 8), (1, 8), torch.int32),
+            ],
+        )
 
 
 if __name__ == "__main__":
