@@ -19,10 +19,25 @@ from pathlib import Path
 
 import requests
 
-from tools.gdn_public_qualification.contract import GSM8K_SHOTS, PROMPT_COUNT
+from tools.gdn_public_qualification.contract import (
+    GSM8K_SHOTS,
+    KL_SAMPLE_COUNT,
+    MTP_PROBE_MAX_NEW_TOKENS,
+    MTP_PROBE_PROMPT_INDEX,
+    MTP_SPECULATIVE_EAGLE_TOPK,
+    MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
+    MTP_SPECULATIVE_NUM_STEPS,
+    PROMPT_COUNT,
+    TP_SIZE,
+)
 
 INVALID_ANSWER = object()
-ROUTE_RE = re.compile(r"Using (cake\.gdn_(prefill|decode)\.noncp\.[a-z0-9_.-]+)")
+ROUTE_MARKER = "FLASHINFER_GDN_NONCP_ROUTE"
+ROUTE_RE = re.compile(
+    r"FLASHINFER_GDN_NONCP_ROUTE\s+backend=gdn_noncp\s+"
+    r"route=(flashinfer\.gdn_(prefill|decode)\.noncp\.[a-z0-9_.-]+)\s+"
+    r"phase=(prefill|decode)\s+t=([1-9][0-9]*)\s+gates_present=True(?:\s|$)"
+)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -45,6 +60,12 @@ def _require_hash(path: Path, expected: str) -> None:
 
 def _post(base_url: str, endpoint: str, payload: dict, timeout: float) -> object:
     response = requests.post(base_url.rstrip("/") + endpoint, json=payload, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def _get(base_url: str, endpoint: str, timeout: float) -> object:
+    response = requests.get(base_url.rstrip("/") + endpoint, timeout=timeout)
     response.raise_for_status()
     return response.json()
 
@@ -133,6 +154,87 @@ def _as_results(value: object, expected: int) -> list[dict]:
     if len(rows) != expected or not all(isinstance(row, dict) for row in rows):
         raise ValueError(f"server returned {len(rows)} results, expected {expected}")
     return rows
+
+
+def _expected_mtp_server_config(arm: str) -> dict[str, object]:
+    backend = "triton" if arm == "baseline" else "flashinfer"
+    return {
+        "tp_size": TP_SIZE,
+        "speculative_algorithm": "EAGLE",
+        "speculative_num_steps": MTP_SPECULATIVE_NUM_STEPS,
+        "speculative_eagle_topk": MTP_SPECULATIVE_EAGLE_TOPK,
+        "speculative_num_draft_tokens": MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
+        "linear_attn_prefill_backend": backend,
+        "linear_attn_decode_backend": backend,
+        "linear_attn_verify_backend": backend,
+    }
+
+
+def _json_sha256(value: object) -> str:
+    encoded = json.dumps(value, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def collect_mtp_probe(args: argparse.Namespace) -> None:
+    """Run one real T=4 NEXTN request against an already loaded TP4 server."""
+
+    _require_hash(args.input_ids, args.input_ids_sha256)
+    input_ids = _load_input_ids(args.input_ids, KL_SAMPLE_COUNT)
+    server_info = _get(args.base_url, "/server_info", args.timeout)
+    if not isinstance(server_info, dict):
+        raise ValueError("MTP probe server_info response must be an object")
+    expected_config = _expected_mtp_server_config(args.arm)
+    server_config = {key: server_info.get(key) for key in expected_config}
+    if server_config != expected_config:
+        raise ValueError(
+            f"MTP probe {args.arm} server configuration {server_config!r} "
+            f"!= {expected_config!r}"
+        )
+
+    sampling_params = {
+        "temperature": 0.0,
+        "max_new_tokens": MTP_PROBE_MAX_NEW_TOKENS,
+        "ignore_eos": True,
+    }
+    _flush(args.base_url, args.timeout)
+    start = time.perf_counter()
+    result = _as_results(
+        _post(
+            args.base_url,
+            "/generate",
+            {
+                "input_ids": [input_ids[MTP_PROBE_PROMPT_INDEX]],
+                "sampling_params": sampling_params,
+            },
+            args.timeout,
+        ),
+        1,
+    )[0]
+    elapsed = time.perf_counter() - start
+    output_ids = result.get("output_ids")
+    if not (
+        isinstance(output_ids, list)
+        and len(output_ids) == MTP_PROBE_MAX_NEW_TOKENS
+        and all(type(token) is int for token in output_ids)
+    ):
+        raise ValueError(
+            "MTP probe must return exactly "
+            f"{MTP_PROBE_MAX_NEW_TOKENS} integer output IDs"
+        )
+    _write_json(
+        args.output,
+        {
+            "arm": args.arm,
+            "input_ids_sha256": args.input_ids_sha256,
+            "prompt_index": MTP_PROBE_PROMPT_INDEX,
+            "request_count": 1,
+            "sampling_params": sampling_params,
+            "server_config": server_config,
+            "output_ids": output_ids,
+            "output_ids_sha256": _json_sha256(output_ids),
+            "measured_runtime_seconds": elapsed,
+        },
+    )
 
 
 def collect_kl_reference(args: argparse.Namespace) -> None:
@@ -249,17 +351,30 @@ def collect_routes(args: argparse.Namespace) -> None:
         rank = int(rank_text)
         path = Path(path_text)
         text = path.read_text(errors="replace")
-        matches = list(ROUTE_RE.finditer(text))
-        prefill = sorted({match.group(1) for match in matches if match.group(2) == "prefill"})
-        decode = sorted({match.group(1) for match in matches if match.group(2) == "decode"})
+        marker_lines = [line for line in text.splitlines() if ROUTE_MARKER in line]
+        observations = set()
+        for line in marker_lines:
+            match = ROUTE_RE.search(line)
+            if match is None:
+                raise ValueError(f"malformed optimized GDN route marker in TP{rank}: {line!r}")
+            route, route_phase, phase, token_width = match.groups()
+            if route_phase != phase:
+                raise ValueError(f"route/phase mismatch in TP{rank}: {line!r}")
+            observations.add((route, phase, int(token_width)))
+        prefill = sorted({route for route, phase, _ in observations if phase == "prefill"})
+        decode = sorted({route for route, phase, _ in observations if phase == "decode"})
         rank_rows.append(
             {
                 "rank": rank,
                 "prefill_routes": prefill,
                 "decode_routes": decode,
-                "cake_route_count": len(matches),
+                "route_observations": [
+                    {"route": route, "phase": phase, "t": token_width, "gates_present": True}
+                    for route, phase, token_width in sorted(observations)
+                ],
+                "marker_count": len(marker_lines),
                 "fallback_count": len(re.findall(r"fall(?:ing)? back", text, flags=re.IGNORECASE)),
-                "route_error_count": len(re.findall(r"cake\.gdn_.*(?:error|failed)", text, flags=re.IGNORECASE)),
+                "route_error_count": len(re.findall(r"(?:FLASHINFER_GDN_NONCP_ROUTE|backend=gdn_noncp).*?(?:error|failed)", text, flags=re.IGNORECASE)),
                 "log_sha256": _sha256(path),
             }
         )
@@ -291,6 +406,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     kl_candidate = server_parser("kl-candidate", collect_kl_candidate)
     kl_candidate.add_argument("--reference", type=Path, required=True)
+
+    mtp_probe = server_parser("mtp-probe", collect_mtp_probe)
+    mtp_probe.add_argument("--arm", choices=("baseline", "candidate"), required=True)
+    mtp_probe.add_argument("--input-ids", type=Path, required=True)
+    mtp_probe.add_argument("--input-ids-sha256", required=True)
 
     performance = server_parser("performance", collect_performance)
     performance.add_argument("--arm", choices=("baseline", "candidate"), required=True)

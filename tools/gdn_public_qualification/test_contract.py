@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 import unittest
 
+from tools.gdn_public_qualification.collect import ROUTE_RE
 from tools.gdn_public_qualification.contract import (
     ABBA_ORDER,
     BOOTSTRAP_SAMPLES,
     BOOTSTRAP_SEED,
+    EXACT_T4_ROUTE,
+    HASHES,
+    KL_METRIC,
+    MTP_PROBE_MAX_NEW_TOKENS,
+    MTP_PROBE_PROMPT_INDEX,
+    MTP_SPECULATIVE_EAGLE_TOPK,
+    MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
+    MTP_SPECULATIVE_NUM_STEPS,
     PROMPT_COUNT,
     SCHEMA,
     WORKLOADS,
@@ -51,6 +62,38 @@ def _observations(candidate_ratio: float) -> list[dict]:
     return rows
 
 
+def _mtp_probe_arm(arm: str) -> dict:
+    backend = "triton" if arm == "baseline" else "flashinfer"
+    output_ids = list(range(10, 10 + MTP_PROBE_MAX_NEW_TOKENS))
+    output_ids_sha256 = hashlib.sha256(
+        json.dumps(output_ids, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "arm": arm,
+        "input_ids_sha256": HASHES["longbench_first48_ids_sha256"],
+        "prompt_index": MTP_PROBE_PROMPT_INDEX,
+        "request_count": 1,
+        "sampling_params": {
+            "temperature": 0.0,
+            "max_new_tokens": MTP_PROBE_MAX_NEW_TOKENS,
+            "ignore_eos": True,
+        },
+        "server_config": {
+            "tp_size": 4,
+            "speculative_algorithm": "EAGLE",
+            "speculative_num_steps": MTP_SPECULATIVE_NUM_STEPS,
+            "speculative_eagle_topk": MTP_SPECULATIVE_EAGLE_TOPK,
+            "speculative_num_draft_tokens": MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
+            "linear_attn_prefill_backend": backend,
+            "linear_attn_decode_backend": backend,
+            "linear_attn_verify_backend": backend,
+        },
+        "output_ids": output_ids,
+        "output_ids_sha256": output_ids_sha256,
+        "measured_runtime_seconds": 1.0,
+    }
+
+
 def _receipt() -> dict:
     provenance = expected_provenance()
     provenance.update(
@@ -64,8 +107,8 @@ def _receipt() -> dict:
         }
     )
     expected_routes = {
-        "prefill": ["cake.gdn_prefill.noncp.full_dv"],
-        "decode": ["cake.gdn_decode.noncp.tile16_fullwarp"],
+        "prefill": ["flashinfer.gdn_prefill.noncp.full_dv"],
+        "decode": [EXACT_T4_ROUTE],
     }
     return {
         "schema": SCHEMA,
@@ -82,7 +125,9 @@ def _receipt() -> dict:
                 "candidate": _accuracy_arm(1223),
             },
             "kl": {
+                "metric": KL_METRIC,
                 "mean_kl": 0.0,
+                "max_kl": 0.0,
                 "records": [
                     {
                         "sample_index": index,
@@ -93,6 +138,11 @@ def _receipt() -> dict:
                 ],
             },
         },
+        "mtp_probe": {
+            "arms": {
+                arm: _mtp_probe_arm(arm) for arm in ("baseline", "candidate")
+            }
+        },
         "routes": {
             "expected_candidate_routes": expected_routes,
             "arms": {
@@ -101,7 +151,8 @@ def _receipt() -> dict:
                         "rank": rank,
                         "prefill_routes": [],
                         "decode_routes": [],
-                        "cake_route_count": 0,
+                        "route_observations": [],
+                        "marker_count": 0,
                         "fallback_count": 0,
                         "route_error_count": 0,
                     }
@@ -112,7 +163,21 @@ def _receipt() -> dict:
                         "rank": rank,
                         "prefill_routes": expected_routes["prefill"],
                         "decode_routes": expected_routes["decode"],
-                        "cake_route_count": 2,
+                        "route_observations": [
+                            {
+                                "route": expected_routes["prefill"][0],
+                                "phase": "prefill",
+                                "t": 128,
+                                "gates_present": True,
+                            },
+                            {
+                                "route": EXACT_T4_ROUTE,
+                                "phase": "decode",
+                                "t": 4,
+                                "gates_present": True,
+                            },
+                        ],
+                        "marker_count": 2,
                         "fallback_count": 0,
                         "route_error_count": 0,
                     }
@@ -162,42 +227,72 @@ class QualificationContractTest(unittest.TestCase):
         with self.subTest("KL threshold"):
             receipt = _receipt()
             value = math.exp(0.1) - 1.0 - 0.1
-            for row in receipt["accuracy"]["kl"]["records"]:
-                row["baseline_logprobs"] = [0.0]
-                row["candidate_logprobs"] = [-0.1]
-            receipt["accuracy"]["kl"]["mean_kl"] = value
-            with self.assertRaisesRegex(QualificationError, "not < 0.0035"):
+            row = receipt["accuracy"]["kl"]["records"][0]
+            row["baseline_logprobs"] = [0.0]
+            row["candidate_logprobs"] = [-0.1]
+            receipt["accuracy"]["kl"]["mean_kl"] = value / 48
+            receipt["accuracy"]["kl"]["max_kl"] = value
+            with self.assertRaisesRegex(QualificationError, "maximum sample .*not < 0.0035"):
                 audit_receipt(receipt)
 
     def test_05_tp4_exact_route_and_zero_baseline_gate(self):
         receipt = _receipt()
         baseline_rank = receipt["routes"]["arms"]["baseline"][2]
-        baseline_rank["decode_routes"] = ["cake.gdn_decode.noncp.tile16_fullwarp"]
-        baseline_rank["cake_route_count"] = 1
-        with self.assertRaisesRegex(QualificationError, "baseline rank 2 recorded"):
+        baseline_rank["decode_routes"] = [EXACT_T4_ROUTE]
+        baseline_rank["route_observations"] = [
+            {
+                "route": EXACT_T4_ROUTE,
+                "phase": "decode",
+                "t": 4,
+                "gates_present": True,
+            }
+        ]
+        baseline_rank["marker_count"] = 1
+        with self.assertRaisesRegex(QualificationError, "baseline rank 2 recorded optimized"):
             audit_receipt(receipt)
 
-    def test_06_abba_eight_observations_gate(self):
+    def test_06_candidate_must_prove_exact_t4_route(self):
+        receipt = _receipt()
+        receipt["routes"]["arms"]["candidate"][1]["route_observations"] = [
+            {
+                "route": receipt["routes"]["expected_candidate_routes"]["prefill"][0],
+                "phase": "prefill",
+                "t": 128,
+                "gates_present": True,
+            }
+        ]
+        with self.assertRaisesRegex(QualificationError, "exact optimized T=4 route"):
+            audit_receipt(receipt)
+
+    def test_07_mtp_probe_requires_exact_resolved_server_config(self):
+        receipt = _receipt()
+        receipt["mtp_probe"]["arms"]["candidate"]["server_config"][
+            "linear_attn_verify_backend"
+        ] = "triton"
+        with self.assertRaisesRegex(QualificationError, "server configuration differs"):
+            audit_receipt(receipt)
+
+    def test_08_abba_eight_observations_gate(self):
         receipt = _receipt()
         receipt["performance"]["workloads"][0]["observations"][1]["arm"] = "baseline"
         with self.assertRaisesRegex(QualificationError, "ABBA"):
             audit_receipt(receipt)
 
-    def test_07_aggregate_geomean_and_lower_ci_gate(self):
+    def test_09_aggregate_geomean_and_lower_ci_gate(self):
         receipt = _receipt()
         for workload in receipt["performance"]["workloads"]:
             workload["observations"] = _observations(1.0)
         with self.assertRaisesRegex(QualificationError, "geomean .* is not > 1"):
             audit_receipt(receipt)
 
-    def test_08_resolved_workload_regression_gate(self):
+    def test_10_resolved_workload_regression_gate(self):
         receipt = _receipt()
         receipt["performance"]["workloads"][0]["observations"] = _observations(0.95)
         receipt["performance"]["workloads"][1]["observations"] = _observations(1.30)
         with self.assertRaisesRegex(QualificationError, "resolved regression"):
             audit_receipt(receipt)
 
-    def test_09_server_hosts_are_per_arm_and_fail_closed(self):
+    def test_11_server_hosts_are_per_arm_and_fail_closed(self):
         binding = {
             "server_hosts": {
                 "baseline": "gb300-a.internal",
@@ -214,6 +309,22 @@ class QualificationContractTest(unittest.TestCase):
         candidate = _server_command(binding, "candidate")
         self.assertEqual(baseline[baseline.index("--host") + 1], "gb300-a.internal")
         self.assertEqual(candidate[candidate.index("--host") + 1], "gb300-b.internal")
+        for command, backend in ((baseline, "triton"), (candidate, "flashinfer")):
+            self.assertEqual(
+                command[command.index("--linear-attn-verify-backend") + 1], backend
+            )
+            self.assertEqual(
+                command[command.index("--speculative-algorithm") + 1], "NEXTN"
+            )
+            self.assertEqual(
+                command[command.index("--speculative-num-steps") + 1], "3"
+            )
+            self.assertEqual(
+                command[command.index("--speculative-eagle-topk") + 1], "1"
+            )
+            self.assertEqual(
+                command[command.index("--speculative-num-draft-tokens") + 1], "4"
+            )
 
         invalid_hosts = (
             None,
@@ -229,6 +340,23 @@ class QualificationContractTest(unittest.TestCase):
         for hosts in invalid_hosts:
             with self.subTest(hosts=hosts), self.assertRaises(ValueError):
                 _server_hosts({"server_hosts": hosts})
+
+    def test_12_route_marker_parser_requires_neutral_attributable_schema(self):
+        valid = (
+            "INFO FLASHINFER_GDN_NONCP_ROUTE backend=gdn_noncp "
+            f"route={EXACT_T4_ROUTE} phase=decode t=4 gates_present=True "
+            "batch_size=16"
+        )
+        match = ROUTE_RE.search(valid)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.groups(), (EXACT_T4_ROUTE, "decode", "decode", "4"))
+        self.assertIsNone(
+            ROUTE_RE.search(
+                "FLASHINFER_GDN_NONCP_ROUTE backend=gdn_noncp "
+                "route=cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp "
+                "phase=decode t=4 gates_present=True"
+            )
+        )
 
 
 if __name__ == "__main__":

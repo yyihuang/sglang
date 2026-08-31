@@ -7,6 +7,8 @@ duplicated, or provenance-drifted evidence.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 import re
@@ -58,8 +60,17 @@ GSM8K_SHOTS = 5
 MIN_SCORE = 0.93
 MAX_KL_EXCLUSIVE = 0.0035
 KL_SAMPLE_COUNT = 48
+KL_METRIC = "max_sample_sglang_logratio_surrogate"
 TP_SIZE = 4
 TP_RANKS = [0, 1, 2, 3]
+MTP_PROBE_PROMPT_INDEX = 0
+MTP_PROBE_MAX_NEW_TOKENS = 8
+MTP_SPECULATIVE_NUM_STEPS = 3
+MTP_SPECULATIVE_EAGLE_TOPK = 1
+MTP_SPECULATIVE_NUM_DRAFT_TOKENS = 4
+EXACT_T4_ROUTE = (
+    "flashinfer.gdn_decode.noncp.indexed_bf16_verify_t4.tile16_fullwarp"
+)
 ABBA_ORDER = ["baseline", "candidate", "candidate", "baseline"] * 4
 OBSERVATIONS_PER_ARM_PER_WORKLOAD = 8
 BOOTSTRAP_SAMPLES = 20_000
@@ -67,8 +78,10 @@ BOOTSTRAP_SEED = 2026083001
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _ROUTE_RE = {
-    "prefill": re.compile(r"^cake\.gdn_prefill\.noncp\.[a-z0-9_.-]+$"),
-    "decode": re.compile(r"^cake\.gdn_decode\.noncp\.[a-z0-9_.-]+$"),
+    "prefill": re.compile(
+        r"^flashinfer\.gdn_prefill\.noncp\.[a-z0-9_.-]+$"
+    ),
+    "decode": re.compile(r"^flashinfer\.gdn_decode\.noncp\.[a-z0-9_.-]+$"),
 }
 
 
@@ -167,7 +180,16 @@ def _validate_prompt_rows(rows: object, arm: str) -> float:
     return sum(scores) / PROMPT_COUNT
 
 
-def _recompute_kl(kl: Mapping[str, object]) -> float:
+def _recompute_kl(kl: Mapping[str, object]) -> list[float]:
+    """Return the existing SGLang log-ratio surrogate for each sealed sample.
+
+    For one output-token log-probability pair, the source implementation uses
+    ``exp(log_p - log_q) - 1 - (log_p - log_q)``.  Each sample is the mean of
+    those terms over its output tokens.  This is not full-vocabulary P||Q, so
+    the metric is named explicitly and the acceptance gate uses the maximum
+    sample rather than the historically weaker mean across all 48 samples.
+    """
+
     rows = kl.get("records")
     require(isinstance(rows, list) and len(rows) == KL_SAMPLE_COUNT, "KL must contain exactly 48 sealed samples")
     require([row.get("sample_index") for row in rows if isinstance(row, Mapping)] == list(range(KL_SAMPLE_COUNT)), "KL sample indices must be exactly 0..47 in order")
@@ -192,10 +214,10 @@ def _recompute_kl(kl: Mapping[str, object]) -> float:
             require(math.isfinite(term), f"KL sample {sample_index} term is not finite")
             terms.append(term)
         sample_means.append(sum(terms) / len(terms))
-    return sum(sample_means) / len(sample_means)
+    return sample_means
 
 
-def validate_accuracy(accuracy: Mapping[str, object]) -> dict[str, float]:
+def validate_accuracy(accuracy: Mapping[str, object]) -> dict[str, object]:
     arms = accuracy.get("arms")
     require(isinstance(arms, Mapping) and set(arms) == {"baseline", "candidate"}, "accuracy arms must be exactly baseline and candidate")
     scores = {}
@@ -210,11 +232,92 @@ def validate_accuracy(accuracy: Mapping[str, object]) -> dict[str, float]:
     require(scores["candidate"] >= scores["baseline"], "candidate accuracy dropped relative to baseline")
     kl = accuracy.get("kl")
     require(isinstance(kl, Mapping), "accuracy.kl must be an object")
-    mean_kl = _recompute_kl(kl)
-    reported_kl = kl.get("mean_kl")
-    require(isinstance(reported_kl, (int, float)) and math.isclose(float(reported_kl), mean_kl, rel_tol=0, abs_tol=1e-15), "reported KL does not match raw logprobs")
-    require(mean_kl < MAX_KL_EXCLUSIVE, f"mean KL {mean_kl:.9f} is not < 0.0035")
-    return {**scores, "mean_kl": mean_kl}
+    require(kl.get("metric") == KL_METRIC, f"KL metric must be {KL_METRIC}")
+    sample_values = _recompute_kl(kl)
+    mean_kl = sum(sample_values) / len(sample_values)
+    max_kl = max(sample_values)
+    reported_mean = kl.get("mean_kl")
+    reported_max = kl.get("max_kl")
+    require(isinstance(reported_mean, (int, float)) and math.isclose(float(reported_mean), mean_kl, rel_tol=0, abs_tol=1e-15), "reported mean KL surrogate does not match raw logprobs")
+    require(isinstance(reported_max, (int, float)) and math.isclose(float(reported_max), max_kl, rel_tol=0, abs_tol=1e-15), "reported max KL surrogate does not match raw logprobs")
+    require(max_kl < MAX_KL_EXCLUSIVE, f"maximum sample KL surrogate {max_kl:.9f} is not < 0.0035")
+    return {**scores, "kl_metric": KL_METRIC, "mean_kl": mean_kl, "max_kl": max_kl}
+
+
+def _json_sha256(value: object) -> str:
+    encoded = json.dumps(value, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_mtp_probe(probe: Mapping[str, object]) -> dict[str, object]:
+    arms = probe.get("arms")
+    require(
+        isinstance(arms, Mapping) and set(arms) == {"baseline", "candidate"},
+        "MTP probe arms must be exactly baseline and candidate",
+    )
+    result = {}
+    for arm, backend in (("baseline", "triton"), ("candidate", "flashinfer")):
+        row = arms[arm]
+        require(isinstance(row, Mapping), f"MTP probe {arm} must be an object")
+        require(row.get("arm") == arm, f"MTP probe {arm} arm identity differs")
+        require(
+            row.get("input_ids_sha256") == HASHES["longbench_first48_ids_sha256"],
+            f"MTP probe {arm} input IDs hash mismatch",
+        )
+        require(
+            row.get("prompt_index") == MTP_PROBE_PROMPT_INDEX,
+            f"MTP probe {arm} prompt index differs",
+        )
+        require(
+            row.get("request_count") == 1,
+            f"MTP probe {arm} was not requested exactly once",
+        )
+        require(
+            row.get("sampling_params")
+            == {
+                "temperature": 0.0,
+                "max_new_tokens": MTP_PROBE_MAX_NEW_TOKENS,
+                "ignore_eos": True,
+            },
+            f"MTP probe {arm} sampling parameters differ",
+        )
+        server_config = row.get("server_config")
+        require(
+            server_config
+            == {
+                "tp_size": TP_SIZE,
+                "speculative_algorithm": "EAGLE",
+                "speculative_num_steps": MTP_SPECULATIVE_NUM_STEPS,
+                "speculative_eagle_topk": MTP_SPECULATIVE_EAGLE_TOPK,
+                "speculative_num_draft_tokens": MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
+                "linear_attn_prefill_backend": backend,
+                "linear_attn_decode_backend": backend,
+                "linear_attn_verify_backend": backend,
+            },
+            f"MTP probe {arm} server configuration differs",
+        )
+        output_ids = row.get("output_ids")
+        require(
+            isinstance(output_ids, list)
+            and len(output_ids) == MTP_PROBE_MAX_NEW_TOKENS
+            and all(type(token) is int for token in output_ids),
+            f"MTP probe {arm} must return exactly {MTP_PROBE_MAX_NEW_TOKENS} integer output IDs",
+        )
+        output_ids_sha256 = row.get("output_ids_sha256")
+        require(
+            isinstance(output_ids_sha256, str)
+            and output_ids_sha256 == _json_sha256(output_ids),
+            f"MTP probe {arm} output IDs hash mismatch",
+        )
+        runtime = _finite_positive(
+            row.get("measured_runtime_seconds"),
+            f"MTP probe {arm} measured runtime",
+        )
+        result[arm] = {
+            "output_ids_sha256": output_ids_sha256,
+            "measured_runtime_seconds": runtime,
+        }
+    return result
 
 
 def _validate_route_names(route_kind: str, routes: object) -> list[str]:
@@ -225,7 +328,7 @@ def _validate_route_names(route_kind: str, routes: object) -> list[str]:
     return routes
 
 
-def validate_routes(routes: Mapping[str, object]) -> dict[str, list[str]]:
+def validate_routes(routes: Mapping[str, object]) -> dict[str, object]:
     expected = routes.get("expected_candidate_routes")
     require(isinstance(expected, Mapping) and set(expected) == {"prefill", "decode"}, "expected candidate routes must contain prefill and decode")
     expected_routes = {kind: _validate_route_names(kind, expected[kind]) for kind in ("prefill", "decode")}
@@ -242,14 +345,30 @@ def validate_routes(routes: Mapping[str, object]) -> dict[str, list[str]]:
             require(isinstance(prefill, list) and isinstance(decode, list), f"{arm} rank {row.get('rank')} route fields must be lists")
             require(row.get("fallback_count") == 0, f"{arm} rank {row.get('rank')} used a fallback")
             require(row.get("route_error_count") == 0, f"{arm} rank {row.get('rank')} had route errors")
+            observations = row.get("route_observations")
+            require(isinstance(observations, list), f"{arm} rank {row.get('rank')} route observations must be a list")
+            marker_count = row.get("marker_count")
+            require(isinstance(marker_count, int) and marker_count >= len(observations), f"{arm} rank {row.get('rank')} marker count is incomplete")
+            observed_t4_routes = []
+            for observation in observations:
+                require(isinstance(observation, Mapping), f"{arm} rank {row.get('rank')} route observation must be an object")
+                phase = observation.get("phase")
+                route = observation.get("route")
+                token_width = observation.get("t")
+                require(phase in {"prefill", "decode"}, f"{arm} rank {row.get('rank')} route phase is invalid")
+                require(isinstance(token_width, int) and token_width > 0, f"{arm} rank {row.get('rank')} route token width is invalid")
+                require(observation.get("gates_present") is True, f"{arm} rank {row.get('rank')} route marker lacks gate authority")
+                require(route in (prefill if phase == "prefill" else decode), f"{arm} rank {row.get('rank')} route observation differs from route sets")
+                if phase == "decode" and token_width == 4:
+                    observed_t4_routes.append(route)
             if arm == "candidate":
                 require(prefill == expected_routes["prefill"], f"candidate rank {row.get('rank')} prefill routes differ")
                 require(decode == expected_routes["decode"], f"candidate rank {row.get('rank')} decode routes differ")
-                require(row.get("cake_route_count") == len(prefill) + len(decode), f"candidate rank {row.get('rank')} route count differs")
+                require(sorted(set(observed_t4_routes)) == [EXACT_T4_ROUTE], f"candidate rank {row.get('rank')} did not prove the exact optimized T=4 route")
             else:
-                require(prefill == [] and decode == [], f"baseline rank {row.get('rank')} recorded Cake routes")
-                require(row.get("cake_route_count") == 0, f"baseline rank {row.get('rank')} Cake route count is nonzero")
-    return expected_routes
+                require(prefill == [] and decode == [], f"baseline rank {row.get('rank')} recorded optimized GDN routes")
+                require(marker_count == 0 and observations == [], f"baseline rank {row.get('rank')} optimized-route marker count is nonzero")
+    return {**expected_routes, "exact_t4_route": EXACT_T4_ROUTE}
 
 
 def _workload_block_ratios(workload: Mapping[str, object]) -> list[float]:
@@ -331,11 +450,19 @@ def validate_campaign(campaign: Mapping[str, object]) -> dict[str, float]:
 
 def audit_receipt(receipt: Mapping[str, object]) -> dict[str, object]:
     require(receipt.get("schema") == SCHEMA, f"schema must be {SCHEMA}")
-    for section in ("provenance", "campaign", "accuracy", "routes", "performance"):
+    for section in (
+        "provenance",
+        "campaign",
+        "accuracy",
+        "mtp_probe",
+        "routes",
+        "performance",
+    ):
         require(isinstance(receipt.get(section), Mapping), f"{section} must be an object")
     validate_provenance(receipt["provenance"])
     campaign = validate_campaign(receipt["campaign"])
     accuracy = validate_accuracy(receipt["accuracy"])
+    mtp_probe = validate_mtp_probe(receipt["mtp_probe"])
     routes = validate_routes(receipt["routes"])
     performance = validate_performance(receipt["performance"])
     return {
@@ -343,6 +470,7 @@ def audit_receipt(receipt: Mapping[str, object]) -> dict[str, object]:
         "passed": True,
         "campaign": campaign,
         "accuracy": accuracy,
+        "mtp_probe": mtp_probe,
         "routes": routes,
         "performance": performance,
     }
