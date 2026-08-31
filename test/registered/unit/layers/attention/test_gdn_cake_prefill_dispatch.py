@@ -6,6 +6,8 @@ import torch
 
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
+    _gdn_noncp_route_marker,
+    _neutral_gdn_noncp_route,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -82,6 +84,25 @@ def _kernel_and_inputs():
 
 
 class TestCakeGDNPrefillDispatch(unittest.TestCase):
+    def test_neutral_route_marker_pins_exact_t4_authority(self):
+        route = "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
+        self.assertEqual(
+            _neutral_gdn_noncp_route(route),
+            "flashinfer.gdn_decode.noncp.indexed_bf16_verify_t4.tile16_fullwarp",
+        )
+        self.assertEqual(
+            _gdn_noncp_route_marker(
+                route,
+                phase="decode",
+                token_width=4,
+                metadata=(("batch_size", 8), ("disable_state_update", 1)),
+            ),
+            "FLASHINFER_GDN_NONCP_ROUTE backend=gdn_noncp "
+            "route=flashinfer.gdn_decode.noncp.indexed_bf16_verify_t4.tile16_fullwarp "
+            "phase=decode t=4 gates_present=True batch_size=8 "
+            "disable_state_update=1",
+        )
+
     def test_exact_bf16_indexed_row_uses_in_place_state_and_frozen_grid(self):
         kernel, api, entry, inputs, output, workspace, empty_state, empty_i32 = (
             _kernel_and_inputs()
@@ -235,15 +256,10 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
         self.assertIs(args[12], workspace)
         self.assertEqual(args[15], 64)
         log_info.assert_called_once_with(
-            "Using %s num_seqs=%d total_tokens=%d "
-            "seq_lens=%s checkpoint_every_n_tokens=%d "
-            "num_state_checkpoints=%d",
-            "cake.gdn_prefill.noncp.full_dv",
-            7,
-            421,
-            (52, 93, 15, 107, 72, 61, 21),
-            64,
-            3,
+            "FLASHINFER_GDN_NONCP_ROUTE backend=gdn_noncp "
+            "route=flashinfer.gdn_prefill.noncp.full_dv "
+            "phase=prefill t=107 gates_present=True num_seqs=7 total_tokens=421 "
+            "checkpoint_every_n_tokens=64 num_state_checkpoints=3"
         )
 
     def test_checkpoint_and_missing_cpu_metadata_fail_closed(self):

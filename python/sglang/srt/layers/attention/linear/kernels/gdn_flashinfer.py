@@ -41,6 +41,45 @@ _flashinfer_gated_delta_rule_mtp_bf16 = None
 _cake_gdn_decode_api = None
 _cake_gdn_decode_api_checked = False
 
+_GDN_NONCP_ROUTE_MARKER = "FLASHINFER_GDN_NONCP_ROUTE"
+
+
+def _neutral_gdn_noncp_route(route_id: str) -> str:
+    """Return the public, source-neutral identity for a promoted GDN route."""
+
+    prefill_prefix = "cake.gdn_prefill.noncp"
+    decode_prefix = "cake.gdn_decode."
+    if route_id == prefill_prefix or route_id.startswith(prefill_prefix + "."):
+        return "flashinfer.gdn_prefill.noncp" + route_id[len(prefill_prefix) :]
+    if route_id.startswith(decode_prefix):
+        return "flashinfer.gdn_decode.noncp." + route_id[len(decode_prefix) :]
+    raise RuntimeError(f"unexpected promoted GDN route identity: {route_id!r}")
+
+
+def _gdn_noncp_route_marker(
+    route_id: str,
+    *,
+    phase: str,
+    token_width: int,
+    metadata: tuple[tuple[str, int], ...] = (),
+) -> str:
+    """Build one parseable route marker with explicit invocation authority."""
+
+    if phase not in {"prefill", "decode"}:
+        raise ValueError(f"invalid GDN route phase: {phase!r}")
+    if token_width <= 0:
+        raise ValueError(f"GDN route token width must be positive, got {token_width}")
+    fields = [
+        _GDN_NONCP_ROUTE_MARKER,
+        "backend=gdn_noncp",
+        f"route={_neutral_gdn_noncp_route(route_id)}",
+        f"phase={phase}",
+        f"t={token_width}",
+        "gates_present=True",
+    ]
+    fields.extend(f"{name}={value}" for name, value in metadata)
+    return " ".join(fields)
+
 
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
@@ -675,18 +714,24 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             1,
             1,
         )
-        if route.route_id not in self._cake_gdn_logged_routes:
-            self._cake_gdn_logged_routes.add(route.route_id)
+        marker_key = (route.route_id, "prefill", max_seq_len)
+        if marker_key not in self._cake_gdn_logged_routes:
+            self._cake_gdn_logged_routes.add(marker_key)
             logger.info(
-                "Using %s num_seqs=%d total_tokens=%d "
-                "seq_lens=%s checkpoint_every_n_tokens=%d "
-                "num_state_checkpoints=%d",
-                route.route_id,
-                num_seqs,
-                total_tokens,
-                tuple(seq_lens_cpu),
-                state_checkpoint_every_n_tokens,
-                num_state_checkpoints,
+                _gdn_noncp_route_marker(
+                    route.route_id,
+                    phase="prefill",
+                    token_width=max_seq_len,
+                    metadata=(
+                        ("num_seqs", num_seqs),
+                        ("total_tokens", total_tokens),
+                        (
+                            "checkpoint_every_n_tokens",
+                            state_checkpoint_every_n_tokens,
+                        ),
+                        ("num_state_checkpoints", num_state_checkpoints),
+                    ),
+                )
             )
         h = state_checkpoints.unsqueeze(0) if enable_checkpoints else None
         return output.view(1, total_tokens, num_v_heads, 128), h
@@ -826,9 +871,25 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             1,
             1,
         )
-        if route.route_id not in self._cake_gdn_logged_routes:
-            self._cake_gdn_logged_routes.add(route.route_id)
-            logger.info("Using %s", route.route_id)
+        marker_key = (route.route_id, "decode", seq_len)
+        if marker_key not in self._cake_gdn_logged_routes:
+            self._cake_gdn_logged_routes.add(marker_key)
+            logger.info(
+                _gdn_noncp_route_marker(
+                    route.route_id,
+                    phase="decode",
+                    token_width=seq_len,
+                    metadata=(
+                        ("batch_size", batch_size),
+                        ("disable_state_update", int(disable_state_update)),
+                        (
+                            "cache_intermediate_states",
+                            int(cache_intermediate_states),
+                        ),
+                        ("cache_steps", cache_steps),
+                    ),
+                )
+            )
         return output.view(1, batch_size * seq_len, num_v_heads, 128)
 
     # ---- decode ----
