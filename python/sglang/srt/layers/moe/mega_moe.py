@@ -169,8 +169,7 @@ def forward_mega_moe(
     num_tokens = hidden_states.shape[0]
 
     sbo_overlap_flag = (
-        not get_moe_a2a_backend().is_flashinfer_megamoe()
-        and moe.alt_stream is not None
+        moe.alt_stream is not None
         and moe.num_fused_shared_experts == 0
         and num_tokens > 0
         and get_is_capture_mode()
