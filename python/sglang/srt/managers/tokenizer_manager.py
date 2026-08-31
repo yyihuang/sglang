@@ -2639,6 +2639,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
             meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
+            if os.environ.get(
+                "SGLANG_GDN_QUALIFICATION_KL_SINK_AUTHORITY"
+            ) or os.environ.get(
+                "SGLANG_GDN_QUALIFICATION_KL_SINK_AUTHORITY_SHA256"
+            ):
+                from tools.gdn_public_qualification.kl_sink_hook import (
+                    attach_sink_receipt,
+                )
+
+                attach_sink_receipt(meta_info, token_ids_logprob)
 
     def convert_logprob_style(
         self,

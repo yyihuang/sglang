@@ -35,6 +35,12 @@ from tools.gdn_public_qualification.contract import (
     PROMPT_COUNT,
     TP_SIZE,
 )
+from tools.gdn_public_qualification.kl_sink_hook import (
+    KL_SINK_AUTHORITY_SCHEMA,
+    KL_SINK_RESPONSE_KEY,
+    KL_SINK_SAMPLE_SCHEMA,
+    marker_for_sample,
+)
 
 INVALID_ANSWER = object()
 ROUTE_MARKER = "FLASHINFER_GDN_NONCP_ROUTE"
@@ -231,75 +237,83 @@ def _kl_server_identity(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def _prepare_kl_output(output: Path) -> Path:
-    if output.exists():
-        raise ValueError(f"KL manifest output already exists: {output}")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    shard_root = output.parent / f"{output.name}.shards"
-    if shard_root.exists():
-        raise ValueError(f"KL shard directory already exists: {shard_root}")
-    shard_root.mkdir()
-    return shard_root
+def _prepare_kl_output(args: argparse.Namespace, arm: str) -> tuple[dict, str]:
+    root = args.sink_root.resolve()
+    if args.output.resolve() != root / "manifest.json":
+        raise ValueError("KL output must be the sealed sink root manifest.json")
+    if args.output.exists():
+        raise ValueError(f"KL manifest output already exists: {args.output}")
+    authority_path = root / "authority.json"
+    if not authority_path.is_file():
+        raise ValueError("KL sink authority is missing")
+    raw = authority_path.read_bytes()
+    authority = json.loads(raw)
+    expected = {
+        "schema": KL_SINK_AUTHORITY_SCHEMA,
+        "root": str(root),
+        "arm": arm,
+        "vocab_size": args.vocab_size,
+        "sample_count": KL_SAMPLE_COUNT,
+        "position_count": 512,
+        "vocab_chunk_size": KL_VOCAB_CHUNK_SIZE,
+        "token_id_order": KL_TOKEN_ID_ORDER,
+        "dtype": "float32",
+        "byte_order": "little",
+        "normalization_atol": KL_NORMALIZATION_ATOL,
+    }
+    if not isinstance(authority, dict) or any(authority.get(k) != v for k, v in expected.items()):
+        raise ValueError("KL sink authority differs from the collector contract")
+    for directory in (root / "shards", root / "receipts"):
+        if not directory.is_dir() or any(directory.iterdir()):
+            raise ValueError(f"KL sink directory must be fresh and empty: {directory}")
+    return authority, hashlib.sha256(raw).hexdigest()
 
 
-def _extract_distribution_rows(
+def _extract_sink_receipt(
     result: object,
     output_ids: list[int],
-    token_start: int,
-    token_end: int,
     sample_index: int,
-) -> list[list[float]]:
+    authority_sha256: str,
+    arm: str,
+    vocab_size: int,
+) -> dict:
     if not isinstance(result, dict) or not isinstance(result.get("meta_info"), dict):
         raise ValueError(f"KL sample {sample_index} response has no meta_info")
     meta_info = result["meta_info"]
     selected = meta_info.get("input_token_logprobs")
-    distributions = meta_info.get("input_token_ids_logprobs")
     position_count = len(output_ids)
-    if not (
-        isinstance(selected, list)
-        and isinstance(distributions, list)
-        and len(selected) >= position_count
-        and len(distributions) >= position_count
-    ):
+    if not isinstance(selected, list) or len(selected) < position_count:
         raise ValueError(f"KL sample {sample_index} returned incomplete teacher-forced positions")
     selected = selected[-position_count:]
-    distributions = distributions[-position_count:]
-    width = token_end - token_start
-    expected_ids = list(range(token_start, token_end))
-    output = []
-    for position, (selected_row, distribution_row, expected_output_id) in enumerate(
-        zip(selected, distributions, output_ids)
-    ):
+    for position, (selected_row, expected_output_id) in enumerate(zip(selected, output_ids)):
         if not (
             isinstance(selected_row, (list, tuple))
             and len(selected_row) >= 2
             and selected_row[1] == expected_output_id
         ):
             raise ValueError(f"KL sample {sample_index} position {position} teacher-forced token alignment differs")
-        if not isinstance(distribution_row, list) or len(distribution_row) != width:
-            raise ValueError(f"KL sample {sample_index} position {position} vocabulary row is incomplete")
-        token_ids = []
-        values = []
-        for entry in distribution_row:
-            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-                raise ValueError(f"KL sample {sample_index} position {position} vocabulary entry is malformed")
-            value, token_id = entry[:2]
-            if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > 1e-6:
-                raise ValueError(f"KL sample {sample_index} position {position} has an invalid logprob")
-            if type(token_id) is not int:
-                raise ValueError(f"KL sample {sample_index} position {position} has a non-integer token ID")
-            token_ids.append(token_id)
-            values.append(float(value))
-        if token_ids != expected_ids:
-            raise ValueError(f"KL sample {sample_index} position {position} token IDs are not the exact requested vocabulary chunk")
-        output.append(values)
-    return output
-
-
-def _write_f32le(path: Path, matrix) -> None:
-    payload = matrix.astype("<f4", copy=False).tobytes(order="C")
-    with path.open("xb") as handle:
-        handle.write(payload)
+    response = meta_info.get(KL_SINK_RESPONSE_KEY)
+    if not isinstance(response, dict) or not isinstance(response.get("receipt"), dict):
+        raise ValueError(f"KL sample {sample_index} returned no sealed sink receipt")
+    receipt = response["receipt"]
+    expected = {
+        "schema": KL_SINK_SAMPLE_SCHEMA,
+        "authority_sha256": authority_sha256,
+        "arm": arm,
+        "sample_index": sample_index,
+        "position_count": position_count,
+        "vocab_size": vocab_size,
+        "position_mapping": "first_512_rows_after_prompt_predecessor",
+        "token_id_order": KL_TOKEN_ID_ORDER,
+        "dtype": "float32",
+        "byte_order": "little",
+        "vocab_chunk_size": KL_VOCAB_CHUNK_SIZE,
+    }
+    if any(receipt.get(k) != v for k, v in expected.items()) or not isinstance(
+        response.get("receipt_sha256"), str
+    ):
+        raise ValueError(f"KL sample {sample_index} sink receipt identity differs")
+    return response
 
 
 def _collect_kl_distribution(
@@ -310,63 +324,80 @@ def _collect_kl_distribution(
     continuations: list[list[int]],
     reference_manifest_sha256: str | None = None,
 ) -> None:
-    """Collect all vocabulary IDs in bounded chunks; no top-k path is used."""
+    """Request one server-side full-vocabulary sink forward per sample."""
 
     np = _require_numpy()
-    shard_root = _prepare_kl_output(args.output)
+    _, authority_sha256 = _prepare_kl_output(args, arm)
+    root = args.sink_root.resolve()
     records = []
     collection_start = time.perf_counter()
     _flush(args.base_url, args.timeout)
     for sample_index, (prompt_ids, output_ids) in enumerate(zip(input_ids, continuations)):
         position_count = len(output_ids)
         probability_mass = np.zeros(position_count, dtype=np.float64)
-        shards = []
         joined = prompt_ids + output_ids
-        for token_start in range(0, args.vocab_size, KL_VOCAB_CHUNK_SIZE):
-            token_end = min(token_start + KL_VOCAB_CHUNK_SIZE, args.vocab_size)
-            result = _as_results(
-                _post(
-                    args.base_url,
-                    "/generate",
-                    {
-                        "input_ids": [joined],
-                        "sampling_params": {"temperature": 0.0, "max_new_tokens": 0},
-                        "return_logprob": True,
-                        "return_text_in_logprobs": False,
-                        # Include one predecessor position, then select and verify
-                        # the exact output-token tail from both returned arrays.
-                        "logprob_start_len": max(0, len(prompt_ids) - 1),
-                        "token_ids_logprob": list(range(token_start, token_end)),
-                    },
-                    args.timeout,
-                ),
-                1,
-            )[0]
-            rows = _extract_distribution_rows(
-                result,
-                output_ids,
-                token_start,
-                token_end,
-                sample_index,
-            )
-            matrix = np.asarray(rows, dtype=np.float32)
-            expected_shape = (position_count, token_end - token_start)
-            if matrix.shape != expected_shape or not bool(np.isfinite(matrix).all()):
-                raise ValueError(f"KL sample {sample_index} chunk {token_start}:{token_end} matrix is invalid")
-            probability_mass += np.sum(np.exp(matrix.astype(np.float64)), axis=1, dtype=np.float64)
-            file_name = f"sample-{sample_index:03d}-vocab-{token_start:06d}-{token_end:06d}.f32le"
-            shard_path = shard_root / file_name
-            _write_f32le(shard_path, matrix)
-            shards.append(
+        result = _as_results(
+            _post(
+                args.base_url,
+                "/generate",
                 {
-                    "path": f"{shard_root.name}/{file_name}",
-                    "token_start": token_start,
-                    "token_end": token_end,
-                    "shape": [position_count, token_end - token_start],
-                    "byte_count": position_count * (token_end - token_start) * 4,
-                    "sha256": _sha256(shard_path),
-                }
+                    "input_ids": [joined],
+                    "sampling_params": {"temperature": 0.0, "max_new_tokens": 0},
+                    "return_logprob": True,
+                    "return_text_in_logprobs": False,
+                    "logprob_start_len": max(0, len(prompt_ids) - 1),
+                    "token_ids_logprob": marker_for_sample(args.vocab_size, sample_index),
+                },
+                args.timeout,
+            ),
+            1,
+        )[0]
+        response = _extract_sink_receipt(
+            result, output_ids, sample_index, authority_sha256, arm, args.vocab_size
+        )
+        receipt_path = root / "receipts" / f"sample-{sample_index:03d}.json"
+        raw_receipt = receipt_path.read_bytes()
+        if hashlib.sha256(raw_receipt).hexdigest() != response["receipt_sha256"]:
+            raise ValueError(f"KL sample {sample_index} receipt SHA256 mismatch")
+        receipt = json.loads(raw_receipt)
+        if receipt != response["receipt"] or receipt.get("arm") != arm:
+            raise ValueError(f"KL sample {sample_index} receipt content differs")
+        shards = receipt.get("shards")
+        if not isinstance(shards, list) or not shards:
+            raise ValueError(f"KL sample {sample_index} has no sink shards")
+        cursor = 0
+        for shard_index, shard in enumerate(shards):
+            if not isinstance(shard, dict):
+                raise ValueError(f"KL sample {sample_index} shard {shard_index} is malformed")
+            token_start, token_end = shard.get("token_start"), shard.get("token_end")
+            if (
+                type(token_start) is not int
+                or type(token_end) is not int
+                or token_start != cursor
+                or not token_start < token_end <= args.vocab_size
+                or token_end - token_start > KL_VOCAB_CHUNK_SIZE
+                or shard.get("shape") != [position_count, token_end - token_start]
+                or shard.get("byte_count") != position_count * (token_end - token_start) * 4
+            ):
+                raise ValueError(f"KL sample {sample_index} shard {shard_index} coverage differs")
+            expected_name = (
+                f"sample-{sample_index:03d}-vocab-{token_start:06d}-{token_end:06d}.f32le"
             )
+            if shard.get("path") != f"shards/{expected_name}":
+                raise ValueError(f"KL sample {sample_index} shard {shard_index} path differs")
+            path = root / "shards" / expected_name
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"KL sample {sample_index} shard {shard_index} is missing")
+            raw = path.read_bytes()
+            if len(raw) != shard.get("byte_count") or hashlib.sha256(raw).hexdigest() != shard.get("sha256"):
+                raise ValueError(f"KL sample {sample_index} shard {shard_index} hash or size differs")
+            matrix = np.frombuffer(raw, dtype="<f4").reshape(position_count, token_end - token_start).astype(np.float64)
+            if not bool(np.isfinite(matrix).all()) or float(np.max(matrix)) > 1e-6:
+                raise ValueError(f"KL sample {sample_index} shard {shard_index} contains invalid logprobs")
+            probability_mass += np.sum(np.exp(matrix.astype(np.float64)), axis=1, dtype=np.float64)
+            cursor = token_end
+        if cursor != args.vocab_size:
+            raise ValueError(f"KL sample {sample_index} does not cover the full vocabulary")
         bad_positions = np.flatnonzero(np.abs(probability_mass - 1.0) > KL_NORMALIZATION_ATOL)
         if bad_positions.size:
             position = int(bad_positions[0])
@@ -395,6 +426,7 @@ def _collect_kl_distribution(
         "byte_order": "little",
         "normalization_atol": KL_NORMALIZATION_ATOL,
         "vocab_chunk_size": KL_VOCAB_CHUNK_SIZE,
+        "sink_authority_sha256": authority_sha256,
         "collection_runtime_seconds": time.perf_counter() - collection_start,
         "records": records,
     }
@@ -653,6 +685,7 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--tokenizer-path", required=True)
         child.add_argument("--model-manifest-sha256", required=True)
         child.add_argument("--vocab-size", type=int, required=True)
+        child.add_argument("--sink-root", type=Path, required=True)
 
     mtp_probe = server_parser("mtp-probe", collect_mtp_probe)
     mtp_probe.add_argument("--arm", choices=("baseline", "candidate"), required=True)

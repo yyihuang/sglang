@@ -44,11 +44,21 @@ For each arm, `collect.py accuracy` runs all 1,314 GSM8K prompts once. The KL
 reference command separately generates 512 fixed output token IDs for each of
 the 48 sealed helper prompts. It then teacher-forces those sequences on the
 baseline; the candidate command teacher-forces the identical prompt and output
-IDs. At every scored output position, both commands request `token_ids_logprob`
-for ascending token IDs `0..vocab_size-1`. Requests are split into fixed 8,192-
-ID transport chunks, but every chunk is retained in hash-addressed little-
-endian float32 shards. This is complete vocabulary coverage, not selected-token
-evidence and not a top-k approximation.
+IDs. The rendered server command uses `kl_sink_server.py`, which creates a fresh
+sealed per-arm sink root before SGLang starts. A qualification-only marker asks
+the scheduler to write all ascending token IDs `0..vocab_size-1` directly from
+the existing full-vocabulary input-logprob tensor. Each sample therefore needs
+one teacher-forced forward, not one forward per transport chunk. The scheduler
+writes fixed 8,192-ID, hash-addressed little-endian float32 shards and the HTTP
+response carries only a small receipt. This is complete vocabulary coverage,
+not selected-token evidence and not a top-k approximation.
+
+The sink is disabled unless the launch adapter sets both halves of its sealed
+authority. Its root must be an absolute, fresh child of an existing directory;
+startup creates it and an immutable authority file exactly once. Requests carry
+only a fixed in-vocabulary sample marker, never a path. Only TP rank zero writes,
+and shard and sample-receipt files use exclusive creation, so retries, overwrite,
+root reuse, mixed samples, or non-canonical position layouts fail closed.
 
 The collector fails closed unless `/server_info` reports TP4 and `/model_info`
 matches the exact model and tokenizer paths bound into the plan. The two
@@ -56,7 +66,9 @@ manifests must also share the sealed model-manifest hash, vocabulary size,
 token-ID order, prompt hashes, output-token hashes, scored positions, and shard
 boundaries. Every returned token ID must equal the requested ID, every log
 probability must be finite, and each position's complete probability mass must
-be within `5e-4` of one.
+be within `5e-4` of one. The collector independently reads every server-written
+shard, checks the small receipt and authority hashes, shape and complete token
+range, then recomputes normalization before it writes the arm manifest.
 
 The metric is the forward full-distribution divergence
 `D_KL(P_baseline || Q_candidate)`. The auditor reads and hashes both sets of raw
@@ -125,8 +137,11 @@ launch servers or alter route, accuracy, KL, or performance acceptance gates.
 Create a private binding JSON with the staged model and tokenizer directories,
 the tokenizer vocabulary size, the exact paths for every key in
 `render_plan.ARTIFACT_HASH_KEYS`, separate baseline/candidate hosts, ports, and
-rank-log paths, the candidate FlashInfer Python path, CUDA version, GPU name,
-and container image. Then, inside the allocated compute job:
+rank-log paths, fresh absolute `kl_sink_roots.baseline` and
+`kl_sink_roots.candidate` paths whose parents already exist, the candidate
+FlashInfer Python path, CUDA version, GPU name, and container image. The
+renderer launches both servers through the sealed sink adapter. Then, inside
+the allocated compute job:
 
 ```bash
 python -m tools.gdn_public_qualification.render_plan bindings.json --output plan.json
@@ -136,22 +151,25 @@ python -m tools.gdn_public_qualification.collect kl-reference \
   --input-ids-sha256 "$LONG48_SHA256" --model-path "$MODEL_PATH" \
   --tokenizer-path "$TOKENIZER_PATH" --vocab-size "$VOCAB_SIZE" \
   --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
-  --output kl-baseline-manifest.json
+  --sink-root "$BASELINE_SINK_ROOT" \
+  --output "$BASELINE_SINK_ROOT/manifest.json"
 python -m tools.gdn_public_qualification.collect kl-candidate \
-  --base-url "$CANDIDATE_URL" --reference kl-baseline-manifest.json \
+  --base-url "$CANDIDATE_URL" \
+  --reference "$BASELINE_SINK_ROOT/manifest.json" \
   --input-ids "$LONG48_IDS" --input-ids-sha256 "$LONG48_SHA256" \
   --model-path "$MODEL_PATH" --tokenizer-path "$TOKENIZER_PATH" \
   --vocab-size "$VOCAB_SIZE" \
   --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
-  --output kl-candidate-manifest.json
+  --sink-root "$CANDIDATE_SINK_ROOT" \
+  --output "$CANDIDATE_SINK_ROOT/manifest.json"
 python -m tools.gdn_public_qualification.audit result.json --output audit.json
 ```
 
 `result.json` references each KL manifest with a path relative to the result
-file and its SHA256. Keep each manifest beside its generated `.shards`
-directory. The auditor resolves only safe relative paths below the result
-directory and refuses missing, reused, truncated, re-ordered, or hash-drifted
-distribution evidence.
+file and its SHA256. Place the result so both sealed sink roots and their
+manifests/shards are below its directory. The auditor resolves only safe
+relative paths below the result directory and refuses missing, reused,
+truncated, re-ordered, or hash-drifted distribution evidence.
 
 Keep `bindings.json`, `plan.json`, raw model outputs, rank logs, results, and the
 audit receipt in the durable campaign evidence directory. Record their SHA256

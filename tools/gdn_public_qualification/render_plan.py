@@ -69,6 +69,16 @@ def _server_hosts(binding: dict) -> dict[str, str]:
     return hosts
 
 
+def _kl_sink_roots(binding: dict) -> dict[str, str]:
+    roots = binding.get("kl_sink_roots")
+    if not isinstance(roots, dict) or set(roots) != {"baseline", "candidate"}:
+        raise ValueError("kl_sink_roots must contain exactly baseline and candidate")
+    for arm, value in roots.items():
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise ValueError(f"kl_sink_roots.{arm} must be an absolute path")
+    return roots
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -98,10 +108,18 @@ def _model_vocab_size(model_path: Path) -> int:
 def _server_command(binding: dict, arm: str) -> list[str]:
     backend = "triton" if arm == "baseline" else "flashinfer"
     hosts = _server_hosts(binding)
+    sink_roots = _kl_sink_roots(binding)
     return [
         binding.get("python_executable", "python3"),
         "-m",
-        "sglang.launch_server",
+        "tools.gdn_public_qualification.kl_sink_server",
+        "--sink-root",
+        sink_roots[arm],
+        "--sink-arm",
+        arm,
+        "--sink-vocab-size",
+        str(binding["vocab_size"]),
+        "--",
         "--model-path",
         binding["model_path"],
         "--tokenizer-path",
@@ -180,8 +198,13 @@ def main() -> int:
         parser.error("ports must contain exactly baseline and candidate")
     try:
         server_hosts = _server_hosts(binding)
+        sink_roots = _kl_sink_roots(binding)
     except ValueError as exc:
         parser.error(str(exc))
+    for arm, root_text in sink_roots.items():
+        root = Path(root_text)
+        if root.exists() or not root.parent.is_dir():
+            parser.error(f"kl_sink_roots.{arm} must be a fresh child of an existing directory")
     artifacts = binding.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != set(ARTIFACT_HASH_KEYS):
         parser.error(f"artifacts must contain exactly {sorted(ARTIFACT_HASH_KEYS)}")
@@ -245,6 +268,8 @@ def main() -> int:
             "model_path": binding["model_path"],
             "tokenizer_path": binding["tokenizer_path"],
             "tokenizer_authority_sha256": HASHES["model_manifest_sha256"],
+            "server_side_sink_roots": sink_roots,
+            "teacher_forced_forwards_per_sample_per_arm": 1,
         },
         "mtp_probe": {
             "arms": ["baseline", "candidate"],

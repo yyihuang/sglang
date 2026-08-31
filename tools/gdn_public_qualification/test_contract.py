@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.gdn_public_qualification.collect import ROUTE_RE, _extract_distribution_rows
+from tools.gdn_public_qualification.collect import ROUTE_RE
 from tools.gdn_public_qualification.contract import (
     ABBA_ORDER,
     BOOTSTRAP_SAMPLES,
@@ -37,6 +37,8 @@ from tools.gdn_public_qualification.contract import (
     expected_provenance,
 )
 from tools.gdn_public_qualification.render_plan import _server_command, _server_hosts
+from tools.gdn_public_qualification.kl_sink_hook import marker_for_sample
+from tools.gdn_public_qualification.kl_sink_server import prepare_sink_root
 
 
 def _prompt_rows(correct_count: int) -> list[dict]:
@@ -165,6 +167,7 @@ def _write_kl_evidence(
             "byte_order": "little",
             "normalization_atol": KL_NORMALIZATION_ATOL,
             "vocab_chunk_size": KL_VOCAB_CHUNK_SIZE,
+            "sink_authority_sha256": ("a" if arm == "baseline" else "b") * 64,
             "records": records,
         }
         if arm == "candidate":
@@ -415,6 +418,11 @@ class QualificationContractTest(unittest.TestCase):
             "ports": {"baseline": 31000, "candidate": 31001},
             "model_path": "/model",
             "tokenizer_path": "/model",
+            "vocab_size": 151936,
+            "kl_sink_roots": {
+                "baseline": "/sink/baseline",
+                "candidate": "/sink/candidate",
+            },
         }
         self.assertEqual(
             _server_hosts(binding),
@@ -440,6 +448,7 @@ class QualificationContractTest(unittest.TestCase):
             self.assertEqual(
                 command[command.index("--speculative-num-draft-tokens") + 1], "4"
             )
+            self.assertIn("tools.gdn_public_qualification.kl_sink_server", command)
 
         invalid_hosts = (
             None,
@@ -532,22 +541,16 @@ class QualificationContractTest(unittest.TestCase):
         with self.assertRaisesRegex(QualificationError, "shard 0 SHA256 mismatch"):
             self._audit(_receipt(self.kl_specs, self.kl_value))
 
-    def test_18_collector_requires_exact_requested_token_ids(self):
-        result = {
-            "meta_info": {
-                "input_token_logprobs": [[math.log(0.5), 1, None]],
-                "input_token_ids_logprobs": [
-                    [[math.log(0.5), 0, None], [math.log(0.5), 1, None]]
-                ],
-            }
-        }
-        self.assertEqual(
-            _extract_distribution_rows(result, [1], 0, 2, 0),
-            [[math.log(0.5), math.log(0.5)]],
-        )
-        result["meta_info"]["input_token_ids_logprobs"][0].pop()
-        with self.assertRaisesRegex(ValueError, "vocabulary row is incomplete"):
-            _extract_distribution_rows(result, [1], 0, 2, 0)
+    def test_18_sink_root_is_fresh_sealed_and_request_marker_has_no_path(self):
+        root = self.evidence_root / "sink-server"
+        authority_path, authority_sha = prepare_sink_root(root, "baseline", 151936)
+        self.assertTrue(authority_path.is_file())
+        self.assertEqual(hashlib.sha256(authority_path.read_bytes()).hexdigest(), authority_sha)
+        marker = marker_for_sample(151936, 17)
+        self.assertEqual(marker, [151935, 151934, 151935, 151934, 17])
+        self.assertTrue(all(type(value) is int for value in marker))
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            prepare_sink_root(root, "baseline", 151936)
 
 
 if __name__ == "__main__":

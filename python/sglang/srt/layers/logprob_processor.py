@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
@@ -297,6 +298,18 @@ def get_token_ids_logprobs_chunk(
     Returns:
         int: Number of remaining tokens to process in next chunk
     """
+    if os.environ.get("SGLANG_GDN_QUALIFICATION_KL_SINK_AUTHORITY") or os.environ.get(
+        "SGLANG_GDN_QUALIFICATION_KL_SINK_AUTHORITY_SHA256"
+    ):
+        from tools.gdn_public_qualification.kl_sink_hook import maybe_sink_full_vocab
+
+        maybe_sink_full_vocab(
+            logprobs,
+            token_ids_logprobs,
+            pruned_lens,
+            split_pruned_len,
+            log_normalizer,
+        )
     # Empty chunks still walk the slice to emit placeholder entries.
     if log_normalizer is not None:
         row_max, row_log_sum = log_normalizer

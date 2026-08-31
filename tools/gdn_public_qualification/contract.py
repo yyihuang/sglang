@@ -253,6 +253,8 @@ def _validate_kl_manifest_identity(manifest: Mapping[str, object], arm: str) -> 
     require(manifest.get("normalization_atol") == KL_NORMALIZATION_ATOL, f"{arm} KL normalization tolerance differs")
     require(manifest.get("vocab_chunk_size") == KL_VOCAB_CHUNK_SIZE, f"{arm} KL vocabulary chunk size differs")
     require(manifest.get("model_manifest_sha256") == HASHES["model_manifest_sha256"], f"{arm} KL model manifest hash differs")
+    sink_authority_sha256 = manifest.get("sink_authority_sha256")
+    require(isinstance(sink_authority_sha256, str) and bool(_SHA256_RE.fullmatch(sink_authority_sha256)), f"{arm} KL sink authority SHA256 is required")
     for key in ("model_path", "tokenizer_path"):
         require(isinstance(manifest.get(key), str) and bool(manifest[key]), f"{arm} KL {key} is required")
     vocab_size = manifest.get("vocab_size")
