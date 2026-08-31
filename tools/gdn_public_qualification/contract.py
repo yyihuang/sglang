@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 
 SCHEMA = "gdn-public-qualification-result-v1"
 PLAN_SCHEMA = "gdn-public-qualification-plan-v1"
+ROUTE_ARTIFACT_SCHEMA = "gdn-noncp-final-sglang-route-artifact-v1"
 
 SGLANG_INTEGRATION_COMMIT = "d1aeb7785547d6de57ff9b199662726664af8099"
 SGLANG_INTEGRATION_TREE = "5e9a389267abe5e7354f7730dc022a2d0f4b0e3d"
@@ -71,6 +72,23 @@ MTP_SPECULATIVE_NUM_DRAFT_TOKENS = 4
 EXACT_T4_ROUTE = (
     "flashinfer.gdn_decode.noncp.indexed_bf16_verify_t4.tile16_fullwarp"
 )
+# These exact exported contract rows are the routes exercised by the pinned
+# SGLang TP4 campaign.  The route-artifact producer resolves their route IDs
+# from the authenticated final export instead of accepting route names from a
+# caller.
+SGLANG_ROUTE_CONTRACT_ROWS = {
+    "prefill": (
+        ("prefill_focus", "correctness_sglang_tp4_bf16_indexed_b5_s64"),
+        (
+            "prefill_focus",
+            "correctness_sglang_tp4_bf16_indexed_checkpoint_b7_t421",
+        ),
+    ),
+    "decode": (
+        ("decode_bf16_serving", "bf16_sglang_qwen_tp4_decode_t1"),
+        ("decode_bf16_serving", "bf16_sglang_qwen_tp4_verify_t4"),
+    ),
+}
 ABBA_ORDER = ["baseline", "candidate", "candidate", "baseline"] * 4
 OBSERVATIONS_PER_ARM_PER_WORKLOAD = 8
 BOOTSTRAP_SAMPLES = 20_000

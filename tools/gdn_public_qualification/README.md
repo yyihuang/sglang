@@ -66,6 +66,42 @@ ranks 0–3, including
 route error or fallback. Every baseline rank must report zero attributable
 optimized-route markers. Missing or malformed route evidence fails closed.
 
+## Final route artifact
+
+`produce_route_artifact.py` emits the deterministic
+`gdn-noncp-final-sglang-route-artifact-v1` input consumed by the TP4 renderer.
+It does not accept caller-written routes. It selects the four exact campaign
+rows pinned in `contract.py` from a hash-authenticated final core manifest,
+requires matching optimized SM100a/SM103a dispatch, and proves every selected
+raw route against literals in the hash-authenticated installed
+`flashinfer/jit/gdn_noncp.py`. Decode routes must be exact literals; prefill
+routes use the loader's canonical base plus its generated `dvsplit` or
+`full_dv` suffix. The exact T=4 decode literal is mandatory.
+
+The command requires full Cake and FlashInfer commit/tree identities, clean
+matching checkouts, the exact Cake exporter hash, core and overlay manifest
+hashes, and an overlay whose complete output set matches the FlashInfer tree.
+It rejects placeholders, abbreviations, dirty or mismatched sources, missing
+contract rows, and stale literals. Output contains no timestamp or local path
+and must be a fresh absolute file.
+
+```bash
+python -m tools.gdn_public_qualification.produce_route_artifact \
+  --cake-root /absolute/clean/final-cake \
+  --cake-commit "$CAKE_COMMIT" --cake-tree "$CAKE_TREE" \
+  --cake-exporter-sha256 "$CAKE_EXPORTER_SHA256" \
+  --flashinfer-root /absolute/clean/final-flashinfer \
+  --flashinfer-commit "$FLASHINFER_COMMIT" --flashinfer-tree "$FLASHINFER_TREE" \
+  --core-manifest /absolute/export/manifest.json \
+  --core-manifest-sha256 "$CORE_MANIFEST_SHA256" \
+  --overlay-manifest /absolute/export/overlay/manifest.json \
+  --overlay-manifest-sha256 "$OVERLAY_MANIFEST_SHA256" \
+  --output /absolute/fresh/route-artifact.json
+```
+
+Hash the result into the unresolved TP4 final pins. This producer does not
+launch servers or alter route, accuracy, KL, or performance acceptance gates.
+
 ## Use
 
 Create a private binding JSON with the staged model directory, the exact paths
