@@ -222,7 +222,13 @@ class TestFlashInferMegaMoEActiveChunks(unittest.TestCase):
             is_hash=False,
             layer_id=0,
         )
-        with patch.dict(sys.modules, _fake_flashinfer_modules()):
+        with (
+            patch.dict(sys.modules, _fake_flashinfer_modules()),
+            patch(
+                "sglang.srt.layers.moe.mega_moe.ExpertLocationDispatchInfo.init_new",
+                return_value=object(),
+            ),
+        ):
             output = _run_flashinfer_mega_routed(moe, hidden, None, None, num_tokens)
 
         self.assertEqual(tuple(output.shape), tuple(hidden.shape))
