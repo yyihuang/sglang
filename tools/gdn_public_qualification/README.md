@@ -12,7 +12,8 @@ emits a private plan and pins:
 - the exact SGLang integration base, FlashInfer commit/tree/bundle, exported
   source commit/tree, manifests, kernel, and exporter;
 - the 1,319-row sealed GSM8K file as five fixed shots followed by exactly 1,314
-  unique evaluation prompts, requested once per arm;
+  unique evaluation prompts, plus the exact 1,314-row prompt-token artifact
+  requested once per arm;
 - the two fixed 32- and 48-prompt LongBench token-ID workloads;
 - TP4 ranks 0–3 on compute capability 10.3 in the named container and model
   revision.
@@ -40,7 +41,10 @@ token IDs, their hash, and wall runtime. Together with the exact per-rank T=4
 route markers, this proves that the campaign exercised the real MTP/target-
 verify server configuration rather than merely declaring it in a plan.
 
-For each arm, `collect.py accuracy` runs all 1,314 GSM8K prompts once. The KL
+For each arm, `collect.py accuracy` sends all 1,314 sealed GSM8K token-ID rows
+once. Each raw prompt result records the token-row hash and length; the auditor
+hashes the prompt-token artifact itself and independently matches every row.
+The KL
 reference command separately generates 512 fixed output token IDs for each of
 the 48 sealed helper prompts. It then teacher-forces those sequences on the
 baseline; the candidate command teacher-forces the identical prompt and output
@@ -145,6 +149,12 @@ the allocated compute job:
 
 ```bash
 python -m tools.gdn_public_qualification.render_plan bindings.json --output plan.json
+python -m tools.gdn_public_qualification.collect accuracy \
+  --base-url "$BASELINE_URL" --arm baseline \
+  --dataset "$GSM8K_DATASET" --dataset-sha256 "$GSM8K_DATASET_SHA256" \
+  --prompt-ids "$GSM8K_PROMPT_IDS" \
+  --prompt-ids-sha256 "$GSM8K_PROMPT_IDS_SHA256" \
+  --output baseline-gsm8k.json
 python -m tools.gdn_public_qualification.collect mtp-probe --help
 python -m tools.gdn_public_qualification.collect kl-reference \
   --base-url "$BASELINE_URL" --input-ids "$LONG48_IDS" \

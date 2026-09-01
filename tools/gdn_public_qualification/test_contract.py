@@ -47,6 +47,10 @@ def _prompt_rows(correct_count: int) -> list[dict]:
             "question_index": index,
             "source_row_index": index + 5,
             "request_count": 1,
+            "input_ids_sha256": hashlib.sha256(
+                json.dumps([index + 1], separators=(",", ":")).encode()
+            ).hexdigest(),
+            "input_token_count": 1,
             "correct": index < correct_count,
         }
         for index in range(PROMPT_COUNT)
@@ -55,6 +59,8 @@ def _prompt_rows(correct_count: int) -> list[dict]:
 
 def _accuracy_arm(correct_count: int) -> dict:
     return {
+        "prompt_ids_sha256": HASHES["gsm8k_prompt_ids_sha256"],
+        "request_payload": "input_ids",
         "score": correct_count / PROMPT_COUNT,
         "prompts": _prompt_rows(correct_count),
     }
@@ -215,6 +221,10 @@ def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict
             "measured_runtime_seconds": 3200.0,
         },
         "accuracy": {
+            "prompt_ids": {
+                "path": "gsm8k-prompt-token-ids.json",
+                "sha256": HASHES["gsm8k_prompt_ids_sha256"],
+            },
             "arms": {
                 "baseline": _accuracy_arm(1223),
                 "candidate": _accuracy_arm(1223),
@@ -297,8 +307,15 @@ class QualificationContractTest(unittest.TestCase):
         self.temp_directory = tempfile.TemporaryDirectory()
         self.evidence_root = Path(self.temp_directory.name)
         self.kl_specs, self.kl_value = _write_kl_evidence(self.evidence_root / "default")
+        self.original_prompt_ids_sha256 = HASHES["gsm8k_prompt_ids_sha256"]
+        prompt_ids = [[index + 1] for index in range(PROMPT_COUNT)]
+        HASHES["gsm8k_prompt_ids_sha256"] = _write_json(
+            self.evidence_root / "default" / "gsm8k-prompt-token-ids.json",
+            prompt_ids,
+        )
 
     def tearDown(self):
+        HASHES["gsm8k_prompt_ids_sha256"] = self.original_prompt_ids_sha256
         self.temp_directory.cleanup()
 
     def _audit(self, receipt: dict, root: Path | None = None) -> dict:
@@ -334,6 +351,16 @@ class QualificationContractTest(unittest.TestCase):
         receipt["accuracy"]["arms"]["candidate"]["prompts"][37]["request_count"] = 2
         with self.assertRaisesRegex(QualificationError, "exactly once"):
             self._audit(receipt)
+        with self.subTest("sealed input IDs"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["prompts"][37]["input_ids_sha256"] = "0" * 64
+            with self.assertRaisesRegex(QualificationError, "input IDs differ"):
+                self._audit(receipt)
+        with self.subTest("token-ID payload"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["request_payload"] = "text"
+            with self.assertRaisesRegex(QualificationError, "did not send sealed token IDs"):
+                self._audit(receipt)
 
     def test_04_score_no_drop_and_kl_gates(self):
         with self.subTest("candidate score drop"):

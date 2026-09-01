@@ -97,26 +97,24 @@ def _answer_value(text: str) -> object:
     return value if isinstance(value, (int, float)) and math.isfinite(value) else INVALID_ANSWER
 
 
-def _gsm8k_example(row: dict, include_answer: bool) -> str:
-    text = f"Question: {row['question']}\nAnswer:"
-    return text + (f" {row['answer']}" if include_answer else "")
-
-
 def collect_accuracy(args: argparse.Namespace) -> None:
     _require_hash(args.dataset, args.dataset_sha256)
+    if args.prompt_ids_sha256 != HASHES["gsm8k_prompt_ids_sha256"]:
+        raise ValueError("GSM8K prompt IDs hash differs from the sealed qualification authority")
+    _require_hash(args.prompt_ids, args.prompt_ids_sha256)
     rows = [json.loads(line) for line in args.dataset.read_text().splitlines() if line]
     if len(rows) != GSM8K_SHOTS + PROMPT_COUNT:
         raise ValueError(f"sealed GSM8K file must contain exactly 1319 rows, got {len(rows)}")
-    shots = "".join(_gsm8k_example(row, True) + "\n\n" for row in rows[:GSM8K_SHOTS])
+    prompt_ids = _load_input_ids(args.prompt_ids, PROMPT_COUNT)
 
     def run(question_index: int) -> dict:
         source_row_index = GSM8K_SHOTS + question_index
-        prompt = shots + _gsm8k_example(rows[source_row_index], False)
+        input_ids = prompt_ids[question_index]
         result = _post(
             args.base_url,
             "/generate",
             {
-                "text": prompt,
+                "input_ids": input_ids,
                 "sampling_params": {
                     "temperature": 0.0,
                     "max_new_tokens": 512,
@@ -132,6 +130,8 @@ def collect_accuracy(args: argparse.Namespace) -> None:
             "question_index": question_index,
             "source_row_index": source_row_index,
             "request_count": 1,
+            "input_ids_sha256": _json_sha256(input_ids),
+            "input_token_count": len(input_ids),
             "correct": observed is not INVALID_ANSWER and observed == expected,
         }
 
@@ -139,7 +139,16 @@ def collect_accuracy(args: argparse.Namespace) -> None:
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         prompt_rows = list(executor.map(run, range(PROMPT_COUNT)))
     score = sum(row["correct"] for row in prompt_rows) / PROMPT_COUNT
-    _write_json(args.output, {"arm": args.arm, "score": score, "prompts": prompt_rows})
+    _write_json(
+        args.output,
+        {
+            "arm": args.arm,
+            "prompt_ids_sha256": args.prompt_ids_sha256,
+            "request_payload": "input_ids",
+            "score": score,
+            "prompts": prompt_rows,
+        },
+    )
 
 
 def _load_input_ids(path: Path, expected_count: int) -> list[list[int]]:
@@ -669,6 +678,8 @@ def build_parser() -> argparse.ArgumentParser:
     accuracy.add_argument("--arm", choices=("baseline", "candidate"), required=True)
     accuracy.add_argument("--dataset", type=Path, required=True)
     accuracy.add_argument("--dataset-sha256", required=True)
+    accuracy.add_argument("--prompt-ids", type=Path, required=True)
+    accuracy.add_argument("--prompt-ids-sha256", required=True)
     accuracy.add_argument("--parallel", type=int, default=128)
 
     kl_reference = server_parser("kl-reference", collect_kl_reference)

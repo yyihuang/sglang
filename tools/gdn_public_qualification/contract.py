@@ -189,7 +189,7 @@ def validate_provenance(provenance: Mapping[str, object]) -> None:
     )
 
 
-def _validate_prompt_rows(rows: object, arm: str) -> float:
+def _validate_prompt_rows(rows: object, arm: str, prompt_ids: Sequence[Sequence[int]]) -> float:
     require(isinstance(rows, list), f"{arm} prompts must be a list")
     require(len(rows) == PROMPT_COUNT, f"{arm} must contain exactly 1314 prompts")
     question_indices = []
@@ -200,6 +200,14 @@ def _validate_prompt_rows(rows: object, arm: str) -> float:
         question_indices.append(row.get("question_index"))
         source_indices.append(row.get("source_row_index"))
         require(row.get("request_count") == 1, f"{arm} prompt {position} was not requested exactly once")
+        require(
+            row.get("input_ids_sha256") == _json_sha256(prompt_ids[position]),
+            f"{arm} prompt {position} input IDs differ from the sealed prompt",
+        )
+        require(
+            row.get("input_token_count") == len(prompt_ids[position]),
+            f"{arm} prompt {position} input token count differs from the sealed prompt",
+        )
         require(row.get("correct") in (True, False), f"{arm} prompt {position} has invalid correctness")
         scores.append(float(row["correct"]))
     require(question_indices == list(range(PROMPT_COUNT)), f"{arm} question indices must be exactly 0..1313 in order")
@@ -226,6 +234,40 @@ def _file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _load_prompt_ids_authority(spec: object, evidence_root: Path | None) -> list[list[int]]:
+    require(evidence_root is not None, "an evidence root is required for sealed GSM8K prompt IDs")
+    require(isinstance(spec, Mapping), "accuracy.prompt_ids must be an object")
+    expected_sha = HASHES["gsm8k_prompt_ids_sha256"]
+    require(spec.get("sha256") == expected_sha, "GSM8K prompt IDs spec differs from the sealed authority")
+    path = _resolve_evidence_path(evidence_root, spec.get("path"), "GSM8K prompt IDs")
+    require(_file_sha256(path) == expected_sha, "GSM8K prompt IDs file hash differs from the sealed authority")
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QualificationError(f"GSM8K prompt IDs are unreadable: {exc}") from exc
+    if isinstance(value, Mapping):
+        for key in ("input_ids", "prompts", "records"):
+            if key in value:
+                value = value[key]
+                break
+    if isinstance(value, list) and value and isinstance(value[0], Mapping):
+        value = [row.get("input_ids") for row in value]
+    require(
+        isinstance(value, list) and len(value) == PROMPT_COUNT,
+        "GSM8K prompt IDs must contain exactly 1314 rows",
+    )
+    require(
+        all(
+            isinstance(row, list)
+            and bool(row)
+            and all(type(token) is int and token >= 0 for token in row)
+            for row in value
+        ),
+        "every GSM8K prompt-ID row must be a non-empty list of non-negative integers",
+    )
+    return value
 
 
 def _load_kl_manifest(spec: object, evidence_root: Path, arm: str) -> tuple[dict, Path]:
@@ -392,13 +434,19 @@ def _recompute_kl(kl: Mapping[str, object], evidence_root: Path | None) -> tuple
 
 
 def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None = None) -> dict[str, object]:
+    prompt_ids = _load_prompt_ids_authority(accuracy.get("prompt_ids"), evidence_root)
     arms = accuracy.get("arms")
     require(isinstance(arms, Mapping) and set(arms) == {"baseline", "candidate"}, "accuracy arms must be exactly baseline and candidate")
     scores = {}
     for arm in ("baseline", "candidate"):
         arm_result = arms[arm]
         require(isinstance(arm_result, Mapping), f"accuracy {arm} must be an object")
-        score = _validate_prompt_rows(arm_result.get("prompts"), arm)
+        require(
+            arm_result.get("prompt_ids_sha256") == HASHES["gsm8k_prompt_ids_sha256"],
+            f"{arm} prompt IDs authority differs",
+        )
+        require(arm_result.get("request_payload") == "input_ids", f"{arm} did not send sealed token IDs")
+        score = _validate_prompt_rows(arm_result.get("prompts"), arm, prompt_ids)
         reported = arm_result.get("score")
         require(isinstance(reported, (int, float)) and math.isclose(float(reported), score, rel_tol=0, abs_tol=1e-15), f"{arm} reported score does not match raw prompts")
         require(score >= MIN_SCORE, f"{arm} score {score:.9f} is below 0.93")
