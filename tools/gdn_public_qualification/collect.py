@@ -20,6 +20,7 @@ from pathlib import Path
 import requests
 
 from tools.gdn_public_qualification.contract import (
+    ACCURACY_SAMPLING_PARAMS,
     GSM8K_SHOTS,
     HASHES,
     KL_DISTRIBUTION_SCHEMA,
@@ -34,6 +35,7 @@ from tools.gdn_public_qualification.contract import (
     MTP_SPECULATIVE_NUM_STEPS,
     PROMPT_COUNT,
     TP_SIZE,
+    expected_server_config,
 )
 from tools.gdn_public_qualification.kl_sink_hook import (
     KL_SINK_AUTHORITY_SCHEMA,
@@ -53,6 +55,12 @@ ROUTE_RE = re.compile(
 
 def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _write_json_exclusive(path: Path, value: object) -> None:
+    with path.open("x") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
 
 def _sha256(path: Path) -> str:
@@ -98,6 +106,8 @@ def _answer_value(text: str) -> object:
 
 
 def collect_accuracy(args: argparse.Namespace) -> None:
+    if args.output.exists():
+        raise ValueError(f"accuracy output already exists: {args.output}")
     if args.dataset_sha256 != HASHES["gsm8k_dataset_sha256"]:
         raise ValueError("GSM8K dataset hash differs from the sealed qualification authority")
     _require_hash(args.dataset, args.dataset_sha256)
@@ -108,21 +118,47 @@ def collect_accuracy(args: argparse.Namespace) -> None:
     if len(rows) != GSM8K_SHOTS + PROMPT_COUNT:
         raise ValueError(f"sealed GSM8K file must contain exactly 1319 rows, got {len(rows)}")
     prompt_ids = _load_input_ids(args.prompt_ids, PROMPT_COUNT)
+    if not re.fullmatch(r"[0-9a-f]{64}", args.campaign_id):
+        raise ValueError("accuracy campaign_id must be a SHA256")
+    if args.model_manifest_sha256 != HASHES["model_manifest_sha256"]:
+        raise ValueError("accuracy model manifest hash differs from the sealed authority")
+    server_info = _get(args.base_url, "/server_info", args.timeout)
+    model_info = _get(args.base_url, "/model_info", args.timeout)
+    if not isinstance(server_info, dict) or not isinstance(model_info, dict):
+        raise ValueError("accuracy server identity endpoints must return objects")
+    expected_config = expected_server_config(args.arm)
+    server_config = {key: server_info.get(key) for key in expected_config}
+    if server_config != expected_config:
+        raise ValueError(
+            f"accuracy {args.arm} server configuration {server_config!r} != {expected_config!r}"
+        )
+    model_identity = {
+        "model_path": args.model_path,
+        "tokenizer_path": args.tokenizer_path,
+        "model_manifest_sha256": args.model_manifest_sha256,
+    }
+    observed_model_identity = {
+        "model_path": model_info.get("model_path"),
+        "tokenizer_path": model_info.get("tokenizer_path"),
+        "model_manifest_sha256": args.model_manifest_sha256,
+    }
+    if observed_model_identity != model_identity:
+        raise ValueError(
+            f"accuracy {args.arm} server model identity {observed_model_identity!r} "
+            f"!= {model_identity!r}"
+        )
 
     def run(question_index: int) -> dict:
         source_row_index = GSM8K_SHOTS + question_index
         input_ids = prompt_ids[question_index]
-        request_id = f"gdn-gsm8k-{args.arm}-{question_index:04d}"
+        request_id = f"gdn-gsm8k-{args.campaign_id}-{args.arm}-{question_index:04d}"
         result = _post(
             args.base_url,
             "/generate",
             {
                 "rid": request_id,
                 "input_ids": input_ids,
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": 512,
-                },
+                "sampling_params": ACCURACY_SAMPLING_PARAMS,
             },
             args.timeout,
         )
@@ -154,13 +190,17 @@ def collect_accuracy(args: argparse.Namespace) -> None:
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         prompt_rows = list(executor.map(run, range(PROMPT_COUNT)))
     score = sum(row["correct"] for row in prompt_rows) / PROMPT_COUNT
-    _write_json(
+    _write_json_exclusive(
         args.output,
         {
             "arm": args.arm,
+            "campaign_id": args.campaign_id,
             "dataset_sha256": args.dataset_sha256,
             "prompt_ids_sha256": args.prompt_ids_sha256,
             "request_payload": "input_ids",
+            "sampling_params": ACCURACY_SAMPLING_PARAMS,
+            "server_config": server_config,
+            "model_identity": model_identity,
             "score": score,
             "prompts": prompt_rows,
         },
@@ -190,20 +230,6 @@ def _as_results(value: object, expected: int) -> list[dict]:
     if len(rows) != expected or not all(isinstance(row, dict) for row in rows):
         raise ValueError(f"server returned {len(rows)} results, expected {expected}")
     return rows
-
-
-def _expected_mtp_server_config(arm: str) -> dict[str, object]:
-    backend = "triton" if arm == "baseline" else "flashinfer"
-    return {
-        "tp_size": TP_SIZE,
-        "speculative_algorithm": "EAGLE",
-        "speculative_num_steps": MTP_SPECULATIVE_NUM_STEPS,
-        "speculative_eagle_topk": MTP_SPECULATIVE_EAGLE_TOPK,
-        "speculative_num_draft_tokens": MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
-        "linear_attn_prefill_backend": backend,
-        "linear_attn_decode_backend": backend,
-        "linear_attn_verify_backend": backend,
-    }
 
 
 def _json_sha256(value: object) -> str:
@@ -468,7 +494,7 @@ def collect_mtp_probe(args: argparse.Namespace) -> None:
     server_info = _get(args.base_url, "/server_info", args.timeout)
     if not isinstance(server_info, dict):
         raise ValueError("MTP probe server_info response must be an object")
-    expected_config = _expected_mtp_server_config(args.arm)
+    expected_config = expected_server_config(args.arm)
     server_config = {key: server_info.get(key) for key in expected_config}
     if server_config != expected_config:
         raise ValueError(
@@ -692,10 +718,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     accuracy = server_parser("accuracy", collect_accuracy)
     accuracy.add_argument("--arm", choices=("baseline", "candidate"), required=True)
+    accuracy.add_argument("--campaign-id", required=True, help="SHA256 of the sealed campaign plan")
     accuracy.add_argument("--dataset", type=Path, required=True)
     accuracy.add_argument("--dataset-sha256", required=True)
     accuracy.add_argument("--prompt-ids", type=Path, required=True)
     accuracy.add_argument("--prompt-ids-sha256", required=True)
+    accuracy.add_argument("--model-path", required=True)
+    accuracy.add_argument("--tokenizer-path", required=True)
+    accuracy.add_argument("--model-manifest-sha256", required=True)
     accuracy.add_argument("--parallel", type=int, default=128)
 
     kl_reference = server_parser("kl-reference", collect_kl_reference)

@@ -80,6 +80,7 @@ MTP_PROBE_MAX_NEW_TOKENS = 8
 MTP_SPECULATIVE_NUM_STEPS = 3
 MTP_SPECULATIVE_EAGLE_TOPK = 1
 MTP_SPECULATIVE_NUM_DRAFT_TOKENS = 4
+ACCURACY_SAMPLING_PARAMS = {"temperature": 0.0, "max_new_tokens": 512}
 EXACT_T4_ROUTE = (
     "flashinfer.gdn_decode.noncp.indexed_bf16_verify_t4.tile16_fullwarp"
 )
@@ -123,6 +124,21 @@ class QualificationError(ValueError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise QualificationError(message)
+
+
+def expected_server_config(arm: str) -> dict[str, object]:
+    require(arm in ("baseline", "candidate"), "server arm must be baseline or candidate")
+    backend = "triton" if arm == "baseline" else "flashinfer"
+    return {
+        "tp_size": TP_SIZE,
+        "speculative_algorithm": "EAGLE",
+        "speculative_num_steps": MTP_SPECULATIVE_NUM_STEPS,
+        "speculative_eagle_topk": MTP_SPECULATIVE_EAGLE_TOPK,
+        "speculative_num_draft_tokens": MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
+        "linear_attn_prefill_backend": backend,
+        "linear_attn_decode_backend": backend,
+        "linear_attn_verify_backend": backend,
+    }
 
 
 def _finite_positive(value: object, label: str) -> float:
@@ -205,6 +221,7 @@ def _gsm8k_answer_value(text: str) -> Decimal | None:
 def _validate_prompt_rows(
     rows: object,
     arm: str,
+    campaign_id: str,
     prompt_ids: Sequence[Sequence[int]],
     dataset_rows: Sequence[Mapping[str, object]],
 ) -> float:
@@ -219,7 +236,7 @@ def _validate_prompt_rows(
         question_indices.append(row.get("question_index"))
         source_indices.append(row.get("source_row_index"))
         require(row.get("request_count") == 1, f"{arm} prompt {position} was not requested exactly once")
-        request_id = f"gdn-gsm8k-{arm}-{position:04d}"
+        request_id = f"gdn-gsm8k-{campaign_id}-{arm}-{position:04d}"
         request_ids.append(row.get("request_id"))
         require(
             row.get("request_id") == request_id,
@@ -266,7 +283,11 @@ def _validate_prompt_rows(
     require(question_indices == list(range(PROMPT_COUNT)), f"{arm} question indices must be exactly 0..1313 in order")
     require(source_indices == list(range(GSM8K_SHOTS, GSM8K_SHOTS + PROMPT_COUNT)), f"{arm} source rows must be exactly 5..1318 in order")
     require(
-        request_ids == [f"gdn-gsm8k-{arm}-{index:04d}" for index in range(PROMPT_COUNT)],
+        request_ids
+        == [
+            f"gdn-gsm8k-{campaign_id}-{arm}-{index:04d}"
+            for index in range(PROMPT_COUNT)
+        ],
         f"{arm} request IDs must be unique and ordered",
     )
     require(len(set(question_indices)) == PROMPT_COUNT, f"{arm} question indices are duplicated")
@@ -520,15 +541,42 @@ def _recompute_kl(kl: Mapping[str, object], evidence_root: Path | None) -> tuple
 
 
 def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None = None) -> dict[str, object]:
+    campaign_id = accuracy.get("campaign_id")
+    require(
+        isinstance(campaign_id, str) and bool(_SHA256_RE.fullmatch(campaign_id)),
+        "accuracy campaign_id must be a SHA256",
+    )
     dataset_rows = _load_gsm8k_dataset_authority(accuracy.get("dataset"), evidence_root)
     prompt_ids = _load_prompt_ids_authority(accuracy.get("prompt_ids"), evidence_root)
     arms = accuracy.get("arms")
     require(isinstance(arms, Mapping) and set(arms) == {"baseline", "candidate"}, "accuracy arms must be exactly baseline and candidate")
     scores = {}
+    model_identities = {}
     for arm in ("baseline", "candidate"):
         arm_result = arms[arm]
         require(isinstance(arm_result, Mapping), f"accuracy {arm} must be an object")
         require(arm_result.get("arm") == arm, f"accuracy {arm} arm identity differs")
+        require(arm_result.get("campaign_id") == campaign_id, f"accuracy {arm} campaign identity differs")
+        require(
+            arm_result.get("sampling_params") == ACCURACY_SAMPLING_PARAMS,
+            f"accuracy {arm} sampling parameters differ",
+        )
+        require(
+            arm_result.get("server_config") == expected_server_config(arm),
+            f"accuracy {arm} server configuration differs",
+        )
+        model_identity = arm_result.get("model_identity")
+        require(isinstance(model_identity, Mapping), f"accuracy {arm} model identity is required")
+        require(
+            model_identity.get("model_manifest_sha256") == HASHES["model_manifest_sha256"],
+            f"accuracy {arm} model manifest authority differs",
+        )
+        for key in ("model_path", "tokenizer_path"):
+            require(
+                isinstance(model_identity.get(key), str) and bool(model_identity[key]),
+                f"accuracy {arm} {key} is required",
+            )
+        model_identities[arm] = dict(model_identity)
         require(
             arm_result.get("dataset_sha256") == HASHES["gsm8k_dataset_sha256"],
             f"{arm} GSM8K dataset authority differs",
@@ -539,12 +587,16 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
         )
         require(arm_result.get("request_payload") == "input_ids", f"{arm} did not send sealed token IDs")
         score = _validate_prompt_rows(
-            arm_result.get("prompts"), arm, prompt_ids, dataset_rows
+            arm_result.get("prompts"), arm, campaign_id, prompt_ids, dataset_rows
         )
         reported = arm_result.get("score")
         require(isinstance(reported, (int, float)) and math.isclose(float(reported), score, rel_tol=0, abs_tol=1e-15), f"{arm} reported score does not match raw prompts")
         require(score >= MIN_SCORE, f"{arm} score {score:.9f} is below 0.93")
         scores[arm] = score
+    require(
+        model_identities["candidate"] == model_identities["baseline"],
+        "accuracy baseline/candidate model identity differs",
+    )
     require(scores["candidate"] >= scores["baseline"], "candidate accuracy dropped relative to baseline")
     kl = accuracy.get("kl")
     require(isinstance(kl, Mapping), "accuracy.kl must be an object")
@@ -574,7 +626,7 @@ def validate_mtp_probe(probe: Mapping[str, object]) -> dict[str, object]:
         "MTP probe arms must be exactly baseline and candidate",
     )
     result = {}
-    for arm, backend in (("baseline", "triton"), ("candidate", "flashinfer")):
+    for arm in ("baseline", "candidate"):
         row = arms[arm]
         require(isinstance(row, Mapping), f"MTP probe {arm} must be an object")
         require(row.get("arm") == arm, f"MTP probe {arm} arm identity differs")
@@ -601,17 +653,7 @@ def validate_mtp_probe(probe: Mapping[str, object]) -> dict[str, object]:
         )
         server_config = row.get("server_config")
         require(
-            server_config
-            == {
-                "tp_size": TP_SIZE,
-                "speculative_algorithm": "EAGLE",
-                "speculative_num_steps": MTP_SPECULATIVE_NUM_STEPS,
-                "speculative_eagle_topk": MTP_SPECULATIVE_EAGLE_TOPK,
-                "speculative_num_draft_tokens": MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
-                "linear_attn_prefill_backend": backend,
-                "linear_attn_decode_backend": backend,
-                "linear_attn_verify_backend": backend,
-            },
+            server_config == expected_server_config(arm),
             f"MTP probe {arm} server configuration differs",
         )
         output_ids = row.get("output_ids")

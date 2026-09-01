@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from tools.gdn_public_qualification.collect import ROUTE_RE, collect_accuracy
 from tools.gdn_public_qualification.contract import (
+    ACCURACY_SAMPLING_PARAMS,
     ABBA_ORDER,
     BOOTSTRAP_SAMPLES,
     BOOTSTRAP_SEED,
@@ -36,10 +37,14 @@ from tools.gdn_public_qualification.contract import (
     QualificationError,
     audit_receipt,
     expected_provenance,
+    expected_server_config,
 )
 from tools.gdn_public_qualification.render_plan import _server_command, _server_hosts
 from tools.gdn_public_qualification.kl_sink_hook import marker_for_sample
 from tools.gdn_public_qualification.kl_sink_server import prepare_sink_root
+
+
+TEST_CAMPAIGN_ID = "c" * 64
 
 
 def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
@@ -48,7 +53,7 @@ def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
             "question_index": index,
             "source_row_index": index + 5,
             "request_count": 1,
-            "request_id": f"gdn-gsm8k-{arm}-{index:04d}",
+            "request_id": f"gdn-gsm8k-{TEST_CAMPAIGN_ID}-{arm}-{index:04d}",
             "input_ids_sha256": hashlib.sha256(
                 json.dumps([index + 1], separators=(",", ":")).encode()
             ).hexdigest(),
@@ -59,7 +64,9 @@ def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
             "response": {
                 "text": f"answer {index if index < correct_count else index + 1}",
                 "output_ids": [index + 10],
-                "meta_info": {"id": f"gdn-gsm8k-{arm}-{index:04d}"},
+                "meta_info": {
+                    "id": f"gdn-gsm8k-{TEST_CAMPAIGN_ID}-{arm}-{index:04d}"
+                },
             },
             "correct": index < correct_count,
         }
@@ -70,9 +77,17 @@ def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
 def _accuracy_arm(arm: str, correct_count: int) -> dict:
     return {
         "arm": arm,
+        "campaign_id": TEST_CAMPAIGN_ID,
         "dataset_sha256": HASHES["gsm8k_dataset_sha256"],
         "prompt_ids_sha256": HASHES["gsm8k_prompt_ids_sha256"],
         "request_payload": "input_ids",
+        "sampling_params": dict(ACCURACY_SAMPLING_PARAMS),
+        "server_config": expected_server_config(arm),
+        "model_identity": {
+            "model_path": "/sealed/model",
+            "tokenizer_path": "/sealed/model",
+            "model_manifest_sha256": HASHES["model_manifest_sha256"],
+        },
         "score": correct_count / PROMPT_COUNT,
         "prompts": _prompt_rows(arm, correct_count),
     }
@@ -233,6 +248,7 @@ def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict
             "measured_runtime_seconds": 3200.0,
         },
         "accuracy": {
+            "campaign_id": TEST_CAMPAIGN_ID,
             "dataset": {
                 "path": "gsm8k.jsonl",
                 "sha256": HASHES["gsm8k_dataset_sha256"],
@@ -410,8 +426,22 @@ class QualificationContractTest(unittest.TestCase):
             receipt = _receipt(self.kl_specs, self.kl_value)
             receipt["accuracy"]["arms"]["candidate"]["prompts"][37][
                 "request_id"
-            ] = "gdn-gsm8k-candidate-0036"
+            ] = f"gdn-gsm8k-{TEST_CAMPAIGN_ID}-candidate-0036"
             with self.assertRaisesRegex(QualificationError, "request ID differs"):
+                self._audit(receipt)
+        with self.subTest("server backend identity"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["server_config"] = (
+                expected_server_config("baseline")
+            )
+            with self.assertRaisesRegex(QualificationError, "server configuration differs"):
+                self._audit(receipt)
+        with self.subTest("sampling parameters"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["sampling_params"][
+                "temperature"
+            ] = 0.5
+            with self.assertRaisesRegex(QualificationError, "sampling parameters differ"):
                 self._audit(receipt)
         with self.subTest("raw-response rescoring"):
             receipt = _receipt(self.kl_specs, self.kl_value)

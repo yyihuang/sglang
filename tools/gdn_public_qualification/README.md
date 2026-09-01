@@ -43,7 +43,8 @@ verify server configuration rather than merely declaring it in a plan.
 
 For each arm, `collect.py accuracy` sends all 1,314 sealed GSM8K token-ID rows
 once. It refuses caller-supplied dataset or token-artifact hashes that differ
-from the contract, assigns a unique ordered request ID, preserves each raw
+from the contract, verifies the exact per-arm TP4 backend and model identity,
+assigns a campaign-scoped unique ordered request ID, preserves each raw
 SGLang response and output-token IDs, and records the token-row hash and length.
 The auditor hashes both sealed artifacts, matches every token row, checks arm
 and echoed request identities, and independently re-scores every raw response
@@ -155,9 +156,12 @@ the allocated compute job:
 python -m tools.gdn_public_qualification.render_plan bindings.json --output plan.json
 python -m tools.gdn_public_qualification.collect accuracy \
   --base-url "$BASELINE_URL" --arm baseline \
+  --campaign-id "$PLAN_SHA256" \
   --dataset "$GSM8K_DATASET" --dataset-sha256 "$GSM8K_DATASET_SHA256" \
   --prompt-ids "$GSM8K_PROMPT_IDS" \
   --prompt-ids-sha256 "$GSM8K_PROMPT_IDS_SHA256" \
+  --model-path "$MODEL_PATH" --tokenizer-path "$TOKENIZER_PATH" \
+  --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
   --output baseline-gsm8k.json
 python -m tools.gdn_public_qualification.collect mtp-probe --help
 python -m tools.gdn_public_qualification.collect kl-reference \
