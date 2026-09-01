@@ -194,6 +194,25 @@ class TestFlashInferMegaMoEActiveChunks(unittest.TestCase):
         ):
             self.assertTrue(_fuses_routed_scaling_factor_in_topk(quant_method))
 
+    def test_unquantized_method_keeps_routed_scale_unfused_for_other_backends(self):
+        quant_method = object.__new__(UnquantizedFusedMoEMethod)
+        runner_backend = SimpleNamespace(
+            is_flashinfer_trtllm_routed=lambda: False,
+        )
+        a2a_backend = SimpleNamespace(is_flashinfer_megamoe=lambda: False)
+        with (
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer."
+                "get_moe_runner_backend",
+                return_value=runner_backend,
+            ),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.get_moe_a2a_backend",
+                return_value=a2a_backend,
+            ),
+        ):
+            self.assertFalse(_fuses_routed_scaling_factor_in_topk(quant_method))
+
     def test_chunk_ranges_cover_fixed_boundaries(self):
         expected = {
             0: (),
@@ -265,6 +284,41 @@ class TestFlashInferMegaMoEActiveChunks(unittest.TestCase):
                 ((1, 7168), (1, 8), (1, 8), torch.int32),
             ],
         )
+
+    def test_routed_forward_applies_scale_when_topk_does_not_fuse_it(self):
+        class Layer:
+            def __call__(self, tensors):
+                return tensors.hidden_states.clone()
+
+        num_tokens = 1
+        hidden = torch.ones((num_tokens, 7168), dtype=torch.bfloat16)
+        ids = torch.zeros((num_tokens, 8), dtype=torch.int32)
+        weights = torch.full((num_tokens, 8), 0.125, dtype=torch.float32)
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(
+                flashinfer_megamoe_layer=Layer(),
+                _flashinfer_megamoe_warmed_up=True,
+                should_fuse_routed_scaling_factor_in_topk=False,
+            ),
+            routed_scaling_factor=2.5,
+            gate=lambda *_args, **_kwargs: object(),
+            topk=lambda *_args, **_kwargs: SimpleNamespace(
+                topk_ids=ids, topk_weights=weights
+            ),
+            is_hash=False,
+            layer_id=0,
+        )
+        with (
+            patch.dict(sys.modules, _fake_flashinfer_modules()),
+            patch(
+                "sglang.srt.layers.moe.mega_moe.ExpertLocationDispatchInfo.init_new",
+                return_value=object(),
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        ):
+            output = _run_flashinfer_mega_routed(moe, hidden, None, None, num_tokens)
+
+        torch.testing.assert_close(output, hidden * 2.5)
 
 
 if __name__ == "__main__":
