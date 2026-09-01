@@ -11,6 +11,8 @@ from pathlib import Path
 
 from tools.gdn_public_qualification.contract import (
     ABBA_ORDER,
+    ACCURACY_SERVER_AUTHORITY_SCHEMA,
+    ACCURACY_SERVER_RECEIPT_SCHEMA,
     BOOTSTRAP_SAMPLES,
     BOOTSTRAP_SEED,
     CONTAINER_IMAGE,
@@ -42,6 +44,7 @@ from tools.gdn_public_qualification.contract import (
     TP_SIZE,
     WORKLOADS,
     expected_provenance,
+    load_strict_json,
 )
 
 ARTIFACT_HASH_KEYS = {
@@ -92,8 +95,8 @@ def _model_vocab_size(model_path: Path) -> int:
     if not config_path.is_file():
         raise ValueError(f"staged model config is missing: {config_path}")
     try:
-        config = json.loads(config_path.read_text())
-    except json.JSONDecodeError as exc:
+        config = load_strict_json(config_path.read_text())
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"staged model config is not valid JSON: {config_path}") from exc
     if not isinstance(config, dict):
         raise ValueError(f"staged model config must be an object: {config_path}")
@@ -103,6 +106,12 @@ def _model_vocab_size(model_path: Path) -> int:
     if type(vocab_size) is not int or vocab_size <= 1:
         raise ValueError("staged model config has no valid vocabulary size")
     return vocab_size
+
+
+def _write_plan_exclusive(path: Path, plan: object) -> None:
+    with path.open("x") as handle:
+        json.dump(plan, handle, allow_nan=False, indent=2, sort_keys=True)
+        handle.write("\n")
 
 
 def _server_command(binding: dict, arm: str) -> list[str]:
@@ -163,7 +172,14 @@ def main() -> int:
     parser.add_argument("bindings", type=Path, help="private, uncommitted staged-path JSON")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    binding = json.loads(args.bindings.read_text())
+    if args.output.exists():
+        parser.error(f"qualification plan output must be fresh: {args.output}")
+    try:
+        binding = load_strict_json(args.bindings.read_text())
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        parser.error(f"bindings are not strict JSON: {exc}")
+    if not isinstance(binding, dict):
+        parser.error("bindings must be a JSON object")
 
     repo_root = Path(__file__).resolve().parents[2]
     head = subprocess.run(
@@ -180,15 +196,18 @@ def main() -> int:
         text=True,
         stdout=subprocess.PIPE,
     ).stdout.strip()
-    qualification_status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--", "tools/gdn_public_qualification"],
+    worktree_status = subprocess.run(
+        ["git", "status", "--porcelain=v1"],
         cwd=repo_root,
         check=True,
         text=True,
         stdout=subprocess.PIPE,
     ).stdout
-    if qualification_status:
-        parser.error("qualification source must be committed and clean before rendering")
+    if worktree_status:
+        parser.error(
+            "the complete SGLang qualification worktree must be committed and clean "
+            "before rendering"
+        )
     if not isinstance(binding.get("model_path"), str) or not Path(binding["model_path"]).is_dir():
         parser.error("model_path must name the staged model directory")
     if not isinstance(binding.get("tokenizer_path"), str) or not Path(binding["tokenizer_path"]).is_dir():
@@ -267,6 +286,10 @@ def main() -> int:
             "requests_per_prompt_per_arm": 1,
             "minimum_score": MIN_SCORE,
             "candidate_no_drop": True,
+            "server_request_authority_schema": ACCURACY_SERVER_AUTHORITY_SCHEMA,
+            "server_request_receipt_schema": ACCURACY_SERVER_RECEIPT_SCHEMA,
+            "server_request_hook": "tools.gdn_public_qualification.accuracy_server_hook",
+            "server_duplicate_request_policy": "reject_before_generation",
         },
         "kl": {
             "input_ids": artifacts["longbench_first48_ids"],
@@ -341,7 +364,7 @@ def main() -> int:
             "model_revision": MODEL_REVISION,
         },
     }
-    args.output.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n")
+    _write_plan_exclusive(args.output, plan)
     print(f"wrote verified private plan to {args.output}")
     return 0
 

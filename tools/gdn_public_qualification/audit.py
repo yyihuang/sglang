@@ -7,11 +7,16 @@ import hashlib
 import json
 from pathlib import Path
 
-from tools.gdn_public_qualification.contract import QualificationError, audit_receipt
+from tools.gdn_public_qualification.contract import (
+    QualificationError,
+    audit_receipt,
+    canonical_json_text,
+    load_strict_json,
+)
 
 
 def _canonical_json(value: object) -> bytes:
-    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return (canonical_json_text(value) + "\n").encode()
 
 
 def main() -> int:
@@ -21,15 +26,15 @@ def main() -> int:
     args = parser.parse_args()
 
     raw = args.receipt.read_bytes()
-    receipt = json.loads(raw)
     try:
+        receipt = load_strict_json(raw.decode())
         audit = audit_receipt(receipt, args.receipt.resolve().parent)
-    except QualificationError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, QualificationError) as exc:
         parser.error(str(exc))
     audit["receipt_sha256"] = hashlib.sha256(raw).hexdigest()
     encoded = _canonical_json(audit)
     args.output.write_bytes(encoded)
-    print(json.dumps(audit, indent=2, sort_keys=True))
+    print(json.dumps(audit, allow_nan=False, indent=2, sort_keys=True))
     return 0
 
 

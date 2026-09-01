@@ -13,8 +13,10 @@ import math
 import random
 import re
 import struct
+import subprocess
 from collections.abc import Mapping, Sequence
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from pathlib import Path
 
 SCHEMA = "gdn-public-qualification-result-v2"
@@ -81,6 +83,12 @@ MTP_SPECULATIVE_NUM_STEPS = 3
 MTP_SPECULATIVE_EAGLE_TOPK = 1
 MTP_SPECULATIVE_NUM_DRAFT_TOKENS = 4
 ACCURACY_SAMPLING_PARAMS = {"temperature": 0.0, "max_new_tokens": 512}
+ACCURACY_DECODE_PARAMS = {
+    "skip_special_tokens": True,
+    "clean_up_tokenization_spaces": False,
+}
+ACCURACY_SERVER_AUTHORITY_SCHEMA = "gdn-gsm8k-server-request-authority-v1"
+ACCURACY_SERVER_RECEIPT_SCHEMA = "gdn-gsm8k-server-request-receipt-v1"
 EXACT_T4_ROUTE = (
     "flashinfer.gdn_decode.noncp.indexed_bf16_verify_t4.tile16_fullwarp"
 )
@@ -124,6 +132,74 @@ class QualificationError(ValueError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise QualificationError(message)
+
+
+def canonical_json_text(value: object) -> str:
+    """Return the one JSON spelling used by qualification hashes and ledgers."""
+
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(canonical_json_text(value).encode()).hexdigest()
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+
+def load_strict_json(text: str) -> object:
+    return json.loads(text, parse_constant=_reject_json_constant)
+
+
+@lru_cache(maxsize=2)
+def _load_accuracy_tokenizer(tokenizer_path: str):
+    try:
+        from transformers import AutoTokenizer
+    except ModuleNotFoundError as exc:
+        raise QualificationError(
+            "Transformers from the pinned SGLang runtime is required to decode "
+            "GSM8K output token IDs"
+        ) from exc
+    try:
+        return AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            local_files_only=True,
+            trust_remote_code=True,
+        )
+    except Exception as exc:
+        raise QualificationError(
+            f"sealed accuracy tokenizer could not be loaded from {tokenizer_path}: {exc}"
+        ) from exc
+
+
+def decode_accuracy_output_ids(tokenizer_path: str, output_ids: Sequence[int]) -> str:
+    require(
+        isinstance(tokenizer_path, str) and bool(tokenizer_path),
+        "sealed accuracy tokenizer path is required",
+    )
+    require(
+        isinstance(output_ids, list)
+        and bool(output_ids)
+        and all(type(token) is int and token >= 0 for token in output_ids),
+        "accuracy output IDs are invalid",
+    )
+    try:
+        value = _load_accuracy_tokenizer(tokenizer_path).decode(
+            output_ids, **ACCURACY_DECODE_PARAMS
+        )
+    except QualificationError:
+        raise
+    except Exception as exc:
+        raise QualificationError(f"accuracy output token decoding failed: {exc}") from exc
+    require(isinstance(value, str), "accuracy output token decoding did not return text")
+    return value
 
 
 def expected_server_config(arm: str) -> dict[str, object]:
@@ -213,6 +289,45 @@ def validate_provenance(provenance: Mapping[str, object]) -> None:
     )
 
 
+def qualification_checkout_identity() -> tuple[str, str]:
+    """Return the exact clean SGLang checkout that executes the auditor."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=repo_root,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            cwd=repo_root,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise QualificationError(
+            "qualification auditor must run from an authenticated Git checkout"
+        ) from exc
+    require(not status, "qualification auditor worktree must be completely clean")
+    require(bool(_FULL_SHA_RE.fullmatch(commit)), "qualification checkout commit is invalid")
+    require(bool(_FULL_SHA_RE.fullmatch(tree)), "qualification checkout tree is invalid")
+    return commit, tree
+
+
 def _gsm8k_answer_value(text: str) -> Decimal | None:
     numbers = _GSM8K_NUMBER_RE.findall(text.replace(",", ""))
     if not numbers:
@@ -230,6 +345,7 @@ def _validate_prompt_rows(
     campaign_id: str,
     prompt_ids: Sequence[Sequence[int]],
     dataset_rows: Sequence[Mapping[str, object]],
+    tokenizer_path: str,
 ) -> float:
     require(isinstance(rows, list), f"{arm} prompts must be a list")
     require(len(rows) == PROMPT_COUNT, f"{arm} must contain exactly 1314 prompts")
@@ -277,8 +393,17 @@ def _validate_prompt_rows(
             isinstance(meta_info, Mapping) and meta_info.get("id") == request_id,
             f"{arm} prompt {position} response request ID differs",
         )
+        decoded_text = decode_accuracy_output_ids(tokenizer_path, output_ids)
+        require(
+            row.get("decoded_text") == decoded_text,
+            f"{arm} prompt {position} source-owned output decoding differs",
+        )
+        require(
+            row.get("decode_params") == ACCURACY_DECODE_PARAMS,
+            f"{arm} prompt {position} output decoding parameters differ",
+        )
         expected = _gsm8k_answer_value(dataset_rows[GSM8K_SHOTS + position]["answer"])
-        observed = _gsm8k_answer_value(response["text"])
+        observed = _gsm8k_answer_value(decoded_text)
         recomputed = observed is not None and expected is not None and observed == expected
         require(type(row.get("correct")) is bool, f"{arm} prompt {position} has invalid correctness")
         require(
@@ -330,8 +455,8 @@ def _load_gsm8k_dataset_authority(
     path = _resolve_evidence_path(evidence_root, spec.get("path"), "GSM8K dataset")
     require(_file_sha256(path) == expected_sha, "GSM8K dataset file hash differs from the sealed authority")
     try:
-        rows = [json.loads(line) for line in path.read_text().splitlines() if line]
-    except (OSError, json.JSONDecodeError) as exc:
+        rows = [load_strict_json(line) for line in path.read_text().splitlines() if line]
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise QualificationError(f"GSM8K dataset is unreadable: {exc}") from exc
     require(
         len(rows) == GSM8K_SHOTS + PROMPT_COUNT,
@@ -357,8 +482,8 @@ def _load_prompt_ids_authority(spec: object, evidence_root: Path | None) -> list
     path = _resolve_evidence_path(evidence_root, spec.get("path"), "GSM8K prompt IDs")
     require(_file_sha256(path) == expected_sha, "GSM8K prompt IDs file hash differs from the sealed authority")
     try:
-        value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        value = load_strict_json(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise QualificationError(f"GSM8K prompt IDs are unreadable: {exc}") from exc
     if isinstance(value, Mapping):
         for key in ("input_ids", "prompts", "records"):
@@ -392,13 +517,22 @@ def _load_campaign_plan(
     path = _resolve_evidence_path(evidence_root, spec.get("path"), "campaign plan")
     require(_file_sha256(path) == campaign_id, "campaign plan file hash differs from campaign_id")
     try:
-        plan = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        plan = load_strict_json(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise QualificationError(f"campaign plan is unreadable: {exc}") from exc
     require(isinstance(plan, Mapping) and plan.get("schema") == PLAN_SCHEMA, "campaign plan schema differs")
     provenance = plan.get("provenance")
     require(isinstance(provenance, Mapping), "campaign plan provenance is required")
     validate_provenance(provenance)
+    checkout_commit, checkout_tree = qualification_checkout_identity()
+    require(
+        provenance.get("qualification_commit") == checkout_commit,
+        "campaign plan qualification commit differs from the auditor checkout",
+    )
+    require(
+        provenance.get("qualification_tree") == checkout_tree,
+        "campaign plan qualification tree differs from the auditor checkout",
+    )
     accuracy = plan.get("accuracy")
     require(isinstance(accuracy, Mapping), "campaign plan accuracy contract is required")
     require(accuracy.get("prompt_count") == PROMPT_COUNT, "campaign plan prompt count differs")
@@ -406,6 +540,26 @@ def _load_campaign_plan(
     require(accuracy.get("requests_per_prompt_per_arm") == 1, "campaign plan request count differs")
     require(accuracy.get("minimum_score") == MIN_SCORE, "campaign plan minimum score differs")
     require(accuracy.get("candidate_no_drop") is True, "campaign plan no-drop gate differs")
+    require(
+        accuracy.get("server_request_authority_schema")
+        == ACCURACY_SERVER_AUTHORITY_SCHEMA,
+        "campaign plan server request authority schema differs",
+    )
+    require(
+        accuracy.get("server_request_receipt_schema")
+        == ACCURACY_SERVER_RECEIPT_SCHEMA,
+        "campaign plan server request receipt schema differs",
+    )
+    require(
+        accuracy.get("server_request_hook")
+        == "tools.gdn_public_qualification.accuracy_server_hook",
+        "campaign plan server request hook differs",
+    )
+    require(
+        accuracy.get("server_duplicate_request_policy")
+        == "reject_before_generation",
+        "campaign plan duplicate request policy differs",
+    )
     return plan
 
 
@@ -424,8 +578,8 @@ def _validate_request_ledger(
     require(isinstance(expected_sha, str) and bool(_SHA256_RE.fullmatch(expected_sha)), f"{arm} request ledger SHA256 is required")
     require(_file_sha256(path) == expected_sha, f"{arm} request ledger SHA256 mismatch")
     try:
-        events = [json.loads(line) for line in path.read_text().splitlines() if line]
-    except (OSError, json.JSONDecodeError) as exc:
+        events = [load_strict_json(line) for line in path.read_text().splitlines() if line]
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise QualificationError(f"{arm} request ledger is unreadable: {exc}") from exc
     require(len(events) == 1 + 2 * PROMPT_COUNT, f"{arm} request ledger must contain one header and exactly two events per prompt")
     header = events[0]
@@ -438,8 +592,8 @@ def _validate_request_ledger(
         f"{arm} request ledger header differs",
     )
     require(isinstance(prompt_rows, list) and len(prompt_rows) == PROMPT_COUNT, f"{arm} prompt rows are unavailable for ledger audit")
-    observed: dict[tuple[int, str], Mapping[str, object]] = {}
-    for event in events[1:]:
+    observed: dict[tuple[int, str], tuple[int, Mapping[str, object]]] = {}
+    for line_index, event in enumerate(events[1:], start=1):
         require(isinstance(event, Mapping), f"{arm} request ledger event must be an object")
         key = (event.get("question_index"), event.get("event"))
         require(
@@ -449,13 +603,22 @@ def _validate_request_ledger(
             f"{arm} request ledger event identity differs",
         )
         require(key not in observed, f"{arm} request ledger duplicates prompt {key[0]} {key[1]}")
-        observed[key] = event
+        observed[key] = (line_index, event)
     for index, row in enumerate(prompt_rows):
         require(isinstance(row, Mapping), f"{arm} prompt {index} must be an object")
         request_id = f"gdn-gsm8k-{campaign_id}-{arm}-{index:04d}"
-        dispatch = observed.get((index, "dispatch"))
-        response = observed.get((index, "response"))
-        require(dispatch is not None and response is not None, f"{arm} prompt {index} lacks exactly one dispatch and response")
+        dispatch_entry = observed.get((index, "dispatch"))
+        response_entry = observed.get((index, "response"))
+        require(
+            dispatch_entry is not None and response_entry is not None,
+            f"{arm} prompt {index} lacks exactly one dispatch and response",
+        )
+        dispatch_line, dispatch = dispatch_entry
+        response_line, response = response_entry
+        require(
+            dispatch_line < response_line,
+            f"{arm} prompt {index} response precedes dispatch in the request ledger",
+        )
         require(dispatch.get("request_id") == request_id and response.get("request_id") == request_id, f"{arm} prompt {index} ledger request ID differs")
         payload = {
             "rid": request_id,
@@ -466,6 +629,85 @@ def _validate_request_ledger(
         require(response.get("response_sha256") == _json_sha256(row.get("response")), f"{arm} prompt {index} ledger response differs")
 
 
+def _validate_server_request_evidence(
+    spec: object,
+    evidence_root: Path | None,
+    arm: str,
+    campaign_id: str,
+    prompt_rows: object,
+) -> None:
+    require(
+        evidence_root is not None,
+        f"an evidence root is required for the {arm} server request evidence",
+    )
+    require(isinstance(spec, Mapping), f"{arm} server request evidence must be an object")
+    authority_spec = spec.get("authority")
+    receipt_spec = spec.get("receipt")
+    require(isinstance(authority_spec, Mapping), f"{arm} server request authority is required")
+    require(isinstance(receipt_spec, Mapping), f"{arm} server request receipt is required")
+
+    def load_hashed_json(file_spec: Mapping[str, object], label: str) -> Mapping[str, object]:
+        path = _resolve_evidence_path(evidence_root, file_spec.get("path"), label)
+        expected_sha = file_spec.get("sha256")
+        require(
+            isinstance(expected_sha, str) and bool(_SHA256_RE.fullmatch(expected_sha)),
+            f"{label} SHA256 is required",
+        )
+        require(_file_sha256(path) == expected_sha, f"{label} SHA256 mismatch")
+        try:
+            value = load_strict_json(path.read_text())
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise QualificationError(f"{label} is unreadable: {exc}") from exc
+        require(isinstance(value, Mapping), f"{label} must be an object")
+        return value
+
+    authority = load_hashed_json(authority_spec, f"{arm} server request authority")
+    require(
+        authority.get("schema") == ACCURACY_SERVER_AUTHORITY_SCHEMA
+        and authority.get("arm") == arm
+        and authority.get("prompt_count") == PROMPT_COUNT
+        and authority.get("accepted_count_per_prompt") == 1
+        and authority.get("completed_count_per_prompt") == 1,
+        f"{arm} server request authority contract differs",
+    )
+    receipt = load_hashed_json(receipt_spec, f"{arm} server request receipt")
+    require(
+        receipt.get("schema") == ACCURACY_SERVER_RECEIPT_SCHEMA
+        and receipt.get("authority_sha256") == authority_spec.get("sha256")
+        and receipt.get("arm") == arm
+        and receipt.get("campaign_id") == campaign_id
+        and receipt.get("prompt_count") == PROMPT_COUNT,
+        f"{arm} server request receipt identity differs",
+    )
+    records = receipt.get("records")
+    require(
+        isinstance(records, list) and len(records) == PROMPT_COUNT,
+        f"{arm} server request receipt must contain exactly 1314 records",
+    )
+    require(
+        isinstance(prompt_rows, list) and len(prompt_rows) == PROMPT_COUNT,
+        f"{arm} prompt rows are unavailable for server receipt audit",
+    )
+    for index, (record, row) in enumerate(zip(records, prompt_rows)):
+        request_id = f"gdn-gsm8k-{campaign_id}-{arm}-{index:04d}"
+        require(
+            isinstance(record, Mapping),
+            f"{arm} server request record {index} must be an object",
+        )
+        require(
+            record.get("question_index") == index
+            and record.get("request_id") == request_id
+            and record.get("accepted_count") == 1
+            and record.get("completed_count") == 1,
+            f"{arm} server request record {index} does not prove exact-once "
+            "acceptance and completion",
+        )
+        require(
+            record.get("response_sha256") == _json_sha256(row.get("response")),
+            f"{arm} server request record {index} response differs",
+        )
+
+
 def _load_kl_manifest(spec: object, evidence_root: Path, arm: str) -> tuple[dict, Path]:
     require(isinstance(spec, Mapping), f"{arm} KL manifest reference must be an object")
     path = _resolve_evidence_path(evidence_root, spec.get("path"), f"{arm} KL manifest")
@@ -473,8 +715,8 @@ def _load_kl_manifest(spec: object, evidence_root: Path, arm: str) -> tuple[dict
     require(isinstance(expected_sha, str) and bool(_SHA256_RE.fullmatch(expected_sha)), f"{arm} KL manifest SHA256 is required")
     require(_file_sha256(path) == expected_sha, f"{arm} KL manifest SHA256 mismatch")
     try:
-        manifest = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest = load_strict_json(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise QualificationError(f"{arm} KL manifest is not valid JSON") from exc
     require(isinstance(manifest, dict), f"{arm} KL manifest must be an object")
     require(manifest.get("schema") == KL_DISTRIBUTION_SCHEMA, f"{arm} KL distribution schema differs")
@@ -629,13 +871,37 @@ def _recompute_kl(kl: Mapping[str, object], evidence_root: Path | None) -> tuple
     return sample_means, max_position_kl
 
 
-def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None = None) -> dict[str, object]:
+def validate_accuracy(
+    accuracy: Mapping[str, object],
+    evidence_root: Path | None = None,
+    receipt_provenance: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     campaign_id = accuracy.get("campaign_id")
     require(
         isinstance(campaign_id, str) and bool(_SHA256_RE.fullmatch(campaign_id)),
         "accuracy campaign_id must be a SHA256",
     )
-    _load_campaign_plan(accuracy.get("plan"), evidence_root, campaign_id)
+    plan = _load_campaign_plan(accuracy.get("plan"), evidence_root, campaign_id)
+    require(
+        isinstance(receipt_provenance, Mapping)
+        and plan.get("provenance") == receipt_provenance,
+        "campaign plan provenance differs from receipt provenance",
+    )
+    bindings = plan.get("bindings")
+    require(isinstance(bindings, Mapping), "campaign plan bindings are required")
+    planned_model_identity = {
+        "model_path": bindings.get("model_path"),
+        "tokenizer_path": bindings.get("tokenizer_path"),
+        "model_manifest_sha256": HASHES["model_manifest_sha256"],
+    }
+    require(
+        all(
+            isinstance(planned_model_identity[key], str)
+            and bool(planned_model_identity[key])
+            for key in ("model_path", "tokenizer_path")
+        ),
+        "campaign plan model/tokenizer identity is required",
+    )
     dataset_rows = _load_gsm8k_dataset_authority(accuracy.get("dataset"), evidence_root)
     prompt_ids = _load_prompt_ids_authority(accuracy.get("prompt_ids"), evidence_root)
     arms = accuracy.get("arms")
@@ -669,6 +935,10 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
             )
         model_identities[arm] = dict(model_identity)
         require(
+            model_identities[arm] == planned_model_identity,
+            f"accuracy {arm} model identity differs from the campaign plan",
+        )
+        require(
             arm_result.get("dataset_sha256") == HASHES["gsm8k_dataset_sha256"],
             f"{arm} GSM8K dataset authority differs",
         )
@@ -678,7 +948,12 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
         )
         require(arm_result.get("request_payload") == "input_ids", f"{arm} did not send sealed token IDs")
         score = _validate_prompt_rows(
-            arm_result.get("prompts"), arm, campaign_id, prompt_ids, dataset_rows
+            arm_result.get("prompts"),
+            arm,
+            campaign_id,
+            prompt_ids,
+            dataset_rows,
+            planned_model_identity["tokenizer_path"],
         )
         _validate_request_ledger(
             arm_result.get("request_ledger"),
@@ -686,6 +961,13 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
             arm,
             campaign_id,
             prompt_ids,
+            arm_result.get("prompts"),
+        )
+        _validate_server_request_evidence(
+            arm_result.get("server_request_evidence"),
+            evidence_root,
+            arm,
+            campaign_id,
             arm_result.get("prompts"),
         )
         reported = arm_result.get("score")
@@ -714,8 +996,7 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
 
 
 def _json_sha256(value: object) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return canonical_json_sha256(value)
 
 
 def validate_mtp_probe(probe: Mapping[str, object]) -> dict[str, object]:
@@ -920,7 +1201,9 @@ def audit_receipt(receipt: Mapping[str, object], evidence_root: Path | None = No
         require(isinstance(receipt.get(section), Mapping), f"{section} must be an object")
     validate_provenance(receipt["provenance"])
     campaign = validate_campaign(receipt["campaign"])
-    accuracy = validate_accuracy(receipt["accuracy"], evidence_root)
+    accuracy = validate_accuracy(
+        receipt["accuracy"], evidence_root, receipt["provenance"]
+    )
     mtp_probe = validate_mtp_probe(receipt["mtp_probe"])
     routes = validate_routes(receipt["routes"])
     performance = validate_performance(receipt["performance"])

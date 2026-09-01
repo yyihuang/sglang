@@ -931,9 +931,22 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
+            accuracy_request = None
+            finish_gdn_accuracy_request = None
+            if os.environ.get("SGLANG_GDN_QUALIFICATION_ACCURACY_AUTHORITY") or os.environ.get(
+                "SGLANG_GDN_QUALIFICATION_ACCURACY_AUTHORITY_SHA256"
+            ):
+                from tools.gdn_public_qualification.accuracy_server_hook import (
+                    begin_request as begin_gdn_accuracy_request,
+                    finish_request as finish_gdn_accuracy_request,
+                )
+
+                accuracy_request = begin_gdn_accuracy_request(obj)
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
+            if finish_gdn_accuracy_request is not None:
+                finish_gdn_accuracy_request(accuracy_request, ret)
             return orjson_response(ret)
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")

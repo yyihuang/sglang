@@ -22,7 +22,10 @@ from pathlib import Path
 import requests
 
 from tools.gdn_public_qualification.contract import (
+    ACCURACY_DECODE_PARAMS,
     ACCURACY_SAMPLING_PARAMS,
+    ACCURACY_SERVER_AUTHORITY_SCHEMA,
+    ACCURACY_SERVER_RECEIPT_SCHEMA,
     GSM8K_SHOTS,
     HASHES,
     KL_DISTRIBUTION_SCHEMA,
@@ -38,7 +41,11 @@ from tools.gdn_public_qualification.contract import (
     PROMPT_COUNT,
     PLAN_SCHEMA,
     TP_SIZE,
+    canonical_json_sha256,
+    canonical_json_text,
+    decode_accuracy_output_ids,
     expected_server_config,
+    load_strict_json,
     validate_provenance,
 )
 from tools.gdn_public_qualification.kl_sink_hook import (
@@ -58,12 +65,14 @@ ROUTE_RE = re.compile(
 
 
 def _write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    )
 
 
 def _write_json_exclusive(path: Path, value: object) -> None:
     with path.open("x") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
+        json.dump(value, handle, allow_nan=False, indent=2, sort_keys=True)
         handle.write("\n")
 
 
@@ -116,13 +125,15 @@ def collect_accuracy(args: argparse.Namespace) -> None:
         raise ValueError(f"accuracy output already exists: {args.output}")
     if args.ledger.exists():
         raise ValueError(f"accuracy request ledger already exists: {args.ledger}")
+    if args.output.resolve() == args.ledger.resolve():
+        raise ValueError("accuracy output and request ledger must be distinct files")
     if args.output.resolve().parent != args.ledger.resolve().parent:
         raise ValueError("accuracy output and request ledger must share one evidence directory")
     if _sha256(args.plan) != args.campaign_id:
         raise ValueError("accuracy campaign_id differs from the rendered plan SHA256")
     try:
-        plan = json.loads(args.plan.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        plan = load_strict_json(args.plan.read_text())
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"rendered qualification plan is unreadable: {exc}") from exc
     if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA:
         raise ValueError("accuracy plan schema differs from the qualification contract")
@@ -139,11 +150,35 @@ def collect_accuracy(args: argparse.Namespace) -> None:
         or plan_servers[args.arm].get("base_url") != args.base_url.rstrip("/")
     ):
         raise ValueError(f"accuracy {args.arm} base URL differs from the rendered plan")
+    plan_bindings = plan.get("bindings")
+    if not isinstance(plan_bindings, dict):
+        raise ValueError("accuracy plan bindings are required")
+    planned_model_identity = {
+        "model_path": plan_bindings.get("model_path"),
+        "tokenizer_path": plan_bindings.get("tokenizer_path"),
+        "model_manifest_sha256": HASHES["model_manifest_sha256"],
+    }
+    requested_model_identity = {
+        "model_path": args.model_path,
+        "tokenizer_path": args.tokenizer_path,
+        "model_manifest_sha256": args.model_manifest_sha256,
+    }
+    if requested_model_identity != planned_model_identity:
+        raise ValueError(
+            f"accuracy {args.arm} requested model identity {requested_model_identity!r} "
+            f"!= rendered plan identity {planned_model_identity!r}"
+        )
+    plan_artifacts = plan_bindings.get("artifacts")
+    if not isinstance(plan_artifacts, dict) or not isinstance(
+        plan_artifacts.get("model_manifest"), str
+    ):
+        raise ValueError("accuracy plan model manifest artifact is required")
+    _require_hash(Path(plan_artifacts["model_manifest"]), HASHES["model_manifest_sha256"])
     _require_hash(args.dataset, args.dataset_sha256)
     if args.prompt_ids_sha256 != HASHES["gsm8k_prompt_ids_sha256"]:
         raise ValueError("GSM8K prompt IDs hash differs from the sealed qualification authority")
     _require_hash(args.prompt_ids, args.prompt_ids_sha256)
-    rows = [json.loads(line) for line in args.dataset.read_text().splitlines() if line]
+    rows = [load_strict_json(line) for line in args.dataset.read_text().splitlines() if line]
     if len(rows) != GSM8K_SHOTS + PROMPT_COUNT:
         raise ValueError(f"sealed GSM8K file must contain exactly 1319 rows, got {len(rows)}")
     prompt_ids = _load_input_ids(args.prompt_ids, PROMPT_COUNT)
@@ -161,11 +196,7 @@ def collect_accuracy(args: argparse.Namespace) -> None:
         raise ValueError(
             f"accuracy {args.arm} server configuration {server_config!r} != {expected_config!r}"
         )
-    model_identity = {
-        "model_path": args.model_path,
-        "tokenizer_path": args.tokenizer_path,
-        "model_manifest_sha256": args.model_manifest_sha256,
-    }
+    model_identity = requested_model_identity
     observed_model_identity = {
         "model_path": model_info.get("model_path"),
         "tokenizer_path": model_info.get("tokenizer_path"),
@@ -181,7 +212,7 @@ def collect_accuracy(args: argparse.Namespace) -> None:
     ledger_lock = threading.Lock()
 
     def record_event(value: dict) -> None:
-        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        encoded = canonical_json_text(value) + "\n"
         with ledger_lock:
             ledger.write(encoded)
             ledger.flush()
@@ -224,7 +255,10 @@ def collect_accuracy(args: argparse.Namespace) -> None:
         ):
             raise ValueError(f"prompt {question_index} returned an invalid response")
         expected = _answer_value(rows[source_row_index]["answer"])
-        observed = _answer_value(result["text"])
+        decoded_text = decode_accuracy_output_ids(
+            model_identity["tokenizer_path"], result["output_ids"]
+        )
+        observed = _answer_value(decoded_text)
         record_event(
             {
                 "event": "response",
@@ -242,6 +276,8 @@ def collect_accuracy(args: argparse.Namespace) -> None:
             "input_token_count": len(input_ids),
             "output_ids_sha256": _json_sha256(result["output_ids"]),
             "response": result,
+            "decoded_text": decoded_text,
+            "decode_params": ACCURACY_DECODE_PARAMS,
             "correct": observed is not INVALID_ANSWER and observed == expected,
         }
 
@@ -253,6 +289,34 @@ def collect_accuracy(args: argparse.Namespace) -> None:
         os.fsync(ledger.fileno())
     finally:
         ledger.close()
+    sink_roots = plan_bindings.get("kl_sink_roots")
+    if not isinstance(sink_roots, dict) or not isinstance(sink_roots.get(args.arm), str):
+        raise ValueError("accuracy plan server evidence root is required")
+    server_evidence_root = Path(sink_roots[args.arm]) / "accuracy_requests"
+    authority_path = server_evidence_root / "authority.json"
+    receipt_path = server_evidence_root / "receipt.json"
+    evidence_root = args.output.resolve().parent
+    try:
+        authority_relative = authority_path.resolve(strict=True).relative_to(evidence_root)
+        receipt_relative = receipt_path.resolve(strict=True).relative_to(evidence_root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError(
+            "source-owned server request authority/receipt must exist below the "
+            "accuracy evidence directory"
+        ) from exc
+    authority = load_strict_json(authority_path.read_text())
+    receipt = load_strict_json(receipt_path.read_text())
+    if (
+        not isinstance(authority, dict)
+        or authority.get("schema") != ACCURACY_SERVER_AUTHORITY_SCHEMA
+        or authority.get("arm") != args.arm
+        or not isinstance(receipt, dict)
+        or receipt.get("schema") != ACCURACY_SERVER_RECEIPT_SCHEMA
+        or receipt.get("arm") != args.arm
+        or receipt.get("campaign_id") != args.campaign_id
+        or receipt.get("prompt_count") != PROMPT_COUNT
+    ):
+        raise ValueError("source-owned server request authority/receipt identity differs")
     score = sum(row["correct"] for row in prompt_rows) / PROMPT_COUNT
     _write_json_exclusive(
         args.output,
@@ -270,6 +334,16 @@ def collect_accuracy(args: argparse.Namespace) -> None:
                 "path": args.ledger.name,
                 "sha256": _sha256(args.ledger),
             },
+            "server_request_evidence": {
+                "authority": {
+                    "path": str(authority_relative),
+                    "sha256": _sha256(authority_path),
+                },
+                "receipt": {
+                    "path": str(receipt_relative),
+                    "sha256": _sha256(receipt_path),
+                },
+            },
             "score": score,
             "prompts": prompt_rows,
         },
@@ -277,7 +351,7 @@ def collect_accuracy(args: argparse.Namespace) -> None:
 
 
 def _load_input_ids(path: Path, expected_count: int) -> list[list[int]]:
-    value = json.loads(path.read_text())
+    value = load_strict_json(path.read_text())
     if isinstance(value, dict):
         for key in ("input_ids", "prompts", "records"):
             if key in value:
@@ -302,8 +376,7 @@ def _as_results(value: object, expected: int) -> list[dict]:
 
 
 def _json_sha256(value: object) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return canonical_json_sha256(value)
 
 
 def _require_numpy():
@@ -326,7 +399,7 @@ def _kl_server_identity(args: argparse.Namespace) -> dict[str, object]:
     config_path = Path(args.model_path) / "config.json"
     if not config_path.is_file():
         raise ValueError(f"KL model config is missing: {config_path}")
-    config = json.loads(config_path.read_text())
+    config = load_strict_json(config_path.read_text())
     if not isinstance(config, dict):
         raise ValueError(f"KL model config must be an object: {config_path}")
     configured_vocab_size = config.get("vocab_size")
@@ -367,7 +440,7 @@ def _prepare_kl_output(args: argparse.Namespace, arm: str) -> tuple[dict, str]:
     if not authority_path.is_file():
         raise ValueError("KL sink authority is missing")
     raw = authority_path.read_bytes()
-    authority = json.loads(raw)
+    authority = load_strict_json(raw.decode())
     expected = {
         "schema": KL_SINK_AUTHORITY_SCHEMA,
         "root": str(root),
@@ -479,7 +552,7 @@ def _collect_kl_distribution(
         raw_receipt = receipt_path.read_bytes()
         if hashlib.sha256(raw_receipt).hexdigest() != response["receipt_sha256"]:
             raise ValueError(f"KL sample {sample_index} receipt SHA256 mismatch")
-        receipt = json.loads(raw_receipt)
+        receipt = load_strict_json(raw_receipt.decode())
         if receipt != response["receipt"] or receipt.get("arm") != arm:
             raise ValueError(f"KL sample {sample_index} receipt content differs")
         shards = receipt.get("shards")
@@ -653,7 +726,7 @@ def collect_kl_reference(args: argparse.Namespace) -> None:
 
 def collect_kl_candidate(args: argparse.Namespace) -> None:
     reference_sha256 = _sha256(args.reference)
-    reference = json.loads(args.reference.read_text())
+    reference = load_strict_json(args.reference.read_text())
     if not isinstance(reference, dict) or reference.get("schema") != KL_DISTRIBUTION_SCHEMA:
         raise ValueError("KL reference must be a full-vocabulary distribution manifest")
     if reference.get("arm") != "baseline" or reference.get("sample_count") != KL_SAMPLE_COUNT:

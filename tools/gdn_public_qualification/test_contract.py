@@ -4,15 +4,26 @@ import copy
 import hashlib
 import json
 import math
+import shutil
 import struct
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tools.gdn_public_qualification.collect import ROUTE_RE, collect_accuracy
+from tools.gdn_public_qualification.accuracy_server_hook import (
+    AUTHORITY_ENV as ACCURACY_AUTHORITY_ENV,
+    AUTHORITY_SHA256_ENV as ACCURACY_AUTHORITY_SHA256_ENV,
+    begin_request as begin_accuracy_server_request,
+    load_authority as load_accuracy_server_authority,
+)
 from tools.gdn_public_qualification.contract import (
+    ACCURACY_DECODE_PARAMS,
     ACCURACY_SAMPLING_PARAMS,
+    ACCURACY_SERVER_AUTHORITY_SCHEMA,
+    ACCURACY_SERVER_RECEIPT_SCHEMA,
     ABBA_ORDER,
     BOOTSTRAP_SAMPLES,
     BOOTSTRAP_SEED,
@@ -37,12 +48,21 @@ from tools.gdn_public_qualification.contract import (
     WORKLOADS,
     QualificationError,
     audit_receipt,
+    canonical_json_text,
     expected_provenance,
     expected_server_config,
+    load_strict_json,
 )
-from tools.gdn_public_qualification.render_plan import _server_command, _server_hosts
+from tools.gdn_public_qualification.render_plan import (
+    _server_command,
+    _server_hosts,
+    _write_plan_exclusive,
+)
 from tools.gdn_public_qualification.kl_sink_hook import marker_for_sample
-from tools.gdn_public_qualification.kl_sink_server import prepare_sink_root
+from tools.gdn_public_qualification.kl_sink_server import (
+    prepare_accuracy_request_root,
+    prepare_sink_root,
+)
 
 
 TEST_CAMPAIGN_ID = ""
@@ -51,8 +71,11 @@ TEST_PLAN_SPEC: dict[str, str] | None = None
 
 
 def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
-    return [
-        {
+    rows = []
+    for index in range(PROMPT_COUNT):
+        answer_value = index if index < correct_count else index + 1
+        output_ids = [answer_value]
+        rows.append({
             "question_index": index,
             "source_row_index": index + 5,
             "request_count": 1,
@@ -62,19 +85,20 @@ def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
             ).hexdigest(),
             "input_token_count": 1,
             "output_ids_sha256": hashlib.sha256(
-                json.dumps([index + 10], separators=(",", ":")).encode()
+                json.dumps(output_ids, separators=(",", ":")).encode()
             ).hexdigest(),
             "response": {
-                "text": f"answer {index if index < correct_count else index + 1}",
-                "output_ids": [index + 10],
+                "text": f"answer {answer_value}",
+                "output_ids": output_ids,
                 "meta_info": {
                     "id": f"gdn-gsm8k-{TEST_CAMPAIGN_ID}-{arm}-{index:04d}"
                 },
             },
+            "decoded_text": f"answer {answer_value}",
+            "decode_params": dict(ACCURACY_DECODE_PARAMS),
             "correct": index < correct_count,
-        }
-        for index in range(PROMPT_COUNT)
-    ]
+        })
+    return rows
 
 
 def _accuracy_arm(arm: str, correct_count: int) -> dict:
@@ -126,6 +150,48 @@ def _accuracy_arm(arm: str, correct_count: int) -> dict:
             raise RuntimeError(f"test request ledger drift: {ledger_path}")
     else:
         ledger_path.write_bytes(ledger_bytes)
+    server_root = TEST_EVIDENCE_ROOT / f"server-{arm}-{correct_count}" / "accuracy_requests"
+    server_root.mkdir(parents=True, exist_ok=True)
+    authority = {
+        "schema": ACCURACY_SERVER_AUTHORITY_SCHEMA,
+        "root": str(server_root),
+        "arm": arm,
+        "prompt_count": PROMPT_COUNT,
+        "accepted_count_per_prompt": 1,
+        "completed_count_per_prompt": 1,
+    }
+    authority_path = server_root / "authority.json"
+    authority_bytes = (canonical_json_text(authority) + "\n").encode()
+    if authority_path.exists() and authority_path.read_bytes() != authority_bytes:
+        raise RuntimeError(f"test server authority drift: {authority_path}")
+    authority_path.write_bytes(authority_bytes)
+    authority_sha256 = hashlib.sha256(authority_bytes).hexdigest()
+    receipt = {
+        "schema": ACCURACY_SERVER_RECEIPT_SCHEMA,
+        "authority_sha256": authority_sha256,
+        "arm": arm,
+        "campaign_id": TEST_CAMPAIGN_ID,
+        "prompt_count": PROMPT_COUNT,
+        "records": [
+            {
+                "question_index": index,
+                "request_id": f"gdn-gsm8k-{TEST_CAMPAIGN_ID}-{arm}-{index:04d}",
+                "accepted_count": 1,
+                "completed_count": 1,
+                "response_sha256": hashlib.sha256(
+                    json.dumps(
+                        row["response"], sort_keys=True, separators=(",", ":")
+                    ).encode()
+                ).hexdigest(),
+            }
+            for index, row in enumerate(prompt_rows)
+        ],
+    }
+    receipt_path = server_root / "receipt.json"
+    receipt_bytes = (canonical_json_text(receipt) + "\n").encode()
+    if receipt_path.exists() and receipt_path.read_bytes() != receipt_bytes:
+        raise RuntimeError(f"test server receipt drift: {receipt_path}")
+    receipt_path.write_bytes(receipt_bytes)
     return {
         "arm": arm,
         "campaign_id": TEST_CAMPAIGN_ID,
@@ -143,6 +209,16 @@ def _accuracy_arm(arm: str, correct_count: int) -> dict:
         "request_ledger": {
             "path": ledger_path.name,
             "sha256": hashlib.sha256(ledger_bytes).hexdigest(),
+        },
+        "server_request_evidence": {
+            "authority": {
+                "path": str(authority_path.relative_to(TEST_EVIDENCE_ROOT)),
+                "sha256": authority_sha256,
+            },
+            "receipt": {
+                "path": str(receipt_path.relative_to(TEST_EVIDENCE_ROOT)),
+                "sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+            },
         },
         "score": correct_count / PROMPT_COUNT,
         "prompts": prompt_rows,
@@ -440,18 +516,37 @@ class QualificationContractTest(unittest.TestCase):
         plan = {
             "schema": PLAN_SCHEMA,
             "provenance": plan_provenance,
+            "bindings": {
+                "model_path": "/sealed/model",
+                "tokenizer_path": "/sealed/model",
+                "artifacts": {"model_manifest": "/sealed/model-manifest.json"},
+            },
             "accuracy": {
                 "prompt_count": PROMPT_COUNT,
                 "shots": 5,
                 "requests_per_prompt_per_arm": 1,
                 "minimum_score": 0.93,
                 "candidate_no_drop": True,
+                "server_request_authority_schema": ACCURACY_SERVER_AUTHORITY_SCHEMA,
+                "server_request_receipt_schema": ACCURACY_SERVER_RECEIPT_SCHEMA,
+                "server_request_hook": "tools.gdn_public_qualification.accuracy_server_hook",
+                "server_duplicate_request_policy": "reject_before_generation",
             },
         }
         plan_path = TEST_EVIDENCE_ROOT / "plan.json"
         plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n")
         TEST_CAMPAIGN_ID = hashlib.sha256(plan_path.read_bytes()).hexdigest()
         TEST_PLAN_SPEC = {"path": plan_path.name, "sha256": TEST_CAMPAIGN_ID}
+        self.decode_patch = patch(
+            "tools.gdn_public_qualification.contract.decode_accuracy_output_ids",
+            side_effect=lambda tokenizer_path, output_ids: f"answer {output_ids[-1]}",
+        )
+        self.decode_patch.start()
+        self.checkout_patch = patch(
+            "tools.gdn_public_qualification.contract.qualification_checkout_identity",
+            return_value=("a" * 40, "b" * 40),
+        )
+        self.checkout_patch.start()
 
     def tearDown(self):
         global TEST_CAMPAIGN_ID, TEST_EVIDENCE_ROOT, TEST_PLAN_SPEC
@@ -460,10 +555,33 @@ class QualificationContractTest(unittest.TestCase):
         TEST_CAMPAIGN_ID = ""
         TEST_EVIDENCE_ROOT = None
         TEST_PLAN_SPEC = None
+        self.checkout_patch.stop()
+        self.decode_patch.stop()
         self.temp_directory.cleanup()
 
     def _audit(self, receipt: dict, root: Path | None = None) -> dict:
-        return audit_receipt(receipt, root or (self.evidence_root / "default"))
+        default_root = self.evidence_root / "default"
+        selected_root = root or default_root
+        if selected_root != default_root:
+            selected_root.mkdir(parents=True, exist_ok=True)
+            shared_specs = [
+                receipt["accuracy"]["plan"],
+                receipt["accuracy"]["dataset"],
+                receipt["accuracy"]["prompt_ids"],
+                receipt["accuracy"]["arms"]["baseline"]["request_ledger"],
+                receipt["accuracy"]["arms"]["candidate"]["request_ledger"],
+                receipt["accuracy"]["arms"]["baseline"]["server_request_evidence"]["authority"],
+                receipt["accuracy"]["arms"]["baseline"]["server_request_evidence"]["receipt"],
+                receipt["accuracy"]["arms"]["candidate"]["server_request_evidence"]["authority"],
+                receipt["accuracy"]["arms"]["candidate"]["server_request_evidence"]["receipt"],
+            ]
+            for spec in shared_specs:
+                source = default_root / spec["path"]
+                destination = selected_root / spec["path"]
+                if not destination.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, destination)
+        return audit_receipt(receipt, selected_root)
 
     def _rewrite_manifest(self, arm: str, mutate) -> None:
         root = self.evidence_root / "default"
@@ -489,6 +607,24 @@ class QualificationContractTest(unittest.TestCase):
         receipt["provenance"]["flashinfer_commit"] = "b" * 40
         with self.assertRaisesRegex(QualificationError, "flashinfer_commit"):
             self._audit(receipt)
+        with self.subTest("plan and receipt qualification source"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["provenance"]["qualification_commit"] = "c" * 40
+            with self.assertRaisesRegex(
+                QualificationError, "plan provenance differs from receipt provenance"
+            ):
+                self._audit(receipt)
+        with self.subTest("qualification source must match actual auditor checkout"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            with patch(
+                "tools.gdn_public_qualification.contract.qualification_checkout_identity",
+                return_value=("c" * 40, "b" * 40),
+            ):
+                with self.assertRaisesRegex(
+                    QualificationError,
+                    "qualification commit differs from the auditor checkout",
+                ):
+                    self._audit(receipt)
 
     def test_03_prompt_exactly_once_gate(self):
         receipt = _receipt(self.kl_specs, self.kl_value)
@@ -520,6 +656,22 @@ class QualificationContractTest(unittest.TestCase):
             receipt["accuracy"]["arms"]["candidate"]["request_ledger"]["sha256"] = "0" * 64
             with self.assertRaisesRegex(QualificationError, "request ledger SHA256 mismatch"):
                 self._audit(receipt)
+        with self.subTest("server exact-once authority"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            evidence = receipt["accuracy"]["arms"]["candidate"][
+                "server_request_evidence"
+            ]
+            source = self.evidence_root / "default" / evidence["receipt"]["path"]
+            value = json.loads(source.read_text())
+            value["records"][37]["accepted_count"] = 2
+            changed = self.evidence_root / "default" / "candidate-invalid-server-receipt.json"
+            changed.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            evidence["receipt"] = {
+                "path": changed.name,
+                "sha256": hashlib.sha256(changed.read_bytes()).hexdigest(),
+            }
+            with self.assertRaisesRegex(QualificationError, "exact-once acceptance"):
+                self._audit(receipt)
         with self.subTest("arm identity"):
             receipt = _receipt(self.kl_specs, self.kl_value)
             receipt["accuracy"]["arms"]["candidate"]["arm"] = "baseline"
@@ -539,6 +691,13 @@ class QualificationContractTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(QualificationError, "server configuration differs"):
                 self._audit(receipt)
+        with self.subTest("model identity must match rendered plan"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["model_identity"][
+                "model_path"
+            ] = "/different/model"
+            with self.assertRaisesRegex(QualificationError, "differs from the campaign plan"):
+                self._audit(receipt)
         with self.subTest("sampling parameters"):
             receipt = _receipt(self.kl_specs, self.kl_value)
             receipt["accuracy"]["arms"]["candidate"]["sampling_params"][
@@ -551,20 +710,43 @@ class QualificationContractTest(unittest.TestCase):
             receipt["accuracy"]["arms"]["candidate"]["prompts"][37]["response"][
                 "text"
             ] = "answer 999999"
-            with self.assertRaisesRegex(QualificationError, "reported correctness differs"):
+            with self.assertRaisesRegex(QualificationError, "ledger response differs"):
                 self._audit(receipt)
-        with self.subTest("response text and correctness remain ledger-bound"):
+        with self.subTest("source-owned decoding"):
             receipt = _receipt(self.kl_specs, self.kl_value)
             prompt = receipt["accuracy"]["arms"]["candidate"]["prompts"][37]
-            prompt["response"]["text"] = "answer 999999"
-            prompt["correct"] = False
-            with self.assertRaisesRegex(QualificationError, "ledger response differs"):
+            prompt["decoded_text"] = "answer 999999"
+            with self.assertRaisesRegex(QualificationError, "source-owned output decoding differs"):
                 self._audit(receipt)
         with self.subTest("strict boolean"):
             receipt = _receipt(self.kl_specs, self.kl_value)
             receipt["accuracy"]["arms"]["candidate"]["prompts"][37]["correct"] = 1
             with self.assertRaisesRegex(QualificationError, "invalid correctness"):
                 self._audit(receipt)
+        with self.subTest("ledger response must follow dispatch"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            spec = receipt["accuracy"]["arms"]["candidate"]["request_ledger"]
+            source = self.evidence_root / "default" / spec["path"]
+            lines = source.read_text().splitlines()
+            lines[1], lines[2] = lines[2], lines[1]
+            reordered = self.evidence_root / "default" / "candidate-reordered-ledger.jsonl"
+            reordered.write_text("\n".join(lines) + "\n")
+            spec["path"] = reordered.name
+            spec["sha256"] = hashlib.sha256(reordered.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(QualificationError, "response precedes dispatch"):
+                self._audit(receipt)
+
+    def test_03b_canonical_json_rejects_nonfinite_values(self):
+        with self.assertRaises(ValueError):
+            canonical_json_text({"value": float("nan")})
+        with self.assertRaises(ValueError):
+            load_strict_json('{"value":NaN}')
+
+    def test_03c_rendered_plan_output_is_immutable(self):
+        path = self.evidence_root / "immutable-plan.json"
+        _write_plan_exclusive(path, {"schema": PLAN_SCHEMA})
+        with self.assertRaises(FileExistsError):
+            _write_plan_exclusive(path, {"schema": "replacement"})
 
     def test_04_score_no_drop_and_kl_gates(self):
         with self.subTest("candidate score drop"):
@@ -782,6 +964,28 @@ class QualificationContractTest(unittest.TestCase):
         self.assertTrue(all(type(value) is int for value in marker))
         with self.assertRaisesRegex(ValueError, "already exists"):
             prepare_sink_root(root, "baseline", 151936)
+
+    def test_18b_server_hook_rejects_duplicate_campaign_request_id(self):
+        root = self.evidence_root / "server-exact-once"
+        prepare_sink_root(root, "candidate", 151936)
+        authority_path, authority_sha = prepare_accuracy_request_root(root, "candidate")
+        request = SimpleNamespace(
+            rid=f"gdn-gsm8k-{'d' * 64}-candidate-0000",
+            stream=False,
+        )
+        load_accuracy_server_authority.cache_clear()
+        with patch.dict(
+            "os.environ",
+            {
+                ACCURACY_AUTHORITY_ENV: str(authority_path),
+                ACCURACY_AUTHORITY_SHA256_ENV: authority_sha,
+            },
+            clear=False,
+        ):
+            begin_accuracy_server_request(request)
+            with self.assertRaisesRegex(ValueError, "duplicate qualification"):
+                begin_accuracy_server_request(request)
+        load_accuracy_server_authority.cache_clear()
 
     def test_19_accuracy_collector_rejects_caller_selected_dataset(self):
         with self.assertRaisesRegex(ValueError, "dataset hash differs"):

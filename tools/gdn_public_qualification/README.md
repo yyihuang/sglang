@@ -45,15 +45,27 @@ verify server configuration rather than merely declaring it in a plan.
 For each arm, `collect.py accuracy` sends all 1,314 sealed GSM8K token-ID rows
 once. It refuses caller-supplied dataset or token-artifact hashes that differ
 from the contract, hashes the actual rendered plan to derive the campaign ID,
-verifies the exact per-arm TP4 backend and model identity, assigns a
-campaign-scoped unique ordered request ID, and writes a fresh append-only
-dispatch/response ledger around the one POST for each prompt. It preserves each
-raw SGLang response and output-token IDs and records the token-row hash and
-length. The auditor hashes the plan, ledger, and both sealed artifacts, requires
-exactly one dispatch and one response per ordered prompt with matching payload
-and response hashes, checks arm and echoed request identities, and independently
-re-scores every raw response against the sealed answer labels instead of
-trusting the collector's booleans.
+verifies the exact plan-bound per-arm TP4 backend and model/tokenizer identity,
+assigns a campaign-scoped unique ordered request ID, and writes a fresh
+append-only client diagnostic ledger around the one POST for each prompt. The
+default-off qualification hook at the SGLang `/generate` ingress separately
+uses exclusive server-side files to reject a second use of any campaign request
+ID before generation. It seals a source-owned server receipt only after exactly
+one acceptance and one completion for all 1,314 IDs. The collector will not
+write a successful arm artifact without that receipt. This server authority,
+not the client ledger alone, proves the campaign-wide exactly-once criterion.
+If generation fails after an ID is accepted, that ID remains consumed and no
+receipt can be sealed; restart the arm with a fresh sink root and newly rendered
+plan. This is intentional fail-closed behavior, not a retryable request.
+
+The collector preserves each raw SGLang response and output-token IDs and
+records the token-row hash and length. Both collector and auditor independently
+load the sealed tokenizer and decode the output IDs with
+`skip_special_tokens=True` and `clean_up_tokenization_spaces=False`; scoring uses
+that source-owned decoding, never an unverified response-text field. The auditor
+hashes the plan, client ledger, server authority/receipt, and both sealed input
+artifacts, checks dispatch-before-response chronology, arm and echoed request
+identities, and independently scores decoded outputs against the sealed labels.
 The KL
 reference command separately generates 512 fixed output token IDs for each of
 the 48 sealed helper prompts. It then teacher-forces those sequences on the
@@ -148,13 +160,16 @@ launch servers or alter route, accuracy, KL, or performance acceptance gates.
 
 ## Use
 
-Create a private binding JSON with the staged model and tokenizer directories,
+Create a private binding JSON outside the SGLang worktree with the staged model and tokenizer directories,
 the tokenizer vocabulary size, the exact paths for every key in
 `render_plan.ARTIFACT_HASH_KEYS`, separate baseline/candidate hosts, ports, and
 rank-log paths, fresh absolute `kl_sink_roots.baseline` and
 `kl_sink_roots.candidate` paths whose parents already exist, the candidate
 FlashInfer Python path, CUDA version, GPU name, and container image. The
-renderer launches both servers through the sealed sink adapter. Then, inside
+renderer refuses any dirty path in the complete SGLang worktree and creates the
+plan exclusively; an existing plan is never overwritten. It launches both
+servers through the sealed sink adapter, which also installs the default-off
+accuracy request authority under each fresh KL sink root. Then, inside
 the allocated compute job:
 
 ```bash
@@ -190,12 +205,18 @@ python -m tools.gdn_public_qualification.collect kl-candidate \
 python -m tools.gdn_public_qualification.audit result.json --output audit.json
 ```
 
-`result.json` references the rendered plan, each per-arm request ledger, and
+`result.json` references the rendered plan, each per-arm client request ledger,
+each source-owned server request authority and sealed receipt, and
 each KL manifest with paths relative to the result file and their SHA256s.
 Place the result so the plan, ledgers, and both sealed sink roots with their
 manifests/shards are below its directory. The auditor resolves only safe
-relative paths below the result directory and refuses missing, reused,
-truncated, re-ordered, or hash-drifted evidence.
+relative paths below the result directory, verifies that its own complete clean
+SGLang checkout is the exact qualification commit/tree recorded in the plan
+and receipt, and refuses missing, reused, truncated, re-ordered, or hash-drifted
+evidence.
+
+All qualification JSON and JSONL evidence rejects non-finite numbers and uses
+the source-owned canonical JSON spelling for content hashes.
 
 Keep `bindings.json`, `plan.json`, raw model outputs, rank logs, results, and the
 audit receipt in the durable campaign evidence directory. Record their SHA256

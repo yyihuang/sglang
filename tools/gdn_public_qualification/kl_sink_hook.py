@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -13,6 +12,8 @@ from tools.gdn_public_qualification.contract import (
     KL_SAMPLE_COUNT,
     KL_TOKEN_ID_ORDER,
     KL_VOCAB_CHUNK_SIZE,
+    canonical_json_text,
+    load_strict_json,
 )
 
 AUTHORITY_ENV = "SGLANG_GDN_QUALIFICATION_KL_SINK_AUTHORITY"
@@ -54,7 +55,7 @@ def load_authority() -> tuple[dict, str]:
     actual_sha = hashlib.sha256(raw).hexdigest()
     if actual_sha != expected_sha:
         raise RuntimeError("KL sink authority SHA256 mismatch")
-    authority = json.loads(raw)
+    authority = load_strict_json(raw.decode())
     expected = {
         "schema": KL_SINK_AUTHORITY_SCHEMA,
         "sample_count": KL_SAMPLE_COUNT,
@@ -170,7 +171,7 @@ def maybe_sink_full_vocab(
         "vocab_chunk_size": KL_VOCAB_CHUNK_SIZE,
         "shards": shards,
     }
-    encoded = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    encoded = (canonical_json_text(receipt) + "\n").encode()
     _write_exclusive(root / "receipts" / f"sample-{sample_index:03d}.json", encoded)
 
 
@@ -185,7 +186,7 @@ def attach_sink_receipt(meta_info: dict, token_ids_logprob: object) -> None:
     if not path.is_file():
         raise RuntimeError("KL sink sample receipt is missing")
     raw = path.read_bytes()
-    receipt = json.loads(raw)
+    receipt = load_strict_json(raw.decode())
     if (
         receipt.get("authority_sha256") != authority_sha
         or receipt.get("arm") != authority["arm"]

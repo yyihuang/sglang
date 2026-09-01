@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import runpy
 import sys
@@ -15,6 +14,13 @@ from tools.gdn_public_qualification.contract import (
     KL_SAMPLE_COUNT,
     KL_TOKEN_ID_ORDER,
     KL_VOCAB_CHUNK_SIZE,
+    PROMPT_COUNT,
+    canonical_json_text,
+)
+from tools.gdn_public_qualification.accuracy_server_hook import (
+    AUTHORITY_ENV as ACCURACY_AUTHORITY_ENV,
+    AUTHORITY_SCHEMA as ACCURACY_AUTHORITY_SCHEMA,
+    AUTHORITY_SHA256_ENV as ACCURACY_AUTHORITY_SHA256_ENV,
 )
 from tools.gdn_public_qualification.kl_sink_hook import (
     AUTHORITY_ENV,
@@ -24,7 +30,28 @@ from tools.gdn_public_qualification.kl_sink_hook import (
 
 
 def _canonical_json(value: object) -> bytes:
-    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return (canonical_json_text(value) + "\n").encode()
+
+
+def prepare_accuracy_request_root(sink_root: Path, arm: str) -> tuple[Path, str]:
+    root = sink_root / "accuracy_requests"
+    root.mkdir(mode=0o700)
+    (root / "accepted").mkdir(mode=0o700)
+    (root / "completed").mkdir(mode=0o700)
+    authority = {
+        "schema": ACCURACY_AUTHORITY_SCHEMA,
+        "root": str(root),
+        "arm": arm,
+        "prompt_count": PROMPT_COUNT,
+        "accepted_count_per_prompt": 1,
+        "completed_count_per_prompt": 1,
+    }
+    payload = _canonical_json(authority)
+    path = root / "authority.json"
+    with path.open("xb") as handle:
+        handle.write(payload)
+    path.chmod(0o400)
+    return path, hashlib.sha256(payload).hexdigest()
 
 
 def prepare_sink_root(root: Path, arm: str, vocab_size: int) -> tuple[Path, str]:
@@ -77,8 +104,13 @@ def main() -> int:
     authority_path, authority_sha256 = prepare_sink_root(
         args.sink_root, args.sink_arm, args.sink_vocab_size
     )
+    accuracy_authority_path, accuracy_authority_sha256 = prepare_accuracy_request_root(
+        args.sink_root, args.sink_arm
+    )
     os.environ[AUTHORITY_ENV] = str(authority_path)
     os.environ[AUTHORITY_SHA256_ENV] = authority_sha256
+    os.environ[ACCURACY_AUTHORITY_ENV] = str(accuracy_authority_path)
+    os.environ[ACCURACY_AUTHORITY_SHA256_ENV] = accuracy_authority_sha256
     sys.argv = ["sglang.launch_server", *server_args]
     runpy.run_module("sglang.launch_server", run_name="__main__")
     return 0
