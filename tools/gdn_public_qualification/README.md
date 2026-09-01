@@ -261,3 +261,23 @@ digests, scheduler job/step IDs, physical turnaround, and measured runtimes in
 the final report. The final campaign remains embargoed until the pinned
 FlashInfer commit has passed direct public validation on both required
 architectures.
+
+## Reusable-asset preflight
+
+`preflight_reusable_assets.py` revalidates only the sealed model/tokenizer,
+GSM8K and LongBench inputs, and the aarch64 runtime-dependency wheelhouse. It
+fully hashes the model files and every wheel and derives `vocab_size` from the
+sealed model `config.json`. It must run in a one-GPU GB300 Slurm step from a
+clean checkout and writes a fresh canonical receipt plus its SHA256 file.
+
+```bash
+python -m tools.gdn_public_qualification.preflight_reusable_assets \
+  --input-root /absolute/sealed-input-root \
+  --model-root /absolute/sealed-model-root \
+  --wheelhouse /absolute/sealed-wheelhouse \
+  --output /absolute/fresh-evidence/reusable-assets-preflight.json
+```
+
+The receipt status is `PASS_REUSABLE_ASSETS_ONLY`. It does not authenticate a
+kernel winner, launch a model server, prove TP4 routes, or constitute accuracy,
+KL, throughput, or final-campaign evidence.
