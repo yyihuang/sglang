@@ -6,11 +6,15 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    _fuses_routed_scaling_factor_in_topk,
+)
 from sglang.srt.layers.moe.mega_moe import (
     _flashinfer_megamoe_chunk_ranges,
     _run_flashinfer_mega_routed,
     build_flashinfer_megamoe_experts_weights,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
 
 class _Config:
@@ -171,6 +175,25 @@ class TestFlashInferMegaMoEWeightOwnership(unittest.TestCase):
 
 
 class TestFlashInferMegaMoEActiveChunks(unittest.TestCase):
+    def test_unquantized_method_fuses_routed_scale_for_flashinfer_megamoe(self):
+        quant_method = object.__new__(UnquantizedFusedMoEMethod)
+        runner_backend = SimpleNamespace(
+            is_flashinfer_trtllm_routed=lambda: False,
+        )
+        a2a_backend = SimpleNamespace(is_flashinfer_megamoe=lambda: True)
+        with (
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer."
+                "get_moe_runner_backend",
+                return_value=runner_backend,
+            ),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.get_moe_a2a_backend",
+                return_value=a2a_backend,
+            ),
+        ):
+            self.assertTrue(_fuses_routed_scaling_factor_in_topk(quant_method))
+
     def test_chunk_ranges_cover_fixed_boundaries(self):
         expected = {
             0: (),
@@ -215,6 +238,7 @@ class TestFlashInferMegaMoEActiveChunks(unittest.TestCase):
                 _flashinfer_megamoe_warmed_up=True,
                 should_fuse_routed_scaling_factor_in_topk=True,
             ),
+            routed_scaling_factor=2.5,
             gate=lambda *_args, **_kwargs: object(),
             topk=lambda *_args, **_kwargs: SimpleNamespace(
                 topk_ids=ids, topk_weights=weights
