@@ -62,19 +62,56 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _git_revision_for_file(path: Path) -> str | None:
+def _git_identity_for_file(path: Path) -> dict[str, Any]:
     for directory in (path.parent, *path.parents):
         if not (directory / ".git").exists():
             continue
         try:
-            return subprocess.check_output(
-                ["git", "-C", str(directory), "rev-parse", "HEAD"],
+            git_root = subprocess.check_output(
+                ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
                 text=True,
                 stderr=subprocess.DEVNULL,
             ).strip()
+            revision = subprocess.check_output(
+                ["git", "-C", git_root, "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            tree = subprocess.check_output(
+                ["git", "-C", git_root, "rev-parse", "HEAD^{tree}"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            status = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    git_root,
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            return {
+                "git_root": git_root,
+                "git_revision": revision,
+                "git_tree": tree,
+                "git_clean": not status,
+                "git_status_sha256": hashlib.sha256(
+                    status.encode()
+                ).hexdigest(),
+            }
         except (OSError, subprocess.CalledProcessError):
-            return None
-    return None
+            break
+    return {
+        "git_root": None,
+        "git_revision": None,
+        "git_tree": None,
+        "git_clean": None,
+        "git_status_sha256": None,
+    }
 
 
 def _module_source_identity(module_name: str) -> dict[str, Any]:
@@ -87,8 +124,8 @@ def _module_source_identity(module_name: str) -> dict[str, Any]:
         "module": module_name,
         "module_file": str(module_file),
         "module_file_sha256": _sha256_file(module_file),
-        "git_revision": _git_revision_for_file(module_file),
         "version": getattr(module, "__version__", None),
+        **_git_identity_for_file(module_file),
     }
 
 
@@ -1205,6 +1242,14 @@ def main() -> None:
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
             "guidance_scale_2": args.guidance_scale_2,
+            "return_frames": ref_sampling_kwargs["return_frames"],
+            "return_trajectory_latents": ref_sampling_kwargs[
+                "return_trajectory_latents"
+            ],
+            "return_trajectory_decoded": ref_sampling_kwargs[
+                "return_trajectory_decoded"
+            ],
+            "save_output": ref_sampling_kwargs["save_output"],
         },
         "reference_generation": {
             key: value

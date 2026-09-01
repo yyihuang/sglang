@@ -408,6 +408,7 @@ def test_build_sampling_kwargs_disables_trajectory_for_performance():
     assert kwargs["return_frames"] is True
     assert kwargs["return_trajectory_latents"] is False
     assert kwargs["return_trajectory_decoded"] is False
+    assert kwargs["save_output"] is False
 
 
 def _paired_performance_report(
@@ -441,14 +442,24 @@ def _paired_performance_report(
             "num_inference_steps": 12,
             "guidance_scale": 5.0,
             "guidance_scale_2": None,
+            "return_frames": True,
+            "return_trajectory_latents": False,
+            "return_trajectory_decoded": False,
+            "save_output": False,
         },
         "source_identity": {
             "sglang": {
                 "git_revision": "a" * 40,
+                "git_tree": "e" * 40,
+                "git_clean": True,
+                "git_status_sha256": "0" * 64,
                 "module_file_sha256": "c" * 64,
             },
             "flashinfer": {
                 "git_revision": "b" * 40,
+                "git_tree": "f" * 40,
+                "git_clean": True,
+                "git_status_sha256": "0" * 64,
                 "module_file_sha256": "d" * 64,
             },
         },
@@ -510,6 +521,19 @@ def test_paired_performance_qualification_requires_opposite_orders():
             lambda report: report.update(trajectory_capture_enabled=True),
             "trajectory_capture_enabled",
             "trajectory_capture_must_be_explicitly_disabled",
+        ),
+        (
+            lambda report: report["sampling_kwargs"].update(save_output=True),
+            "sampling_kwargs.save_output",
+            "output_saving_must_be_explicitly_disabled",
+        ),
+        (
+            lambda report: report["source_identity"]["sglang"].update(
+                git_clean=False,
+                git_status_sha256="1" * 64,
+            ),
+            "source_identity.sglang.git_clean",
+            "clean_source_tree_required",
         ),
         (
             lambda report: report["candidate_generation"].update(

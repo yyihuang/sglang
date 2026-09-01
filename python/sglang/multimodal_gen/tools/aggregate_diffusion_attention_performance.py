@@ -142,7 +142,12 @@ def _validate_report(
                     )
                 )
                 continue
-            for identity_field in ("git_revision", "module_file_sha256"):
+            for identity_field in (
+                "git_revision",
+                "git_tree",
+                "git_status_sha256",
+                "module_file_sha256",
+            ):
                 if not component_identity.get(identity_field):
                     failures.append(
                         _failure(
@@ -151,6 +156,28 @@ def _validate_report(
                             "missing_or_empty",
                         )
                     )
+            if component_identity.get("git_clean") is not True:
+                failures.append(
+                    _failure(
+                        label,
+                        f"source_identity.{component}.git_clean",
+                        "clean_source_tree_required",
+                        actual=component_identity.get("git_clean"),
+                    )
+                )
+
+    sampling_kwargs = report.get("sampling_kwargs")
+    if isinstance(sampling_kwargs, dict) and sampling_kwargs.get(
+        "save_output"
+    ) is not False:
+        failures.append(
+            _failure(
+                label,
+                "sampling_kwargs.save_output",
+                "output_saving_must_be_explicitly_disabled",
+                actual=sampling_kwargs.get("save_output"),
+            )
+        )
 
     runtime_provenance = report.get("runtime_provenance")
     if isinstance(runtime_provenance, dict):
