@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -17,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 def handle_mega_moe(server_args: ServerArgs) -> None:
     handle_moe_runner_backend_alias(server_args)
-    handle_w4a4_mxfp4_megamoe_env(server_args)
     validate_flashinfer_megamoe_args(server_args)
 
 
@@ -39,15 +37,6 @@ def handle_moe_runner_backend_alias(server_args: ServerArgs) -> None:
         moe_runner_backend="auto",
         moe_a2a_backend="megamoe",
     )
-
-
-def handle_w4a4_mxfp4_megamoe_env(server_args: ServerArgs) -> None:
-    cfg = resolving_view(server_args)
-    if not cfg.enable_w4a4_mxfp4_megamoe:
-        return
-
-    os.environ["DG_USE_FP4_ACTS"] = "1"
-    os.environ["DG_USE_MXF4_KIND"] = "1"
 
 
 def validate_flashinfer_megamoe_args(server_args: ServerArgs) -> None:
