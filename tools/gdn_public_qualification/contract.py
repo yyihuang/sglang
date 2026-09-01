@@ -677,6 +677,9 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
             f"{arm} prompt IDs authority differs",
         )
         require(arm_result.get("request_payload") == "input_ids", f"{arm} did not send sealed token IDs")
+        score = _validate_prompt_rows(
+            arm_result.get("prompts"), arm, campaign_id, prompt_ids, dataset_rows
+        )
         _validate_request_ledger(
             arm_result.get("request_ledger"),
             evidence_root,
@@ -684,9 +687,6 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
             campaign_id,
             prompt_ids,
             arm_result.get("prompts"),
-        )
-        score = _validate_prompt_rows(
-            arm_result.get("prompts"), arm, campaign_id, prompt_ids, dataset_rows
         )
         reported = arm_result.get("score")
         require(isinstance(reported, (int, float)) and math.isclose(float(reported), score, rel_tol=0, abs_tol=1e-15), f"{arm} reported score does not match raw prompts")

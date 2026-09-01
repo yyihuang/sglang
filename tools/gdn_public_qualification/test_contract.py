@@ -553,6 +553,13 @@ class QualificationContractTest(unittest.TestCase):
             ] = "answer 999999"
             with self.assertRaisesRegex(QualificationError, "reported correctness differs"):
                 self._audit(receipt)
+        with self.subTest("response text and correctness remain ledger-bound"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            prompt = receipt["accuracy"]["arms"]["candidate"]["prompts"][37]
+            prompt["response"]["text"] = "answer 999999"
+            prompt["correct"] = False
+            with self.assertRaisesRegex(QualificationError, "ledger response differs"):
+                self._audit(receipt)
         with self.subTest("strict boolean"):
             receipt = _receipt(self.kl_specs, self.kl_value)
             receipt["accuracy"]["arms"]["candidate"]["prompts"][37]["correct"] = 1
