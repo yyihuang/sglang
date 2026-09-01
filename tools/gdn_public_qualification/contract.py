@@ -189,6 +189,12 @@ def validate_provenance(provenance: Mapping[str, object]) -> None:
         and bool(_FULL_SHA_RE.fullmatch(qualification_commit)),
         "qualification_commit must be a full lowercase Git SHA",
     )
+    qualification_tree = provenance.get("qualification_tree")
+    require(
+        isinstance(qualification_tree, str)
+        and bool(_FULL_SHA_RE.fullmatch(qualification_tree)),
+        "qualification_tree must be a full lowercase Git SHA",
+    )
     require(
         provenance.get("compute_capability") == [10, 3],
         "final campaign must run directly on compute capability 10.3",
@@ -377,6 +383,89 @@ def _load_prompt_ids_authority(spec: object, evidence_root: Path | None) -> list
     return value
 
 
+def _load_campaign_plan(
+    spec: object, evidence_root: Path | None, campaign_id: str
+) -> Mapping[str, object]:
+    require(evidence_root is not None, "an evidence root is required for the rendered campaign plan")
+    require(isinstance(spec, Mapping), "accuracy.plan must be an object")
+    require(spec.get("sha256") == campaign_id, "campaign plan spec differs from campaign_id")
+    path = _resolve_evidence_path(evidence_root, spec.get("path"), "campaign plan")
+    require(_file_sha256(path) == campaign_id, "campaign plan file hash differs from campaign_id")
+    try:
+        plan = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QualificationError(f"campaign plan is unreadable: {exc}") from exc
+    require(isinstance(plan, Mapping) and plan.get("schema") == PLAN_SCHEMA, "campaign plan schema differs")
+    provenance = plan.get("provenance")
+    require(isinstance(provenance, Mapping), "campaign plan provenance is required")
+    validate_provenance(provenance)
+    accuracy = plan.get("accuracy")
+    require(isinstance(accuracy, Mapping), "campaign plan accuracy contract is required")
+    require(accuracy.get("prompt_count") == PROMPT_COUNT, "campaign plan prompt count differs")
+    require(accuracy.get("shots") == GSM8K_SHOTS, "campaign plan shot count differs")
+    require(accuracy.get("requests_per_prompt_per_arm") == 1, "campaign plan request count differs")
+    require(accuracy.get("minimum_score") == MIN_SCORE, "campaign plan minimum score differs")
+    require(accuracy.get("candidate_no_drop") is True, "campaign plan no-drop gate differs")
+    return plan
+
+
+def _validate_request_ledger(
+    spec: object,
+    evidence_root: Path | None,
+    arm: str,
+    campaign_id: str,
+    prompt_ids: Sequence[Sequence[int]],
+    prompt_rows: object,
+) -> None:
+    require(evidence_root is not None, f"an evidence root is required for the {arm} request ledger")
+    require(isinstance(spec, Mapping), f"{arm} request ledger must be an object")
+    path = _resolve_evidence_path(evidence_root, spec.get("path"), f"{arm} request ledger")
+    expected_sha = spec.get("sha256")
+    require(isinstance(expected_sha, str) and bool(_SHA256_RE.fullmatch(expected_sha)), f"{arm} request ledger SHA256 is required")
+    require(_file_sha256(path) == expected_sha, f"{arm} request ledger SHA256 mismatch")
+    try:
+        events = [json.loads(line) for line in path.read_text().splitlines() if line]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QualificationError(f"{arm} request ledger is unreadable: {exc}") from exc
+    require(len(events) == 1 + 2 * PROMPT_COUNT, f"{arm} request ledger must contain one header and exactly two events per prompt")
+    header = events[0]
+    require(
+        isinstance(header, Mapping)
+        and header.get("schema") == "gdn-gsm8k-request-ledger-v1"
+        and header.get("arm") == arm
+        and header.get("campaign_id") == campaign_id
+        and header.get("prompt_count") == PROMPT_COUNT,
+        f"{arm} request ledger header differs",
+    )
+    require(isinstance(prompt_rows, list) and len(prompt_rows) == PROMPT_COUNT, f"{arm} prompt rows are unavailable for ledger audit")
+    observed: dict[tuple[int, str], Mapping[str, object]] = {}
+    for event in events[1:]:
+        require(isinstance(event, Mapping), f"{arm} request ledger event must be an object")
+        key = (event.get("question_index"), event.get("event"))
+        require(
+            type(key[0]) is int
+            and 0 <= key[0] < PROMPT_COUNT
+            and key[1] in ("dispatch", "response"),
+            f"{arm} request ledger event identity differs",
+        )
+        require(key not in observed, f"{arm} request ledger duplicates prompt {key[0]} {key[1]}")
+        observed[key] = event
+    for index, row in enumerate(prompt_rows):
+        require(isinstance(row, Mapping), f"{arm} prompt {index} must be an object")
+        request_id = f"gdn-gsm8k-{campaign_id}-{arm}-{index:04d}"
+        dispatch = observed.get((index, "dispatch"))
+        response = observed.get((index, "response"))
+        require(dispatch is not None and response is not None, f"{arm} prompt {index} lacks exactly one dispatch and response")
+        require(dispatch.get("request_id") == request_id and response.get("request_id") == request_id, f"{arm} prompt {index} ledger request ID differs")
+        payload = {
+            "rid": request_id,
+            "input_ids": prompt_ids[index],
+            "sampling_params": ACCURACY_SAMPLING_PARAMS,
+        }
+        require(dispatch.get("payload_sha256") == _json_sha256(payload), f"{arm} prompt {index} ledger payload differs")
+        require(response.get("response_sha256") == _json_sha256(row.get("response")), f"{arm} prompt {index} ledger response differs")
+
+
 def _load_kl_manifest(spec: object, evidence_root: Path, arm: str) -> tuple[dict, Path]:
     require(isinstance(spec, Mapping), f"{arm} KL manifest reference must be an object")
     path = _resolve_evidence_path(evidence_root, spec.get("path"), f"{arm} KL manifest")
@@ -546,6 +635,7 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
         isinstance(campaign_id, str) and bool(_SHA256_RE.fullmatch(campaign_id)),
         "accuracy campaign_id must be a SHA256",
     )
+    _load_campaign_plan(accuracy.get("plan"), evidence_root, campaign_id)
     dataset_rows = _load_gsm8k_dataset_authority(accuracy.get("dataset"), evidence_root)
     prompt_ids = _load_prompt_ids_authority(accuracy.get("prompt_ids"), evidence_root)
     arms = accuracy.get("arms")
@@ -557,6 +647,7 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
         require(isinstance(arm_result, Mapping), f"accuracy {arm} must be an object")
         require(arm_result.get("arm") == arm, f"accuracy {arm} arm identity differs")
         require(arm_result.get("campaign_id") == campaign_id, f"accuracy {arm} campaign identity differs")
+        require(arm_result.get("plan_sha256") == campaign_id, f"accuracy {arm} plan identity differs")
         require(
             arm_result.get("sampling_params") == ACCURACY_SAMPLING_PARAMS,
             f"accuracy {arm} sampling parameters differ",
@@ -586,6 +677,14 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
             f"{arm} prompt IDs authority differs",
         )
         require(arm_result.get("request_payload") == "input_ids", f"{arm} did not send sealed token IDs")
+        _validate_request_ledger(
+            arm_result.get("request_ledger"),
+            evidence_root,
+            arm,
+            campaign_id,
+            prompt_ids,
+            arm_result.get("prompts"),
+        )
         score = _validate_prompt_rows(
             arm_result.get("prompts"), arm, campaign_id, prompt_ids, dataset_rows
         )
@@ -615,7 +714,7 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
 
 
 def _json_sha256(value: object) -> str:
-    encoded = json.dumps(value, separators=(",", ":")).encode()
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 

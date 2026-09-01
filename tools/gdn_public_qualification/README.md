@@ -10,7 +10,8 @@ an uncommitted binding JSON. `render_plan.py` hashes every staged input before i
 emits a private plan and pins:
 
 - the exact SGLang integration base, FlashInfer commit/tree/bundle, exported
-  source commit/tree, manifests, kernel, and exporter;
+  source commit/tree, clean qualification commit/tree, manifests, kernel, and
+  exporter;
 - the 1,319-row sealed GSM8K file as five fixed shots followed by exactly 1,314
   unique evaluation prompts, plus the exact 1,314-row prompt-token artifact
   requested once per arm;
@@ -43,12 +44,16 @@ verify server configuration rather than merely declaring it in a plan.
 
 For each arm, `collect.py accuracy` sends all 1,314 sealed GSM8K token-ID rows
 once. It refuses caller-supplied dataset or token-artifact hashes that differ
-from the contract, verifies the exact per-arm TP4 backend and model identity,
-assigns a campaign-scoped unique ordered request ID, preserves each raw
-SGLang response and output-token IDs, and records the token-row hash and length.
-The auditor hashes both sealed artifacts, matches every token row, checks arm
-and echoed request identities, and independently re-scores every raw response
-against the sealed answer labels instead of trusting the collector's booleans.
+from the contract, hashes the actual rendered plan to derive the campaign ID,
+verifies the exact per-arm TP4 backend and model identity, assigns a
+campaign-scoped unique ordered request ID, and writes a fresh append-only
+dispatch/response ledger around the one POST for each prompt. It preserves each
+raw SGLang response and output-token IDs and records the token-row hash and
+length. The auditor hashes the plan, ledger, and both sealed artifacts, requires
+exactly one dispatch and one response per ordered prompt with matching payload
+and response hashes, checks arm and echoed request identities, and independently
+re-scores every raw response against the sealed answer labels instead of
+trusting the collector's booleans.
 The KL
 reference command separately generates 512 fixed output token IDs for each of
 the 48 sealed helper prompts. It then teacher-forces those sequences on the
@@ -157,12 +162,14 @@ python -m tools.gdn_public_qualification.render_plan bindings.json --output plan
 python -m tools.gdn_public_qualification.collect accuracy \
   --base-url "$BASELINE_URL" --arm baseline \
   --campaign-id "$PLAN_SHA256" \
+  --plan "$CAMPAIGN_EVIDENCE/plan.json" \
+  --ledger "$CAMPAIGN_EVIDENCE/baseline-gsm8k-request-ledger.jsonl" \
   --dataset "$GSM8K_DATASET" --dataset-sha256 "$GSM8K_DATASET_SHA256" \
   --prompt-ids "$GSM8K_PROMPT_IDS" \
   --prompt-ids-sha256 "$GSM8K_PROMPT_IDS_SHA256" \
   --model-path "$MODEL_PATH" --tokenizer-path "$TOKENIZER_PATH" \
   --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
-  --output baseline-gsm8k.json
+  --output "$CAMPAIGN_EVIDENCE/baseline-gsm8k.json"
 python -m tools.gdn_public_qualification.collect mtp-probe --help
 python -m tools.gdn_public_qualification.collect kl-reference \
   --base-url "$BASELINE_URL" --input-ids "$LONG48_IDS" \
@@ -183,11 +190,12 @@ python -m tools.gdn_public_qualification.collect kl-candidate \
 python -m tools.gdn_public_qualification.audit result.json --output audit.json
 ```
 
-`result.json` references each KL manifest with a path relative to the result
-file and its SHA256. Place the result so both sealed sink roots and their
+`result.json` references the rendered plan, each per-arm request ledger, and
+each KL manifest with paths relative to the result file and their SHA256s.
+Place the result so the plan, ledgers, and both sealed sink roots with their
 manifests/shards are below its directory. The auditor resolves only safe
 relative paths below the result directory and refuses missing, reused,
-truncated, re-ordered, or hash-drifted distribution evidence.
+truncated, re-ordered, or hash-drifted evidence.
 
 Keep `bindings.json`, `plan.json`, raw model outputs, rank logs, results, and the
 audit receipt in the durable campaign evidence directory. Record their SHA256

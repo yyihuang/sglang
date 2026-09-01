@@ -32,6 +32,7 @@ from tools.gdn_public_qualification.contract import (
     MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
     MTP_SPECULATIVE_NUM_STEPS,
     PROMPT_COUNT,
+    PLAN_SCHEMA,
     SCHEMA,
     WORKLOADS,
     QualificationError,
@@ -44,7 +45,9 @@ from tools.gdn_public_qualification.kl_sink_hook import marker_for_sample
 from tools.gdn_public_qualification.kl_sink_server import prepare_sink_root
 
 
-TEST_CAMPAIGN_ID = "c" * 64
+TEST_CAMPAIGN_ID = ""
+TEST_EVIDENCE_ROOT: Path | None = None
+TEST_PLAN_SPEC: dict[str, str] | None = None
 
 
 def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
@@ -75,9 +78,58 @@ def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
 
 
 def _accuracy_arm(arm: str, correct_count: int) -> dict:
+    if TEST_EVIDENCE_ROOT is None:
+        raise RuntimeError("accuracy test evidence root is not initialized")
+    prompt_rows = _prompt_rows(arm, correct_count)
+    ledger_path = TEST_EVIDENCE_ROOT / f"gsm8k-{arm}-{correct_count}-request-ledger.jsonl"
+    events = [
+        {
+            "schema": "gdn-gsm8k-request-ledger-v1",
+            "arm": arm,
+            "campaign_id": TEST_CAMPAIGN_ID,
+            "prompt_count": PROMPT_COUNT,
+        }
+    ]
+    for index, row in enumerate(prompt_rows):
+        request_id = f"gdn-gsm8k-{TEST_CAMPAIGN_ID}-{arm}-{index:04d}"
+        payload = {
+            "rid": request_id,
+            "input_ids": [index + 1],
+            "sampling_params": ACCURACY_SAMPLING_PARAMS,
+        }
+        events.extend(
+            (
+                {
+                    "event": "dispatch",
+                    "question_index": index,
+                    "request_id": request_id,
+                    "payload_sha256": hashlib.sha256(
+                        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                },
+                {
+                    "event": "response",
+                    "question_index": index,
+                    "request_id": request_id,
+                    "response_sha256": hashlib.sha256(
+                        json.dumps(row["response"], sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                },
+            )
+        )
+    ledger_bytes = "".join(
+        json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+        for event in events
+    ).encode()
+    if ledger_path.exists():
+        if ledger_path.read_bytes() != ledger_bytes:
+            raise RuntimeError(f"test request ledger drift: {ledger_path}")
+    else:
+        ledger_path.write_bytes(ledger_bytes)
     return {
         "arm": arm,
         "campaign_id": TEST_CAMPAIGN_ID,
+        "plan_sha256": TEST_CAMPAIGN_ID,
         "dataset_sha256": HASHES["gsm8k_dataset_sha256"],
         "prompt_ids_sha256": HASHES["gsm8k_prompt_ids_sha256"],
         "request_payload": "input_ids",
@@ -88,8 +140,12 @@ def _accuracy_arm(arm: str, correct_count: int) -> dict:
             "tokenizer_path": "/sealed/model",
             "model_manifest_sha256": HASHES["model_manifest_sha256"],
         },
+        "request_ledger": {
+            "path": ledger_path.name,
+            "sha256": hashlib.sha256(ledger_bytes).hexdigest(),
+        },
         "score": correct_count / PROMPT_COUNT,
-        "prompts": _prompt_rows(arm, correct_count),
+        "prompts": prompt_rows,
     }
 
 
@@ -223,10 +279,13 @@ def _write_kl_evidence(
 
 
 def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict:
+    if TEST_PLAN_SPEC is None:
+        raise RuntimeError("accuracy test plan is not initialized")
     provenance = expected_provenance()
     provenance.update(
         {
             "qualification_commit": "a" * 40,
+            "qualification_tree": "b" * 40,
             "compute_capability": [10, 3],
             "gpu_name": "NVIDIA GB300",
             "cuda_version": "13.0",
@@ -249,6 +308,7 @@ def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict
         },
         "accuracy": {
             "campaign_id": TEST_CAMPAIGN_ID,
+            "plan": dict(TEST_PLAN_SPEC),
             "dataset": {
                 "path": "gsm8k.jsonl",
                 "sha256": HASHES["gsm8k_dataset_sha256"],
@@ -336,6 +396,7 @@ def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict
 
 class QualificationContractTest(unittest.TestCase):
     def setUp(self):
+        global TEST_CAMPAIGN_ID, TEST_EVIDENCE_ROOT, TEST_PLAN_SPEC
         self.temp_directory = tempfile.TemporaryDirectory()
         self.evidence_root = Path(self.temp_directory.name)
         self.kl_specs, self.kl_value = _write_kl_evidence(self.evidence_root / "default")
@@ -363,10 +424,42 @@ class QualificationContractTest(unittest.TestCase):
             self.evidence_root / "default" / "gsm8k-prompt-token-ids.json",
             prompt_ids,
         )
+        TEST_EVIDENCE_ROOT = self.evidence_root / "default"
+        plan_provenance = expected_provenance()
+        plan_provenance.update(
+            {
+                "qualification_commit": "a" * 40,
+                "qualification_tree": "b" * 40,
+                "compute_capability": [10, 3],
+                "gpu_name": "NVIDIA GB300",
+                "cuda_version": "13.0",
+                "tp_size": 4,
+                "tp_ranks": [0, 1, 2, 3],
+            }
+        )
+        plan = {
+            "schema": PLAN_SCHEMA,
+            "provenance": plan_provenance,
+            "accuracy": {
+                "prompt_count": PROMPT_COUNT,
+                "shots": 5,
+                "requests_per_prompt_per_arm": 1,
+                "minimum_score": 0.93,
+                "candidate_no_drop": True,
+            },
+        }
+        plan_path = TEST_EVIDENCE_ROOT / "plan.json"
+        plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n")
+        TEST_CAMPAIGN_ID = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+        TEST_PLAN_SPEC = {"path": plan_path.name, "sha256": TEST_CAMPAIGN_ID}
 
     def tearDown(self):
+        global TEST_CAMPAIGN_ID, TEST_EVIDENCE_ROOT, TEST_PLAN_SPEC
         HASHES["gsm8k_dataset_sha256"] = self.original_dataset_sha256
         HASHES["gsm8k_prompt_ids_sha256"] = self.original_prompt_ids_sha256
+        TEST_CAMPAIGN_ID = ""
+        TEST_EVIDENCE_ROOT = None
+        TEST_PLAN_SPEC = None
         self.temp_directory.cleanup()
 
     def _audit(self, receipt: dict, root: Path | None = None) -> dict:
@@ -416,6 +509,16 @@ class QualificationContractTest(unittest.TestCase):
             receipt = _receipt(self.kl_specs, self.kl_value)
             receipt["accuracy"]["arms"]["candidate"]["dataset_sha256"] = "0" * 64
             with self.assertRaisesRegex(QualificationError, "dataset authority differs"):
+                self._audit(receipt)
+        with self.subTest("rendered plan authority"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["plan"]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(QualificationError, "campaign plan spec differs"):
+                self._audit(receipt)
+        with self.subTest("request ledger authority"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["request_ledger"]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(QualificationError, "request ledger SHA256 mismatch"):
                 self._audit(receipt)
         with self.subTest("arm identity"):
             receipt = _receipt(self.kl_specs, self.kl_value)

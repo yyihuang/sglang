@@ -12,7 +12,9 @@ import ast
 import hashlib
 import json
 import math
+import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -34,8 +36,10 @@ from tools.gdn_public_qualification.contract import (
     MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
     MTP_SPECULATIVE_NUM_STEPS,
     PROMPT_COUNT,
+    PLAN_SCHEMA,
     TP_SIZE,
     expected_server_config,
+    validate_provenance,
 )
 from tools.gdn_public_qualification.kl_sink_hook import (
     KL_SINK_AUTHORITY_SCHEMA,
@@ -106,10 +110,35 @@ def _answer_value(text: str) -> object:
 
 
 def collect_accuracy(args: argparse.Namespace) -> None:
-    if args.output.exists():
-        raise ValueError(f"accuracy output already exists: {args.output}")
     if args.dataset_sha256 != HASHES["gsm8k_dataset_sha256"]:
         raise ValueError("GSM8K dataset hash differs from the sealed qualification authority")
+    if args.output.exists():
+        raise ValueError(f"accuracy output already exists: {args.output}")
+    if args.ledger.exists():
+        raise ValueError(f"accuracy request ledger already exists: {args.ledger}")
+    if args.output.resolve().parent != args.ledger.resolve().parent:
+        raise ValueError("accuracy output and request ledger must share one evidence directory")
+    if _sha256(args.plan) != args.campaign_id:
+        raise ValueError("accuracy campaign_id differs from the rendered plan SHA256")
+    try:
+        plan = json.loads(args.plan.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"rendered qualification plan is unreadable: {exc}") from exc
+    if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA:
+        raise ValueError("accuracy plan schema differs from the qualification contract")
+    if not isinstance(plan.get("provenance"), dict):
+        raise ValueError("accuracy plan provenance is required")
+    validate_provenance(plan["provenance"])
+    plan_accuracy = plan.get("accuracy")
+    if not isinstance(plan_accuracy, dict) or plan_accuracy.get("prompt_count") != PROMPT_COUNT:
+        raise ValueError("accuracy plan does not bind all sealed prompts")
+    plan_servers = plan.get("servers")
+    if (
+        not isinstance(plan_servers, dict)
+        or not isinstance(plan_servers.get(args.arm), dict)
+        or plan_servers[args.arm].get("base_url") != args.base_url.rstrip("/")
+    ):
+        raise ValueError(f"accuracy {args.arm} base URL differs from the rendered plan")
     _require_hash(args.dataset, args.dataset_sha256)
     if args.prompt_ids_sha256 != HASHES["gsm8k_prompt_ids_sha256"]:
         raise ValueError("GSM8K prompt IDs hash differs from the sealed qualification authority")
@@ -148,20 +177,42 @@ def collect_accuracy(args: argparse.Namespace) -> None:
             f"!= {model_identity!r}"
         )
 
+    ledger = args.ledger.open("x")
+    ledger_lock = threading.Lock()
+
+    def record_event(value: dict) -> None:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        with ledger_lock:
+            ledger.write(encoded)
+            ledger.flush()
+
+    record_event(
+        {
+            "schema": "gdn-gsm8k-request-ledger-v1",
+            "arm": args.arm,
+            "campaign_id": args.campaign_id,
+            "prompt_count": PROMPT_COUNT,
+        }
+    )
+
     def run(question_index: int) -> dict:
         source_row_index = GSM8K_SHOTS + question_index
         input_ids = prompt_ids[question_index]
         request_id = f"gdn-gsm8k-{args.campaign_id}-{args.arm}-{question_index:04d}"
-        result = _post(
-            args.base_url,
-            "/generate",
+        payload = {
+            "rid": request_id,
+            "input_ids": input_ids,
+            "sampling_params": ACCURACY_SAMPLING_PARAMS,
+        }
+        record_event(
             {
-                "rid": request_id,
-                "input_ids": input_ids,
-                "sampling_params": ACCURACY_SAMPLING_PARAMS,
-            },
-            args.timeout,
+                "event": "dispatch",
+                "question_index": question_index,
+                "request_id": request_id,
+                "payload_sha256": _json_sha256(payload),
+            }
         )
+        result = _post(args.base_url, "/generate", payload, args.timeout)
         if (
             not isinstance(result, dict)
             or not isinstance(result.get("text"), str)
@@ -174,6 +225,14 @@ def collect_accuracy(args: argparse.Namespace) -> None:
             raise ValueError(f"prompt {question_index} returned an invalid response")
         expected = _answer_value(rows[source_row_index]["answer"])
         observed = _answer_value(result["text"])
+        record_event(
+            {
+                "event": "response",
+                "question_index": question_index,
+                "request_id": request_id,
+                "response_sha256": _json_sha256(result),
+            }
+        )
         return {
             "question_index": question_index,
             "source_row_index": source_row_index,
@@ -186,21 +245,31 @@ def collect_accuracy(args: argparse.Namespace) -> None:
             "correct": observed is not INVALID_ANSWER and observed == expected,
         }
 
-    _flush(args.base_url, args.timeout)
-    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-        prompt_rows = list(executor.map(run, range(PROMPT_COUNT)))
+    try:
+        _flush(args.base_url, args.timeout)
+        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+            prompt_rows = list(executor.map(run, range(PROMPT_COUNT)))
+        ledger.flush()
+        os.fsync(ledger.fileno())
+    finally:
+        ledger.close()
     score = sum(row["correct"] for row in prompt_rows) / PROMPT_COUNT
     _write_json_exclusive(
         args.output,
         {
             "arm": args.arm,
             "campaign_id": args.campaign_id,
+            "plan_sha256": args.campaign_id,
             "dataset_sha256": args.dataset_sha256,
             "prompt_ids_sha256": args.prompt_ids_sha256,
             "request_payload": "input_ids",
             "sampling_params": ACCURACY_SAMPLING_PARAMS,
             "server_config": server_config,
             "model_identity": model_identity,
+            "request_ledger": {
+                "path": args.ledger.name,
+                "sha256": _sha256(args.ledger),
+            },
             "score": score,
             "prompts": prompt_rows,
         },
@@ -233,7 +302,7 @@ def _as_results(value: object, expected: int) -> list[dict]:
 
 
 def _json_sha256(value: object) -> str:
-    encoded = json.dumps(value, separators=(",", ":")).encode()
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -719,6 +788,8 @@ def build_parser() -> argparse.ArgumentParser:
     accuracy = server_parser("accuracy", collect_accuracy)
     accuracy.add_argument("--arm", choices=("baseline", "candidate"), required=True)
     accuracy.add_argument("--campaign-id", required=True, help="SHA256 of the sealed campaign plan")
+    accuracy.add_argument("--plan", type=Path, required=True)
+    accuracy.add_argument("--ledger", type=Path, required=True)
     accuracy.add_argument("--dataset", type=Path, required=True)
     accuracy.add_argument("--dataset-sha256", required=True)
     accuracy.add_argument("--prompt-ids", type=Path, required=True)

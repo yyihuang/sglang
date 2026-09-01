@@ -173,6 +173,22 @@ def main() -> int:
         text=True,
         stdout=subprocess.PIPE,
     ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=repo_root,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    qualification_status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--", "tools/gdn_public_qualification"],
+        cwd=repo_root,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    if qualification_status:
+        parser.error("qualification source must be committed and clean before rendering")
     if not isinstance(binding.get("model_path"), str) or not Path(binding["model_path"]).is_dir():
         parser.error("model_path must name the staged model directory")
     if not isinstance(binding.get("tokenizer_path"), str) or not Path(binding["tokenizer_path"]).is_dir():
@@ -220,6 +236,7 @@ def main() -> int:
     provenance.update(
         {
             "qualification_commit": head,
+            "qualification_tree": tree,
             "compute_capability": [10, 3],
             "gpu_name": binding.get("gpu_name", "NVIDIA GB300"),
             "cuda_version": binding["cuda_version"],
