@@ -38,6 +38,9 @@ from tools.gdn_public_qualification.contract import (
     MTP_SPECULATIVE_EAGLE_TOPK,
     MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
     MTP_SPECULATIVE_NUM_STEPS,
+    MODEL_INFO_MANIFEST_FILE_COUNT_KEY,
+    MODEL_INFO_MANIFEST_SHA256_KEY,
+    MODEL_MANIFEST_FILE_COUNT,
     PROMPT_COUNT,
     PLAN_SCHEMA,
     TP_SIZE,
@@ -196,17 +199,24 @@ def collect_accuracy(args: argparse.Namespace) -> None:
         raise ValueError(
             f"accuracy {args.arm} server configuration {server_config!r} != {expected_config!r}"
         )
-    model_identity = requested_model_identity
     observed_model_identity = {
         "model_path": model_info.get("model_path"),
         "tokenizer_path": model_info.get("tokenizer_path"),
-        "model_manifest_sha256": args.model_manifest_sha256,
+        "model_manifest_sha256": model_info.get(MODEL_INFO_MANIFEST_SHA256_KEY),
+        "model_manifest_file_count": model_info.get(
+            MODEL_INFO_MANIFEST_FILE_COUNT_KEY
+        ),
     }
-    if observed_model_identity != model_identity:
+    expected_observed_model_identity = {
+        **planned_model_identity,
+        "model_manifest_file_count": MODEL_MANIFEST_FILE_COUNT,
+    }
+    if observed_model_identity != expected_observed_model_identity:
         raise ValueError(
             f"accuracy {args.arm} server model identity {observed_model_identity!r} "
-            f"!= {model_identity!r}"
+            f"!= {expected_observed_model_identity!r}"
         )
+    model_identity = observed_model_identity
 
     ledger = args.ledger.open("x")
     ledger_lock = threading.Lock()
@@ -419,13 +429,24 @@ def _kl_server_identity(args: argparse.Namespace) -> dict[str, object]:
     expected = {
         "model_path": args.model_path,
         "tokenizer_path": args.tokenizer_path,
+        "model_manifest_sha256": HASHES["model_manifest_sha256"],
+        "model_manifest_file_count": MODEL_MANIFEST_FILE_COUNT,
     }
-    observed = {key: model_info.get(key) for key in expected}
+    observed = {
+        "model_path": model_info.get("model_path"),
+        "tokenizer_path": model_info.get("tokenizer_path"),
+        "model_manifest_sha256": model_info.get(MODEL_INFO_MANIFEST_SHA256_KEY),
+        "model_manifest_file_count": model_info.get(
+            MODEL_INFO_MANIFEST_FILE_COUNT_KEY
+        ),
+    }
     if observed != expected:
-        raise ValueError(f"KL server model/tokenizer identity {observed!r} != {expected!r}")
+        raise ValueError(
+            f"KL server model/tokenizer/manifest identity {observed!r} "
+            f"!= {expected!r}"
+        )
     return {
         **expected,
-        "model_manifest_sha256": args.model_manifest_sha256,
         "vocab_size": args.vocab_size,
     }
 

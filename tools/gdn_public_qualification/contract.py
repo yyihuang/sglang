@@ -89,6 +89,15 @@ ACCURACY_DECODE_PARAMS = {
 }
 ACCURACY_SERVER_AUTHORITY_SCHEMA = "gdn-gsm8k-server-request-authority-v1"
 ACCURACY_SERVER_RECEIPT_SCHEMA = "gdn-gsm8k-server-request-receipt-v1"
+MODEL_MANIFEST_FILE_COUNT = 18
+MODEL_MANIFEST_SHA256_ENV = "SGLANG_GDN_QUALIFICATION_MODEL_MANIFEST_SHA256"
+MODEL_MANIFEST_FILE_COUNT_ENV = (
+    "SGLANG_GDN_QUALIFICATION_MODEL_MANIFEST_FILE_COUNT"
+)
+MODEL_INFO_MANIFEST_SHA256_KEY = "gdn_qualification_model_manifest_sha256"
+MODEL_INFO_MANIFEST_FILE_COUNT_KEY = (
+    "gdn_qualification_model_manifest_file_count"
+)
 EXACT_T4_ROUTE = (
     "flashinfer.gdn_decode.noncp.indexed_bf16_verify_t4.tile16_fullwarp"
 )
@@ -154,8 +163,21 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
 
+def _strict_json_object(pairs: Sequence[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key is forbidden: {key}")
+        value[key] = item
+    return value
+
+
 def load_strict_json(text: str) -> object:
-    return json.loads(text, parse_constant=_reject_json_constant)
+    return json.loads(
+        text,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
 
 
 @lru_cache(maxsize=2)
@@ -289,10 +311,14 @@ def validate_provenance(provenance: Mapping[str, object]) -> None:
     )
 
 
-def qualification_checkout_identity() -> tuple[str, str]:
+def qualification_checkout_identity(repo_root: Path | None = None) -> tuple[str, str]:
     """Return the exact clean SGLang checkout that executes the auditor."""
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = (
+        Path(__file__).resolve().parents[2]
+        if repo_root is None
+        else repo_root.resolve()
+    )
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -445,6 +471,97 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def verify_model_directory_against_manifest(
+    model_path: Path,
+    tokenizer_path: Path,
+    manifest_path: Path,
+) -> dict[str, object]:
+    """Hash the exact sealed model/tokenizer directory named by the manifest."""
+
+    model_root = model_path.resolve()
+    tokenizer_root = tokenizer_path.resolve()
+    require(model_root.is_dir(), "verified model path is not a directory")
+    require(tokenizer_root.is_dir(), "verified tokenizer path is not a directory")
+    require(
+        tokenizer_root == model_root,
+        "verified model and tokenizer paths must name the same sealed directory",
+    )
+
+    resolved_manifest = manifest_path.resolve()
+    require(resolved_manifest.is_file(), "sealed model manifest is missing")
+    manifest_sha256 = _file_sha256(resolved_manifest)
+    require(
+        manifest_sha256 == HASHES["model_manifest_sha256"],
+        "sealed model manifest SHA256 differs from the campaign authority",
+    )
+    try:
+        rows = load_strict_json(resolved_manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise QualificationError(f"sealed model manifest is unreadable: {exc}") from exc
+    require(
+        isinstance(rows, list) and len(rows) == MODEL_MANIFEST_FILE_COUNT,
+        f"sealed model manifest must be a top-level {MODEL_MANIFEST_FILE_COUNT}-row list",
+    )
+
+    entries: list[tuple[str, int, str]] = []
+    names: set[str] = set()
+    for index, row in enumerate(rows):
+        require(
+            isinstance(row, Mapping)
+            and set(row) == {"path", "bytes", "sha256"},
+            f"sealed model manifest row {index} must contain exactly path, bytes, and sha256",
+        )
+        name = row["path"]
+        size = row["bytes"]
+        digest = row["sha256"]
+        require(
+            isinstance(name, str)
+            and bool(name)
+            and name not in (".", "..")
+            and "/" not in name
+            and "\\" not in name,
+            f"sealed model manifest row {index} has an unsafe path",
+        )
+        require(name not in names, f"sealed model manifest path is duplicated: {name}")
+        require(
+            type(size) is int and size >= 0,
+            f"sealed model manifest row {index} has invalid bytes",
+        )
+        require(
+            isinstance(digest, str) and _SHA256_RE.fullmatch(digest) is not None,
+            f"sealed model manifest row {index} has invalid sha256",
+        )
+        names.add(name)
+        entries.append((name, size, digest))
+
+    actual_names: set[str] = set()
+    for path in model_root.iterdir():
+        require(
+            not path.is_symlink() and path.is_file(),
+            f"sealed model directory contains a non-regular entry: {path.name}",
+        )
+        actual_names.add(path.name)
+    require(
+        actual_names == names,
+        "sealed model directory file set differs from the model manifest",
+    )
+
+    for name, size, digest in entries:
+        path = model_root / name
+        require(
+            path.stat().st_size == size,
+            f"sealed model file byte count differs: {name}",
+        )
+        require(
+            _file_sha256(path) == digest,
+            f"sealed model file SHA256 differs: {name}",
+        )
+    return {
+        "manifest_sha256": manifest_sha256,
+        "file_count": len(entries),
+    }
+
+
 def _load_gsm8k_dataset_authority(
     spec: object, evidence_root: Path | None
 ) -> list[Mapping[str, object]]:
@@ -559,6 +676,14 @@ def _load_campaign_plan(
         accuracy.get("server_duplicate_request_policy")
         == "reject_before_generation",
         "campaign plan duplicate request policy differs",
+    )
+    require(
+        accuracy.get("server_model_manifest_observation")
+        == {
+            "sha256_key": MODEL_INFO_MANIFEST_SHA256_KEY,
+            "file_count_key": MODEL_INFO_MANIFEST_FILE_COUNT_KEY,
+        },
+        "campaign plan server model manifest observation differs",
     )
     return plan
 
@@ -893,6 +1018,7 @@ def validate_accuracy(
         "model_path": bindings.get("model_path"),
         "tokenizer_path": bindings.get("tokenizer_path"),
         "model_manifest_sha256": HASHES["model_manifest_sha256"],
+        "model_manifest_file_count": MODEL_MANIFEST_FILE_COUNT,
     }
     require(
         all(

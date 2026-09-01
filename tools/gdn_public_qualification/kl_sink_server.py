@@ -14,8 +14,11 @@ from tools.gdn_public_qualification.contract import (
     KL_SAMPLE_COUNT,
     KL_TOKEN_ID_ORDER,
     KL_VOCAB_CHUNK_SIZE,
+    MODEL_MANIFEST_FILE_COUNT_ENV,
+    MODEL_MANIFEST_SHA256_ENV,
     PROMPT_COUNT,
     canonical_json_text,
+    verify_model_directory_against_manifest,
 )
 from tools.gdn_public_qualification.accuracy_server_hook import (
     AUTHORITY_ENV as ACCURACY_AUTHORITY_ENV,
@@ -91,16 +94,45 @@ def prepare_sink_root(root: Path, arm: str, vocab_size: int) -> tuple[Path, str]
     return authority_path, hashlib.sha256(payload).hexdigest()
 
 
+def _required_server_option(server_args: list[str], name: str) -> str:
+    positions = [index for index, value in enumerate(server_args) if value == name]
+    if len(positions) != 1:
+        raise ValueError(f"SGLang server arguments must contain exactly one {name}")
+    position = positions[0]
+    if position + 1 >= len(server_args) or server_args[position + 1].startswith("--"):
+        raise ValueError(f"SGLang server argument {name} has no value")
+    return server_args[position + 1]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sink-root", type=Path, required=True)
     parser.add_argument("--sink-arm", choices=("baseline", "candidate"), required=True)
     parser.add_argument("--sink-vocab-size", type=int, required=True)
+    parser.add_argument("--model-manifest", type=Path, required=True)
+    parser.add_argument("--verified-model-path", type=Path, required=True)
+    parser.add_argument("--verified-tokenizer-path", type=Path, required=True)
     parser.add_argument("sglang_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     server_args = args.sglang_args[1:] if args.sglang_args[:1] == ["--"] else args.sglang_args
     if not server_args:
         parser.error("SGLang server arguments are required after --")
+    if _required_server_option(server_args, "--model-path") != str(
+        args.verified_model_path
+    ):
+        parser.error("SGLang --model-path differs from the verified model path")
+    if _required_server_option(server_args, "--tokenizer-path") != str(
+        args.verified_tokenizer_path
+    ):
+        parser.error("SGLang --tokenizer-path differs from the verified tokenizer path")
+    try:
+        model_observation = verify_model_directory_against_manifest(
+            args.verified_model_path,
+            args.verified_tokenizer_path,
+            args.model_manifest,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     authority_path, authority_sha256 = prepare_sink_root(
         args.sink_root, args.sink_arm, args.sink_vocab_size
     )
@@ -111,6 +143,10 @@ def main() -> int:
     os.environ[AUTHORITY_SHA256_ENV] = authority_sha256
     os.environ[ACCURACY_AUTHORITY_ENV] = str(accuracy_authority_path)
     os.environ[ACCURACY_AUTHORITY_SHA256_ENV] = accuracy_authority_sha256
+    os.environ[MODEL_MANIFEST_SHA256_ENV] = model_observation["manifest_sha256"]
+    os.environ[MODEL_MANIFEST_FILE_COUNT_ENV] = str(
+        model_observation["file_count"]
+    )
     sys.argv = ["sglang.launch_server", *server_args]
     runpy.run_module("sglang.launch_server", run_name="__main__")
     return 0

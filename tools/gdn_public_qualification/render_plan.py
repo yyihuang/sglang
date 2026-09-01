@@ -36,6 +36,8 @@ from tools.gdn_public_qualification.contract import (
     MTP_SPECULATIVE_EAGLE_TOPK,
     MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
     MTP_SPECULATIVE_NUM_STEPS,
+    MODEL_INFO_MANIFEST_FILE_COUNT_KEY,
+    MODEL_INFO_MANIFEST_SHA256_KEY,
     OBSERVATIONS_PER_ARM_PER_WORKLOAD,
     PLAN_SCHEMA,
     PROMPT_COUNT,
@@ -118,6 +120,11 @@ def _server_command(binding: dict, arm: str) -> list[str]:
     backend = "triton" if arm == "baseline" else "flashinfer"
     hosts = _server_hosts(binding)
     sink_roots = _kl_sink_roots(binding)
+    artifacts = binding.get("artifacts")
+    if not isinstance(artifacts, dict) or not isinstance(
+        artifacts.get("model_manifest"), str
+    ):
+        raise ValueError("model manifest artifact is required for the server command")
     return [
         binding.get("python_executable", "python3"),
         "-m",
@@ -128,6 +135,12 @@ def _server_command(binding: dict, arm: str) -> list[str]:
         arm,
         "--sink-vocab-size",
         str(binding["vocab_size"]),
+        "--model-manifest",
+        artifacts["model_manifest"],
+        "--verified-model-path",
+        binding["model_path"],
+        "--verified-tokenizer-path",
+        binding["tokenizer_path"],
         "--",
         "--model-path",
         binding["model_path"],
@@ -290,6 +303,10 @@ def main() -> int:
             "server_request_receipt_schema": ACCURACY_SERVER_RECEIPT_SCHEMA,
             "server_request_hook": "tools.gdn_public_qualification.accuracy_server_hook",
             "server_duplicate_request_policy": "reject_before_generation",
+            "server_model_manifest_observation": {
+                "sha256_key": MODEL_INFO_MANIFEST_SHA256_KEY,
+                "file_count_key": MODEL_INFO_MANIFEST_FILE_COUNT_KEY,
+            },
         },
         "kl": {
             "input_ids": artifacts["longbench_first48_ids"],

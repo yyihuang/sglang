@@ -764,6 +764,32 @@ async def model_info():
         "architectures": getattr(model_config.hf_config, "architectures", None),
         # "hf_config": model_config.hf_config.to_dict(),
     }
+    qualification_manifest_sha256 = os.environ.get(
+        "SGLANG_GDN_QUALIFICATION_MODEL_MANIFEST_SHA256"
+    )
+    qualification_manifest_file_count = os.environ.get(
+        "SGLANG_GDN_QUALIFICATION_MODEL_MANIFEST_FILE_COUNT"
+    )
+    if qualification_manifest_sha256 or qualification_manifest_file_count:
+        if (
+            qualification_manifest_sha256 is None
+            or len(qualification_manifest_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in qualification_manifest_sha256
+            )
+            or qualification_manifest_file_count is None
+            or not qualification_manifest_file_count.isdigit()
+        ):
+            raise RuntimeError(
+                "qualification model manifest observation is incomplete or invalid"
+            )
+        result["gdn_qualification_model_manifest_sha256"] = (
+            qualification_manifest_sha256
+        )
+        result["gdn_qualification_model_manifest_file_count"] = int(
+            qualification_manifest_file_count
+        )
     embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
     if embedding_model_spec is not None:
         result["embedding"] = resolved_embedding_plan(

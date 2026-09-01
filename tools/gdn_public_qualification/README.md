@@ -48,6 +48,11 @@ from the contract, hashes the actual rendered plan to derive the campaign ID,
 verifies the exact plan-bound per-arm TP4 backend and model/tokenizer identity,
 assigns a campaign-scoped unique ordered request ID, and writes a fresh
 append-only client diagnostic ledger around the one POST for each prompt. The
+server launch adapter independently hashes every file named by the sealed
+model manifest under the exact model/tokenizer directory passed to SGLang.
+`/model_info` exposes that server-observed manifest digest and file count; the
+collector and auditor bind those observed values to the rendered plan rather
+than copying a caller assertion into the receipt. The
 default-off qualification hook at the SGLang `/generate` ingress separately
 uses exclusive server-side files to reject a second use of any campaign request
 ID before generation. It seals a source-owned server receipt only after exactly
@@ -215,8 +220,9 @@ SGLang checkout is the exact qualification commit/tree recorded in the plan
 and receipt, and refuses missing, reused, truncated, re-ordered, or hash-drifted
 evidence.
 
-All qualification JSON and JSONL evidence rejects non-finite numbers and uses
-the source-owned canonical JSON spelling for content hashes.
+All qualification JSON and JSONL evidence rejects non-finite numbers and
+duplicate object keys at every nesting level, and uses the source-owned
+canonical JSON spelling for content hashes.
 
 Keep `bindings.json`, `plan.json`, raw model outputs, rank logs, results, and the
 audit receipt in the durable campaign evidence directory. Record their SHA256

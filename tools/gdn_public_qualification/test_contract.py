@@ -6,9 +6,12 @@ import json
 import math
 import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,6 +20,7 @@ from tools.gdn_public_qualification.accuracy_server_hook import (
     AUTHORITY_ENV as ACCURACY_AUTHORITY_ENV,
     AUTHORITY_SHA256_ENV as ACCURACY_AUTHORITY_SHA256_ENV,
     begin_request as begin_accuracy_server_request,
+    finish_request as finish_accuracy_server_request,
     load_authority as load_accuracy_server_authority,
 )
 from tools.gdn_public_qualification.contract import (
@@ -42,16 +46,22 @@ from tools.gdn_public_qualification.contract import (
     MTP_SPECULATIVE_EAGLE_TOPK,
     MTP_SPECULATIVE_NUM_DRAFT_TOKENS,
     MTP_SPECULATIVE_NUM_STEPS,
+    MODEL_INFO_MANIFEST_FILE_COUNT_KEY,
+    MODEL_INFO_MANIFEST_SHA256_KEY,
+    MODEL_MANIFEST_FILE_COUNT,
     PROMPT_COUNT,
     PLAN_SCHEMA,
     SCHEMA,
     WORKLOADS,
     QualificationError,
     audit_receipt,
+    canonical_json_sha256,
     canonical_json_text,
     expected_provenance,
     expected_server_config,
     load_strict_json,
+    qualification_checkout_identity,
+    verify_model_directory_against_manifest,
 )
 from tools.gdn_public_qualification.render_plan import (
     _server_command,
@@ -205,6 +215,7 @@ def _accuracy_arm(arm: str, correct_count: int) -> dict:
             "model_path": "/sealed/model",
             "tokenizer_path": "/sealed/model",
             "model_manifest_sha256": HASHES["model_manifest_sha256"],
+            "model_manifest_file_count": MODEL_MANIFEST_FILE_COUNT,
         },
         "request_ledger": {
             "path": ledger_path.name,
@@ -531,6 +542,10 @@ class QualificationContractTest(unittest.TestCase):
                 "server_request_receipt_schema": ACCURACY_SERVER_RECEIPT_SCHEMA,
                 "server_request_hook": "tools.gdn_public_qualification.accuracy_server_hook",
                 "server_duplicate_request_policy": "reject_before_generation",
+                "server_model_manifest_observation": {
+                    "sha256_key": MODEL_INFO_MANIFEST_SHA256_KEY,
+                    "file_count_key": MODEL_INFO_MANIFEST_FILE_COUNT_KEY,
+                },
             },
         }
         plan_path = TEST_EVIDENCE_ROOT / "plan.json"
@@ -625,6 +640,49 @@ class QualificationContractTest(unittest.TestCase):
                     "qualification commit differs from the auditor checkout",
                 ):
                     self._audit(receipt)
+
+    def test_02b_checkout_identity_uses_real_clean_git_objects(self):
+        checkout = self.evidence_root / "exact-checkout"
+        checkout.mkdir()
+        (checkout / "tracked.txt").write_text("sealed\n")
+        subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+        subprocess.run(["git", "add", "tracked.txt"], cwd=checkout, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Qualification Test",
+                "-c",
+                "user.email=qualification@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "sealed checkout",
+            ],
+            cwd=checkout,
+            check=True,
+        )
+        expected_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=checkout,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        expected_tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=checkout,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        self.assertEqual(
+            qualification_checkout_identity(checkout),
+            (expected_commit, expected_tree),
+        )
+        (checkout / "untracked.txt").write_text("dirty\n")
+        with self.assertRaisesRegex(QualificationError, "completely clean"):
+            qualification_checkout_identity(checkout)
 
     def test_03_prompt_exactly_once_gate(self):
         receipt = _receipt(self.kl_specs, self.kl_value)
@@ -741,6 +799,8 @@ class QualificationContractTest(unittest.TestCase):
             canonical_json_text({"value": float("nan")})
         with self.assertRaises(ValueError):
             load_strict_json('{"value":NaN}')
+        with self.assertRaisesRegex(ValueError, "duplicate JSON object key"):
+            load_strict_json('{"outer":{"value":1,"value":2}}')
 
     def test_03c_rendered_plan_output_is_immutable(self):
         path = self.evidence_root / "immutable-plan.json"
@@ -836,6 +896,7 @@ class QualificationContractTest(unittest.TestCase):
                 "baseline": "/sink/baseline",
                 "candidate": "/sink/candidate",
             },
+            "artifacts": {"model_manifest": "/sealed/model-files.json"},
         }
         self.assertEqual(
             _server_hosts(binding),
@@ -860,6 +921,17 @@ class QualificationContractTest(unittest.TestCase):
             )
             self.assertEqual(
                 command[command.index("--speculative-num-draft-tokens") + 1], "4"
+            )
+            self.assertEqual(
+                command[command.index("--model-manifest") + 1],
+                "/sealed/model-files.json",
+            )
+            self.assertEqual(
+                command[command.index("--verified-model-path") + 1], "/model"
+            )
+            self.assertEqual(
+                command[command.index("--verified-tokenizer-path") + 1],
+                "/model",
             )
             self.assertIn("tools.gdn_public_qualification.kl_sink_server", command)
 
@@ -965,7 +1037,87 @@ class QualificationContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already exists"):
             prepare_sink_root(root, "baseline", 151936)
 
-    def test_18b_server_hook_rejects_duplicate_campaign_request_id(self):
+    def test_18a_server_hashes_exact_list_shaped_model_manifest(self):
+        model_root = self.evidence_root / "sealed-model"
+        model_root.mkdir()
+        rows = []
+        for index in range(MODEL_MANIFEST_FILE_COUNT):
+            name = f"model-file-{index:02d}.bin"
+            payload = f"sealed payload {index}\n".encode()
+            (model_root / name).write_bytes(payload)
+            rows.append(
+                {
+                    "path": name,
+                    "bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+        manifest = self.evidence_root / "model-files.json"
+        manifest.write_text(json.dumps(rows, sort_keys=True) + "\n")
+        manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        with patch.dict(
+            HASHES, {"model_manifest_sha256": manifest_sha256}, clear=False
+        ):
+            self.assertEqual(
+                verify_model_directory_against_manifest(
+                    model_root, model_root, manifest
+                ),
+                {
+                    "manifest_sha256": manifest_sha256,
+                    "file_count": MODEL_MANIFEST_FILE_COUNT,
+                },
+            )
+            (model_root / rows[0]["path"]).write_bytes(b"tampered\n")
+            with self.assertRaisesRegex(QualificationError, "byte count differs"):
+                verify_model_directory_against_manifest(
+                    model_root, model_root, manifest
+                )
+
+    def test_18aa_server_rejects_unsealed_model_manifest_shapes(self):
+        model_root = self.evidence_root / "manifest-shape-model"
+        model_root.mkdir()
+        rows = []
+        for index in range(MODEL_MANIFEST_FILE_COUNT):
+            name = f"file-{index:02d}"
+            payload = bytes([index])
+            (model_root / name).write_bytes(payload)
+            rows.append(
+                {
+                    "path": name,
+                    "bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+        manifest = self.evidence_root / "invalid-model-files.json"
+        manifest.write_text(json.dumps({"files": rows}, sort_keys=True) + "\n")
+        with patch.dict(
+            HASHES,
+            {"model_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(QualificationError, "top-level 18-row list"):
+                verify_model_directory_against_manifest(
+                    model_root, model_root, manifest
+                )
+
+        manifest.write_text(json.dumps(rows, sort_keys=True) + "\n")
+        extra = model_root / "not-in-manifest"
+        extra.write_text("extra\n")
+        with patch.dict(
+            HASHES,
+            {"model_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(QualificationError, "file set differs"):
+                verify_model_directory_against_manifest(
+                    model_root, model_root, manifest
+                )
+            with self.assertRaisesRegex(QualificationError, "same sealed directory"):
+                verify_model_directory_against_manifest(
+                    model_root, self.evidence_root, manifest
+                )
+
+    def test_18b_server_hook_atomically_rejects_concurrent_duplicate(self):
         root = self.evidence_root / "server-exact-once"
         prepare_sink_root(root, "candidate", 151936)
         authority_path, authority_sha = prepare_accuracy_request_root(root, "candidate")
@@ -982,10 +1134,68 @@ class QualificationContractTest(unittest.TestCase):
             },
             clear=False,
         ):
-            begin_accuracy_server_request(request)
-            with self.assertRaisesRegex(ValueError, "duplicate qualification"):
-                begin_accuracy_server_request(request)
+            barrier = Barrier(2)
+
+            def admit():
+                barrier.wait()
+                try:
+                    return begin_accuracy_server_request(request)
+                except ValueError as exc:
+                    return exc
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(lambda _: admit(), range(2)))
+            self.assertEqual(sum(isinstance(value, dict) for value in outcomes), 1)
+            failures = [value for value in outcomes if isinstance(value, ValueError)]
+            self.assertEqual(len(failures), 1)
+            self.assertIn("duplicate qualification", str(failures[0]))
         load_accuracy_server_authority.cache_clear()
+
+    def test_18c_server_hook_publishes_complete_response_bound_receipt(self):
+        root = self.evidence_root / "server-complete-receipt"
+        prepare_sink_root(root, "baseline", 151936)
+        authority_path, authority_sha = prepare_accuracy_request_root(root, "baseline")
+        campaign_id = "e" * 64
+        responses = []
+        load_accuracy_server_authority.cache_clear()
+        with patch.dict(
+            "os.environ",
+            {
+                ACCURACY_AUTHORITY_ENV: str(authority_path),
+                ACCURACY_AUTHORITY_SHA256_ENV: authority_sha,
+            },
+            clear=False,
+        ):
+            for index in range(PROMPT_COUNT):
+                request_id = (
+                    f"gdn-gsm8k-{campaign_id}-baseline-{index:04d}"
+                )
+                token = begin_accuracy_server_request(
+                    SimpleNamespace(rid=request_id, stream=False)
+                )
+                response = {
+                    "text": f"answer {index}",
+                    "output_ids": [index],
+                    "meta_info": {"id": request_id},
+                }
+                responses.append(response)
+                finish_accuracy_server_request(token, response)
+        load_accuracy_server_authority.cache_clear()
+        receipt = load_strict_json(
+            (root / "accuracy_requests" / "receipt.json").read_text()
+        )
+        self.assertEqual(receipt["authority_sha256"], authority_sha)
+        self.assertEqual(receipt["campaign_id"], campaign_id)
+        self.assertEqual(len(receipt["records"]), PROMPT_COUNT)
+        for index, (record, response) in enumerate(
+            zip(receipt["records"], responses)
+        ):
+            self.assertEqual(record["question_index"], index)
+            self.assertEqual(record["accepted_count"], 1)
+            self.assertEqual(record["completed_count"], 1)
+            self.assertEqual(
+                record["response_sha256"], canonical_json_sha256(response)
+            )
 
     def test_19_accuracy_collector_rejects_caller_selected_dataset(self):
         with self.assertRaisesRegex(ValueError, "dataset hash differs"):
