@@ -14,6 +14,7 @@ import random
 import re
 import struct
 from collections.abc import Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 SCHEMA = "gdn-public-qualification-result-v2"
@@ -106,6 +107,7 @@ BOOTSTRAP_SEED = 2026083001
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_GSM8K_NUMBER_RE = re.compile(r"-?\d+(?:\.\d*)?")
 _ROUTE_RE = {
     "prefill": re.compile(
         r"^flashinfer\.gdn_prefill\.noncp\.[a-z0-9_.-]+$"
@@ -189,17 +191,40 @@ def validate_provenance(provenance: Mapping[str, object]) -> None:
     )
 
 
-def _validate_prompt_rows(rows: object, arm: str, prompt_ids: Sequence[Sequence[int]]) -> float:
+def _gsm8k_answer_value(text: str) -> Decimal | None:
+    numbers = _GSM8K_NUMBER_RE.findall(text.replace(",", ""))
+    if not numbers:
+        return None
+    try:
+        value = Decimal(numbers[-1])
+    except InvalidOperation:
+        return None
+    return value if value.is_finite() else None
+
+
+def _validate_prompt_rows(
+    rows: object,
+    arm: str,
+    prompt_ids: Sequence[Sequence[int]],
+    dataset_rows: Sequence[Mapping[str, object]],
+) -> float:
     require(isinstance(rows, list), f"{arm} prompts must be a list")
     require(len(rows) == PROMPT_COUNT, f"{arm} must contain exactly 1314 prompts")
     question_indices = []
     source_indices = []
+    request_ids = []
     scores = []
     for position, row in enumerate(rows):
         require(isinstance(row, Mapping), f"{arm} prompt {position} must be an object")
         question_indices.append(row.get("question_index"))
         source_indices.append(row.get("source_row_index"))
         require(row.get("request_count") == 1, f"{arm} prompt {position} was not requested exactly once")
+        request_id = f"gdn-gsm8k-{arm}-{position:04d}"
+        request_ids.append(row.get("request_id"))
+        require(
+            row.get("request_id") == request_id,
+            f"{arm} prompt {position} request ID differs",
+        )
         require(
             row.get("input_ids_sha256") == _json_sha256(prompt_ids[position]),
             f"{arm} prompt {position} input IDs differ from the sealed prompt",
@@ -208,10 +233,42 @@ def _validate_prompt_rows(rows: object, arm: str, prompt_ids: Sequence[Sequence[
             row.get("input_token_count") == len(prompt_ids[position]),
             f"{arm} prompt {position} input token count differs from the sealed prompt",
         )
-        require(row.get("correct") in (True, False), f"{arm} prompt {position} has invalid correctness")
-        scores.append(float(row["correct"]))
+        response = row.get("response")
+        require(
+            isinstance(response, Mapping) and isinstance(response.get("text"), str),
+            f"{arm} prompt {position} raw response is invalid",
+        )
+        output_ids = response.get("output_ids")
+        require(
+            isinstance(output_ids, list)
+            and bool(output_ids)
+            and all(type(token) is int and token >= 0 for token in output_ids),
+            f"{arm} prompt {position} output IDs are invalid",
+        )
+        require(
+            row.get("output_ids_sha256") == _json_sha256(output_ids),
+            f"{arm} prompt {position} output ID hash differs",
+        )
+        meta_info = response.get("meta_info")
+        require(
+            isinstance(meta_info, Mapping) and meta_info.get("id") == request_id,
+            f"{arm} prompt {position} response request ID differs",
+        )
+        expected = _gsm8k_answer_value(dataset_rows[GSM8K_SHOTS + position]["answer"])
+        observed = _gsm8k_answer_value(response["text"])
+        recomputed = observed is not None and expected is not None and observed == expected
+        require(type(row.get("correct")) is bool, f"{arm} prompt {position} has invalid correctness")
+        require(
+            row["correct"] is recomputed,
+            f"{arm} prompt {position} reported correctness differs from the raw response",
+        )
+        scores.append(float(recomputed))
     require(question_indices == list(range(PROMPT_COUNT)), f"{arm} question indices must be exactly 0..1313 in order")
     require(source_indices == list(range(GSM8K_SHOTS, GSM8K_SHOTS + PROMPT_COUNT)), f"{arm} source rows must be exactly 5..1318 in order")
+    require(
+        request_ids == [f"gdn-gsm8k-{arm}-{index:04d}" for index in range(PROMPT_COUNT)],
+        f"{arm} request IDs must be unique and ordered",
+    )
     require(len(set(question_indices)) == PROMPT_COUNT, f"{arm} question indices are duplicated")
     require(len(set(source_indices)) == PROMPT_COUNT, f"{arm} source rows are duplicated")
     return sum(scores) / PROMPT_COUNT
@@ -234,6 +291,35 @@ def _file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _load_gsm8k_dataset_authority(
+    spec: object, evidence_root: Path | None
+) -> list[Mapping[str, object]]:
+    require(evidence_root is not None, "an evidence root is required for the sealed GSM8K dataset")
+    require(isinstance(spec, Mapping), "accuracy.dataset must be an object")
+    expected_sha = HASHES["gsm8k_dataset_sha256"]
+    require(spec.get("sha256") == expected_sha, "GSM8K dataset spec differs from the sealed authority")
+    path = _resolve_evidence_path(evidence_root, spec.get("path"), "GSM8K dataset")
+    require(_file_sha256(path) == expected_sha, "GSM8K dataset file hash differs from the sealed authority")
+    try:
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QualificationError(f"GSM8K dataset is unreadable: {exc}") from exc
+    require(
+        len(rows) == GSM8K_SHOTS + PROMPT_COUNT,
+        "GSM8K dataset must contain exactly 1319 rows",
+    )
+    require(
+        all(
+            isinstance(row, Mapping)
+            and isinstance(row.get("question"), str)
+            and isinstance(row.get("answer"), str)
+            for row in rows
+        ),
+        "every GSM8K dataset row must contain string question and answer fields",
+    )
+    return rows
 
 
 def _load_prompt_ids_authority(spec: object, evidence_root: Path | None) -> list[list[int]]:
@@ -434,6 +520,7 @@ def _recompute_kl(kl: Mapping[str, object], evidence_root: Path | None) -> tuple
 
 
 def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None = None) -> dict[str, object]:
+    dataset_rows = _load_gsm8k_dataset_authority(accuracy.get("dataset"), evidence_root)
     prompt_ids = _load_prompt_ids_authority(accuracy.get("prompt_ids"), evidence_root)
     arms = accuracy.get("arms")
     require(isinstance(arms, Mapping) and set(arms) == {"baseline", "candidate"}, "accuracy arms must be exactly baseline and candidate")
@@ -441,12 +528,19 @@ def validate_accuracy(accuracy: Mapping[str, object], evidence_root: Path | None
     for arm in ("baseline", "candidate"):
         arm_result = arms[arm]
         require(isinstance(arm_result, Mapping), f"accuracy {arm} must be an object")
+        require(arm_result.get("arm") == arm, f"accuracy {arm} arm identity differs")
+        require(
+            arm_result.get("dataset_sha256") == HASHES["gsm8k_dataset_sha256"],
+            f"{arm} GSM8K dataset authority differs",
+        )
         require(
             arm_result.get("prompt_ids_sha256") == HASHES["gsm8k_prompt_ids_sha256"],
             f"{arm} prompt IDs authority differs",
         )
         require(arm_result.get("request_payload") == "input_ids", f"{arm} did not send sealed token IDs")
-        score = _validate_prompt_rows(arm_result.get("prompts"), arm, prompt_ids)
+        score = _validate_prompt_rows(
+            arm_result.get("prompts"), arm, prompt_ids, dataset_rows
+        )
         reported = arm_result.get("score")
         require(isinstance(reported, (int, float)) and math.isclose(float(reported), score, rel_tol=0, abs_tol=1e-15), f"{arm} reported score does not match raw prompts")
         require(score >= MIN_SCORE, f"{arm} score {score:.9f} is below 0.93")

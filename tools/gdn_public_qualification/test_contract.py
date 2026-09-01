@@ -8,8 +8,9 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-from tools.gdn_public_qualification.collect import ROUTE_RE
+from tools.gdn_public_qualification.collect import ROUTE_RE, collect_accuracy
 from tools.gdn_public_qualification.contract import (
     ABBA_ORDER,
     BOOTSTRAP_SAMPLES,
@@ -41,28 +42,39 @@ from tools.gdn_public_qualification.kl_sink_hook import marker_for_sample
 from tools.gdn_public_qualification.kl_sink_server import prepare_sink_root
 
 
-def _prompt_rows(correct_count: int) -> list[dict]:
+def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
     return [
         {
             "question_index": index,
             "source_row_index": index + 5,
             "request_count": 1,
+            "request_id": f"gdn-gsm8k-{arm}-{index:04d}",
             "input_ids_sha256": hashlib.sha256(
                 json.dumps([index + 1], separators=(",", ":")).encode()
             ).hexdigest(),
             "input_token_count": 1,
+            "output_ids_sha256": hashlib.sha256(
+                json.dumps([index + 10], separators=(",", ":")).encode()
+            ).hexdigest(),
+            "response": {
+                "text": f"answer {index if index < correct_count else index + 1}",
+                "output_ids": [index + 10],
+                "meta_info": {"id": f"gdn-gsm8k-{arm}-{index:04d}"},
+            },
             "correct": index < correct_count,
         }
         for index in range(PROMPT_COUNT)
     ]
 
 
-def _accuracy_arm(correct_count: int) -> dict:
+def _accuracy_arm(arm: str, correct_count: int) -> dict:
     return {
+        "arm": arm,
+        "dataset_sha256": HASHES["gsm8k_dataset_sha256"],
         "prompt_ids_sha256": HASHES["gsm8k_prompt_ids_sha256"],
         "request_payload": "input_ids",
         "score": correct_count / PROMPT_COUNT,
-        "prompts": _prompt_rows(correct_count),
+        "prompts": _prompt_rows(arm, correct_count),
     }
 
 
@@ -221,13 +233,17 @@ def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict
             "measured_runtime_seconds": 3200.0,
         },
         "accuracy": {
+            "dataset": {
+                "path": "gsm8k.jsonl",
+                "sha256": HASHES["gsm8k_dataset_sha256"],
+            },
             "prompt_ids": {
                 "path": "gsm8k-prompt-token-ids.json",
                 "sha256": HASHES["gsm8k_prompt_ids_sha256"],
             },
             "arms": {
-                "baseline": _accuracy_arm(1223),
-                "candidate": _accuracy_arm(1223),
+                "baseline": _accuracy_arm("baseline", 1223),
+                "candidate": _accuracy_arm("candidate", 1223),
             },
             "kl": {
                 "metric": KL_METRIC,
@@ -307,7 +323,25 @@ class QualificationContractTest(unittest.TestCase):
         self.temp_directory = tempfile.TemporaryDirectory()
         self.evidence_root = Path(self.temp_directory.name)
         self.kl_specs, self.kl_value = _write_kl_evidence(self.evidence_root / "default")
+        self.original_dataset_sha256 = HASHES["gsm8k_dataset_sha256"]
         self.original_prompt_ids_sha256 = HASHES["gsm8k_prompt_ids_sha256"]
+        dataset_path = self.evidence_root / "default" / "gsm8k.jsonl"
+        dataset_path.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "question": f"question {source_index}",
+                        "answer": f"#### {max(0, source_index - 5)}",
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+                for source_index in range(5 + PROMPT_COUNT)
+            )
+        )
+        HASHES["gsm8k_dataset_sha256"] = hashlib.sha256(
+            dataset_path.read_bytes()
+        ).hexdigest()
         prompt_ids = [[index + 1] for index in range(PROMPT_COUNT)]
         HASHES["gsm8k_prompt_ids_sha256"] = _write_json(
             self.evidence_root / "default" / "gsm8k-prompt-token-ids.json",
@@ -315,6 +349,7 @@ class QualificationContractTest(unittest.TestCase):
         )
 
     def tearDown(self):
+        HASHES["gsm8k_dataset_sha256"] = self.original_dataset_sha256
         HASHES["gsm8k_prompt_ids_sha256"] = self.original_prompt_ids_sha256
         self.temp_directory.cleanup()
 
@@ -361,11 +396,40 @@ class QualificationContractTest(unittest.TestCase):
             receipt["accuracy"]["arms"]["candidate"]["request_payload"] = "text"
             with self.assertRaisesRegex(QualificationError, "did not send sealed token IDs"):
                 self._audit(receipt)
+        with self.subTest("dataset authority"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["dataset_sha256"] = "0" * 64
+            with self.assertRaisesRegex(QualificationError, "dataset authority differs"):
+                self._audit(receipt)
+        with self.subTest("arm identity"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["arm"] = "baseline"
+            with self.assertRaisesRegex(QualificationError, "arm identity differs"):
+                self._audit(receipt)
+        with self.subTest("request identity"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["prompts"][37][
+                "request_id"
+            ] = "gdn-gsm8k-candidate-0036"
+            with self.assertRaisesRegex(QualificationError, "request ID differs"):
+                self._audit(receipt)
+        with self.subTest("raw-response rescoring"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["prompts"][37]["response"][
+                "text"
+            ] = "answer 999999"
+            with self.assertRaisesRegex(QualificationError, "reported correctness differs"):
+                self._audit(receipt)
+        with self.subTest("strict boolean"):
+            receipt = _receipt(self.kl_specs, self.kl_value)
+            receipt["accuracy"]["arms"]["candidate"]["prompts"][37]["correct"] = 1
+            with self.assertRaisesRegex(QualificationError, "invalid correctness"):
+                self._audit(receipt)
 
     def test_04_score_no_drop_and_kl_gates(self):
         with self.subTest("candidate score drop"):
             receipt = _receipt(self.kl_specs, self.kl_value)
-            receipt["accuracy"]["arms"]["baseline"] = _accuracy_arm(1224)
+            receipt["accuracy"]["arms"]["baseline"] = _accuracy_arm("baseline", 1224)
             with self.assertRaisesRegex(QualificationError, "accuracy dropped"):
                 self._audit(receipt)
         with self.subTest("KL threshold"):
@@ -578,6 +642,10 @@ class QualificationContractTest(unittest.TestCase):
         self.assertTrue(all(type(value) is int for value in marker))
         with self.assertRaisesRegex(ValueError, "already exists"):
             prepare_sink_root(root, "baseline", 151936)
+
+    def test_19_accuracy_collector_rejects_caller_selected_dataset(self):
+        with self.assertRaisesRegex(ValueError, "dataset hash differs"):
+            collect_accuracy(SimpleNamespace(dataset_sha256="0" * 64))
 
 
 if __name__ == "__main__":

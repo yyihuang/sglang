@@ -98,6 +98,8 @@ def _answer_value(text: str) -> object:
 
 
 def collect_accuracy(args: argparse.Namespace) -> None:
+    if args.dataset_sha256 != HASHES["gsm8k_dataset_sha256"]:
+        raise ValueError("GSM8K dataset hash differs from the sealed qualification authority")
     _require_hash(args.dataset, args.dataset_sha256)
     if args.prompt_ids_sha256 != HASHES["gsm8k_prompt_ids_sha256"]:
         raise ValueError("GSM8K prompt IDs hash differs from the sealed qualification authority")
@@ -110,10 +112,12 @@ def collect_accuracy(args: argparse.Namespace) -> None:
     def run(question_index: int) -> dict:
         source_row_index = GSM8K_SHOTS + question_index
         input_ids = prompt_ids[question_index]
+        request_id = f"gdn-gsm8k-{args.arm}-{question_index:04d}"
         result = _post(
             args.base_url,
             "/generate",
             {
+                "rid": request_id,
                 "input_ids": input_ids,
                 "sampling_params": {
                     "temperature": 0.0,
@@ -122,7 +126,15 @@ def collect_accuracy(args: argparse.Namespace) -> None:
             },
             args.timeout,
         )
-        if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+        if (
+            not isinstance(result, dict)
+            or not isinstance(result.get("text"), str)
+            or not isinstance(result.get("output_ids"), list)
+            or not result["output_ids"]
+            or not all(type(token) is int for token in result["output_ids"])
+            or not isinstance(result.get("meta_info"), dict)
+            or result["meta_info"].get("id") != request_id
+        ):
             raise ValueError(f"prompt {question_index} returned an invalid response")
         expected = _answer_value(rows[source_row_index]["answer"])
         observed = _answer_value(result["text"])
@@ -130,8 +142,11 @@ def collect_accuracy(args: argparse.Namespace) -> None:
             "question_index": question_index,
             "source_row_index": source_row_index,
             "request_count": 1,
+            "request_id": request_id,
             "input_ids_sha256": _json_sha256(input_ids),
             "input_token_count": len(input_ids),
+            "output_ids_sha256": _json_sha256(result["output_ids"]),
+            "response": result,
             "correct": observed is not INVALID_ANSWER and observed == expected,
         }
 
@@ -143,6 +158,7 @@ def collect_accuracy(args: argparse.Namespace) -> None:
         args.output,
         {
             "arm": args.arm,
+            "dataset_sha256": args.dataset_sha256,
             "prompt_ids_sha256": args.prompt_ids_sha256,
             "request_payload": "input_ids",
             "score": score,

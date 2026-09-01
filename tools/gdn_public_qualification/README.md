@@ -42,8 +42,12 @@ route markers, this proves that the campaign exercised the real MTP/target-
 verify server configuration rather than merely declaring it in a plan.
 
 For each arm, `collect.py accuracy` sends all 1,314 sealed GSM8K token-ID rows
-once. Each raw prompt result records the token-row hash and length; the auditor
-hashes the prompt-token artifact itself and independently matches every row.
+once. It refuses caller-supplied dataset or token-artifact hashes that differ
+from the contract, assigns a unique ordered request ID, preserves each raw
+SGLang response and output-token IDs, and records the token-row hash and length.
+The auditor hashes both sealed artifacts, matches every token row, checks arm
+and echoed request identities, and independently re-scores every raw response
+against the sealed answer labels instead of trusting the collector's booleans.
 The KL
 reference command separately generates 512 fixed output token IDs for each of
 the 48 sealed helper prompts. It then teacher-forces those sequences on the
