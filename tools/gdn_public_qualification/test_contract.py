@@ -51,7 +51,11 @@ from tools.gdn_public_qualification.contract import (
     MODEL_MANIFEST_FILE_COUNT,
     PROMPT_COUNT,
     PLAN_SCHEMA,
+    ROUTE_ARTIFACT_SCHEMA,
     SCHEMA,
+    SGLANG_ROUTE_CONTRACT_ROWS,
+    SOURCE_COMMIT,
+    SOURCE_TREE,
     WORKLOADS,
     QualificationError,
     audit_receipt,
@@ -64,6 +68,7 @@ from tools.gdn_public_qualification.contract import (
     verify_model_directory_against_manifest,
 )
 from tools.gdn_public_qualification.render_plan import (
+    _route_artifact as _render_route_artifact,
     _server_command,
     _server_hosts,
     _write_plan_exclusive,
@@ -78,6 +83,47 @@ from tools.gdn_public_qualification.kl_sink_server import (
 TEST_CAMPAIGN_ID = ""
 TEST_EVIDENCE_ROOT: Path | None = None
 TEST_PLAN_SPEC: dict[str, str] | None = None
+TEST_ROUTE_SPEC: dict[str, str] | None = None
+
+
+def _route_artifact(expected_routes: dict[str, list[str]]) -> dict:
+    return {
+        "schema": ROUTE_ARTIFACT_SCHEMA,
+        "status": "PASS",
+        "cake": {"commit": SOURCE_COMMIT, "tree": SOURCE_TREE},
+        "flashinfer": {
+            "commit": expected_provenance()["flashinfer_commit"],
+            "tree": expected_provenance()["flashinfer_tree"],
+        },
+        "route_sources": {
+            "cake_exporter_sha256": HASHES["exporter_sha256"],
+            "core_manifest_sha256": HASHES["core_manifest_sha256"],
+            "overlay_manifest_sha256": HASHES["overlay_manifest_sha256"],
+            "flashinfer_outputs_sha256": {
+                "flashinfer/gdn_decode.py": "1" * 64,
+                "flashinfer/gdn_prefill.py": "2" * 64,
+                "flashinfer/jit/gdn_noncp.py": "3" * 64,
+            },
+            "selected_raw_routes": {
+                "prefill": list(expected_routes["prefill"]),
+                "decode": [
+                    route.replace(
+                        "flashinfer.gdn_decode.noncp.", "flashinfer.gdn_decode."
+                    )
+                    for route in expected_routes["decode"]
+                ],
+            },
+        },
+        "qualification_contract_rows": {
+            kind: [
+                {"contract": contract_name, "label": label}
+                for contract_name, label in selectors
+            ]
+            for kind, selectors in SGLANG_ROUTE_CONTRACT_ROWS.items()
+        },
+        "expected_candidate_routes": expected_routes,
+        "exact_t4_route": EXACT_T4_ROUTE,
+    }
 
 
 def _prompt_rows(arm: str, correct_count: int) -> list[dict]:
@@ -366,7 +412,7 @@ def _write_kl_evidence(
 
 
 def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict:
-    if TEST_PLAN_SPEC is None:
+    if TEST_PLAN_SPEC is None or TEST_ROUTE_SPEC is None:
         raise RuntimeError("accuracy test plan is not initialized")
     provenance = expected_provenance()
     provenance.update(
@@ -425,6 +471,7 @@ def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict
             }
         },
         "routes": {
+            "artifact": dict(TEST_ROUTE_SPEC),
             "expected_candidate_routes": expected_routes,
             "arms": {
                 "baseline": [
@@ -483,7 +530,7 @@ def _receipt(kl_specs: dict[str, dict[str, str]], kl_value: float = 0.0) -> dict
 
 class QualificationContractTest(unittest.TestCase):
     def setUp(self):
-        global TEST_CAMPAIGN_ID, TEST_EVIDENCE_ROOT, TEST_PLAN_SPEC
+        global TEST_CAMPAIGN_ID, TEST_EVIDENCE_ROOT, TEST_PLAN_SPEC, TEST_ROUTE_SPEC
         self.temp_directory = tempfile.TemporaryDirectory()
         self.evidence_root = Path(self.temp_directory.name)
         self.kl_specs, self.kl_value = _write_kl_evidence(self.evidence_root / "default")
@@ -512,6 +559,18 @@ class QualificationContractTest(unittest.TestCase):
             prompt_ids,
         )
         TEST_EVIDENCE_ROOT = self.evidence_root / "default"
+        expected_routes = {
+            "prefill": ["flashinfer.gdn_prefill.noncp.full_dv"],
+            "decode": [EXACT_T4_ROUTE],
+        }
+        route_artifact_path = TEST_EVIDENCE_ROOT / "route-artifact.json"
+        route_artifact_sha256 = _write_json(
+            route_artifact_path, _route_artifact(expected_routes)
+        )
+        TEST_ROUTE_SPEC = {
+            "path": route_artifact_path.name,
+            "sha256": route_artifact_sha256,
+        }
         plan_provenance = expected_provenance()
         plan_provenance.update(
             {
@@ -531,6 +590,10 @@ class QualificationContractTest(unittest.TestCase):
                 "model_path": "/sealed/model",
                 "tokenizer_path": "/sealed/model",
                 "artifacts": {"model_manifest": "/sealed/model-manifest.json"},
+                "route_artifact": {
+                    "path": str(route_artifact_path),
+                    "sha256": route_artifact_sha256,
+                },
             },
             "accuracy": {
                 "prompt_count": PROMPT_COUNT,
@@ -546,6 +609,14 @@ class QualificationContractTest(unittest.TestCase):
                     "sha256_key": MODEL_INFO_MANIFEST_SHA256_KEY,
                     "file_count_key": MODEL_INFO_MANIFEST_FILE_COUNT_KEY,
                 },
+            },
+            "routes": {
+                "artifact": {
+                    "schema": ROUTE_ARTIFACT_SCHEMA,
+                    "sha256": route_artifact_sha256,
+                },
+                "expected_candidate_routes": expected_routes,
+                "candidate_exact_t4_route": EXACT_T4_ROUTE,
             },
         }
         plan_path = TEST_EVIDENCE_ROOT / "plan.json"
@@ -564,12 +635,13 @@ class QualificationContractTest(unittest.TestCase):
         self.checkout_patch.start()
 
     def tearDown(self):
-        global TEST_CAMPAIGN_ID, TEST_EVIDENCE_ROOT, TEST_PLAN_SPEC
+        global TEST_CAMPAIGN_ID, TEST_EVIDENCE_ROOT, TEST_PLAN_SPEC, TEST_ROUTE_SPEC
         HASHES["gsm8k_dataset_sha256"] = self.original_dataset_sha256
         HASHES["gsm8k_prompt_ids_sha256"] = self.original_prompt_ids_sha256
         TEST_CAMPAIGN_ID = ""
         TEST_EVIDENCE_ROOT = None
         TEST_PLAN_SPEC = None
+        TEST_ROUTE_SPEC = None
         self.checkout_patch.stop()
         self.decode_patch.stop()
         self.temp_directory.cleanup()
@@ -581,6 +653,7 @@ class QualificationContractTest(unittest.TestCase):
             selected_root.mkdir(parents=True, exist_ok=True)
             shared_specs = [
                 receipt["accuracy"]["plan"],
+                receipt["routes"]["artifact"],
                 receipt["accuracy"]["dataset"],
                 receipt["accuracy"]["prompt_ids"],
                 receipt["accuracy"]["arms"]["baseline"]["request_ledger"],
@@ -841,6 +914,25 @@ class QualificationContractTest(unittest.TestCase):
         with self.assertRaisesRegex(QualificationError, "baseline rank 2 recorded optimized"):
             self._audit(receipt)
 
+    def test_05a_route_artifact_hash_drift_fails_closed(self):
+        receipt = _receipt(self.kl_specs, self.kl_value)
+        path = self.evidence_root / "default" / receipt["routes"]["artifact"]["path"]
+        artifact = json.loads(path.read_text())
+        artifact["status"] = "FAIL"
+        path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+        with self.assertRaisesRegex(QualificationError, "route artifact SHA256 mismatch"):
+            self._audit(receipt)
+
+    def test_05b_caller_cannot_replace_artifact_derived_routes(self):
+        receipt = _receipt(self.kl_specs, self.kl_value)
+        receipt["routes"]["expected_candidate_routes"]["prefill"] = [
+            "flashinfer.gdn_prefill.noncp.caller_supplied"
+        ]
+        with self.assertRaisesRegex(
+            QualificationError, "expected candidate routes differ from the route artifact"
+        ):
+            self._audit(receipt)
+
     def test_06_candidate_must_prove_exact_t4_route(self):
         receipt = _receipt(self.kl_specs, self.kl_value)
         receipt["routes"]["arms"]["candidate"][1]["route_observations"] = [
@@ -949,6 +1041,28 @@ class QualificationContractTest(unittest.TestCase):
         for hosts in invalid_hosts:
             with self.subTest(hosts=hosts), self.assertRaises(ValueError):
                 _server_hosts({"server_hosts": hosts})
+
+    def test_11a_renderer_hashes_and_parses_the_route_artifact(self):
+        assert TEST_ROUTE_SPEC is not None
+        path = self.evidence_root / "default" / TEST_ROUTE_SPEC["path"]
+        binding = {
+            "route_artifact": {
+                "path": str(path),
+                "sha256": TEST_ROUTE_SPEC["sha256"],
+            }
+        }
+        spec, routes = _render_route_artifact(binding)
+        self.assertEqual(spec, binding["route_artifact"])
+        self.assertEqual(routes, _route_artifact(routes)["expected_candidate_routes"])
+
+        duplicate = self.evidence_root / "duplicate-route-artifact.json"
+        duplicate.write_text('{"schema":"x","schema":"y"}\n')
+        binding["route_artifact"] = {
+            "path": str(duplicate),
+            "sha256": hashlib.sha256(duplicate.read_bytes()).hexdigest(),
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate JSON object key"):
+            _render_route_artifact(binding)
 
     def test_12_route_marker_parser_requires_neutral_attributable_schema(self):
         valid = (

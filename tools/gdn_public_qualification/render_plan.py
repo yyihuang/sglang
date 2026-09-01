@@ -41,12 +41,14 @@ from tools.gdn_public_qualification.contract import (
     OBSERVATIONS_PER_ARM_PER_WORKLOAD,
     PLAN_SCHEMA,
     PROMPT_COUNT,
+    ROUTE_ARTIFACT_SCHEMA,
     SGLANG_INTEGRATION_COMMIT,
     TP_RANKS,
     TP_SIZE,
     WORKLOADS,
     expected_provenance,
     load_strict_json,
+    validate_route_artifact,
 )
 
 ARTIFACT_HASH_KEYS = {
@@ -90,6 +92,36 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _route_artifact(binding: dict) -> tuple[dict[str, str], dict[str, list[str]]]:
+    spec = binding.get("route_artifact")
+    if not isinstance(spec, dict) or set(spec) != {"path", "sha256"}:
+        raise ValueError("route_artifact must contain exactly path and sha256")
+    path_text = spec.get("path")
+    expected_sha256 = spec.get("sha256")
+    if not isinstance(path_text, str) or not Path(path_text).is_absolute():
+        raise ValueError("route_artifact.path must be absolute")
+    path = Path(path_text)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"route artifact is not a regular file: {path}")
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ValueError("route_artifact.sha256 must be a full lowercase SHA256")
+    actual_sha256 = _sha256(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"route artifact SHA256 {actual_sha256} != {expected_sha256}"
+        )
+    try:
+        artifact = load_strict_json(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"route artifact is not strict JSON: {exc}") from exc
+    expected_routes = validate_route_artifact(artifact)
+    return {"path": str(path), "sha256": actual_sha256}, expected_routes
 
 
 def _model_vocab_size(model_path: Path) -> int:
@@ -263,6 +295,11 @@ def main() -> int:
         actual = _sha256(path)
         if actual != HASHES[hash_key]:
             parser.error(f"{artifact} SHA256 {actual} != {HASHES[hash_key]}")
+    try:
+        route_artifact, expected_candidate_routes = _route_artifact(binding)
+    except ValueError as exc:
+        parser.error(str(exc))
+    binding["route_artifact"] = route_artifact
 
     provenance = expected_provenance()
     provenance.update(
@@ -347,6 +384,11 @@ def main() -> int:
             "server_info_must_match": True,
         },
         "routes": {
+            "artifact": {
+                "schema": ROUTE_ARTIFACT_SCHEMA,
+                "sha256": route_artifact["sha256"],
+            },
+            "expected_candidate_routes": expected_candidate_routes,
             "tp_size": TP_SIZE,
             "ranks": TP_RANKS,
             "candidate_exact_noncp_routes_on_every_rank": True,

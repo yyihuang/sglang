@@ -118,6 +118,11 @@ SGLANG_ROUTE_CONTRACT_ROWS = {
         ("decode_bf16_serving", "bf16_sglang_qwen_tp4_verify_t4"),
     ),
 }
+REQUIRED_ROUTE_SOURCE_PATHS = {
+    "flashinfer/gdn_decode.py",
+    "flashinfer/gdn_prefill.py",
+    "flashinfer/jit/gdn_noncp.py",
+}
 ABBA_ORDER = ["baseline", "candidate", "candidate", "baseline"] * 4
 OBSERVATIONS_PER_ARM_PER_WORKLOAD = 8
 BOOTSTRAP_SAMPLES = 20_000
@@ -625,7 +630,7 @@ def _load_prompt_ids_authority(spec: object, evidence_root: Path | None) -> list
     return value
 
 
-def _load_campaign_plan(
+def load_campaign_plan(
     spec: object, evidence_root: Path | None, campaign_id: str
 ) -> Mapping[str, object]:
     require(evidence_root is not None, "an evidence root is required for the rendered campaign plan")
@@ -684,6 +689,43 @@ def _load_campaign_plan(
             "file_count_key": MODEL_INFO_MANIFEST_FILE_COUNT_KEY,
         },
         "campaign plan server model manifest observation differs",
+    )
+    bindings = plan.get("bindings")
+    require(isinstance(bindings, Mapping), "campaign plan bindings are required")
+    route_binding = bindings.get("route_artifact")
+    require(
+        isinstance(route_binding, Mapping)
+        and set(route_binding) == {"path", "sha256"}
+        and isinstance(route_binding.get("path"), str)
+        and bool(route_binding["path"])
+        and Path(route_binding["path"]).is_absolute()
+        and isinstance(route_binding.get("sha256"), str)
+        and bool(_SHA256_RE.fullmatch(route_binding["sha256"])),
+        "campaign plan route artifact binding differs",
+    )
+    routes = plan.get("routes")
+    require(isinstance(routes, Mapping), "campaign plan route contract is required")
+    route_artifact = routes.get("artifact")
+    require(
+        route_artifact
+        == {
+            "schema": ROUTE_ARTIFACT_SCHEMA,
+            "sha256": route_binding["sha256"],
+        },
+        "campaign plan route artifact identity differs",
+    )
+    planned_routes = routes.get("expected_candidate_routes")
+    require(
+        isinstance(planned_routes, Mapping)
+        and set(planned_routes) == {"prefill", "decode"},
+        "campaign plan expected candidate routes differ",
+    )
+    for kind in ("prefill", "decode"):
+        _validate_route_names(kind, planned_routes[kind])
+    require(
+        routes.get("candidate_exact_t4_route") == EXACT_T4_ROUTE
+        and EXACT_T4_ROUTE in planned_routes["decode"],
+        "campaign plan exact T=4 route differs",
     )
     return plan
 
@@ -996,6 +1038,19 @@ def _recompute_kl(kl: Mapping[str, object], evidence_root: Path | None) -> tuple
     return sample_means, max_position_kl
 
 
+def recompute_kl_summary(
+    kl: Mapping[str, object], evidence_root: Path | None
+) -> dict[str, float]:
+    """Recompute the three reported full-vocabulary KL statistics."""
+
+    sample_values, max_position_kl = _recompute_kl(kl, evidence_root)
+    return {
+        "mean_sample_kl": math.fsum(sample_values) / len(sample_values),
+        "max_sample_kl": max(sample_values),
+        "max_position_kl": max_position_kl,
+    }
+
+
 def validate_accuracy(
     accuracy: Mapping[str, object],
     evidence_root: Path | None = None,
@@ -1006,7 +1061,7 @@ def validate_accuracy(
         isinstance(campaign_id, str) and bool(_SHA256_RE.fullmatch(campaign_id)),
         "accuracy campaign_id must be a SHA256",
     )
-    plan = _load_campaign_plan(accuracy.get("plan"), evidence_root, campaign_id)
+    plan = load_campaign_plan(accuracy.get("plan"), evidence_root, campaign_id)
     require(
         isinstance(receipt_provenance, Mapping)
         and plan.get("provenance") == receipt_provenance,
@@ -1111,14 +1166,12 @@ def validate_accuracy(
     require(kl.get("direction") == KL_DIRECTION, f"KL direction must be {KL_DIRECTION}")
     require(kl.get("position_aggregation") == KL_POSITION_AGGREGATION, f"KL position aggregation must be {KL_POSITION_AGGREGATION}")
     require(kl.get("sample_aggregation") == KL_SAMPLE_AGGREGATION, f"KL sample aggregation must be {KL_SAMPLE_AGGREGATION}")
-    sample_values, max_position_kl = _recompute_kl(kl, evidence_root)
-    mean_kl = sum(sample_values) / len(sample_values)
-    max_kl = max(sample_values)
-    for key, computed in (("mean_sample_kl", mean_kl), ("max_sample_kl", max_kl), ("max_position_kl", max_position_kl)):
+    kl_summary = recompute_kl_summary(kl, evidence_root)
+    for key, computed in kl_summary.items():
         reported = kl.get(key)
         require(isinstance(reported, (int, float)) and math.isclose(float(reported), computed, rel_tol=0, abs_tol=1e-12), f"reported {key} does not match full-vocabulary distributions")
-    require(max_kl < MAX_KL_EXCLUSIVE, f"maximum sample full-vocabulary KL {max_kl:.9f} is not < 0.0035")
-    return {**scores, "kl_metric": KL_METRIC, "kl_direction": KL_DIRECTION, "mean_sample_kl": mean_kl, "max_sample_kl": max_kl, "max_position_kl": max_position_kl}
+    require(kl_summary["max_sample_kl"] < MAX_KL_EXCLUSIVE, f"maximum sample full-vocabulary KL {kl_summary['max_sample_kl']:.9f} is not < 0.0035")
+    return {**scores, "kl_metric": KL_METRIC, "kl_direction": KL_DIRECTION, **kl_summary}
 
 
 def _json_sha256(value: object) -> str:
@@ -1194,10 +1247,188 @@ def _validate_route_names(route_kind: str, routes: object) -> list[str]:
     return routes
 
 
-def validate_routes(routes: Mapping[str, object]) -> dict[str, object]:
+def _expected_route_contract_rows() -> dict[str, list[dict[str, str]]]:
+    return {
+        kind: [
+            {"contract": contract_name, "label": label}
+            for contract_name, label in selectors
+        ]
+        for kind, selectors in SGLANG_ROUTE_CONTRACT_ROWS.items()
+    }
+
+
+def validate_route_artifact(artifact: object) -> dict[str, list[str]]:
+    """Validate the deterministic final route artifact against pinned sources."""
+
+    require(isinstance(artifact, Mapping), "route artifact must be an object")
+    require(
+        set(artifact)
+        == {
+            "schema",
+            "status",
+            "cake",
+            "flashinfer",
+            "route_sources",
+            "qualification_contract_rows",
+            "expected_candidate_routes",
+            "exact_t4_route",
+        },
+        "route artifact fields differ",
+    )
+    require(
+        artifact.get("schema") == ROUTE_ARTIFACT_SCHEMA
+        and artifact.get("status") == "PASS",
+        "route artifact schema or status differs",
+    )
+    require(
+        artifact.get("cake") == {"commit": SOURCE_COMMIT, "tree": SOURCE_TREE},
+        "route artifact Cake identity differs",
+    )
+    require(
+        artifact.get("flashinfer")
+        == {"commit": FLASHINFER_COMMIT, "tree": FLASHINFER_TREE},
+        "route artifact FlashInfer identity differs",
+    )
+    require(
+        artifact.get("qualification_contract_rows")
+        == _expected_route_contract_rows(),
+        "route artifact qualification contract rows differ",
+    )
+    sources = artifact.get("route_sources")
+    require(
+        isinstance(sources, Mapping)
+        and set(sources)
+        == {
+            "cake_exporter_sha256",
+            "core_manifest_sha256",
+            "overlay_manifest_sha256",
+            "flashinfer_outputs_sha256",
+            "selected_raw_routes",
+        },
+        "route artifact source fields differ",
+    )
+    for key, expected in (
+        ("cake_exporter_sha256", HASHES["exporter_sha256"]),
+        ("core_manifest_sha256", HASHES["core_manifest_sha256"]),
+        ("overlay_manifest_sha256", HASHES["overlay_manifest_sha256"]),
+    ):
+        require(sources.get(key) == expected, f"route artifact {key} differs")
+    outputs = sources.get("flashinfer_outputs_sha256")
+    require(
+        isinstance(outputs, Mapping)
+        and REQUIRED_ROUTE_SOURCE_PATHS <= set(outputs),
+        "route artifact authenticated FlashInfer outputs are incomplete",
+    )
+    for path, digest in outputs.items():
+        require(
+            isinstance(path, str)
+            and path == Path(path).as_posix()
+            and "\\" not in path
+            and not Path(path).is_absolute()
+            and ".." not in Path(path).parts
+            and isinstance(digest, str)
+            and bool(_SHA256_RE.fullmatch(digest)),
+            "route artifact authenticated FlashInfer output differs",
+        )
+    raw_routes = sources.get("selected_raw_routes")
+    require(
+        isinstance(raw_routes, Mapping)
+        and set(raw_routes) == {"prefill", "decode"},
+        "route artifact selected raw routes differ",
+    )
+    normalized: dict[str, list[str]] = {}
+    for kind in ("prefill", "decode"):
+        values = raw_routes[kind]
+        require(
+            isinstance(values, list)
+            and bool(values)
+            and values == sorted(set(values))
+            and all(isinstance(value, str) for value in values),
+            f"route artifact selected {kind} routes differ",
+        )
+        if kind == "prefill":
+            normalized[kind] = list(values)
+        else:
+            prefix = "flashinfer.gdn_decode."
+            require(
+                all(
+                    value.startswith(prefix)
+                    and not value.startswith(prefix + "noncp.")
+                    for value in values
+                ),
+                "route artifact selected decode routes are not canonical",
+            )
+            normalized[kind] = sorted(
+                "flashinfer.gdn_decode.noncp." + value[len(prefix) :]
+                for value in values
+            )
+    expected = artifact.get("expected_candidate_routes")
+    require(
+        isinstance(expected, Mapping) and set(expected) == {"prefill", "decode"},
+        "route artifact expected candidate routes differ",
+    )
+    expected_routes = {
+        kind: _validate_route_names(kind, expected[kind])
+        for kind in ("prefill", "decode")
+    }
+    require(
+        expected_routes == normalized,
+        "route artifact expected routes differ from selected raw routes",
+    )
+    require(
+        artifact.get("exact_t4_route") == EXACT_T4_ROUTE
+        and EXACT_T4_ROUTE in expected_routes["decode"],
+        "route artifact exact T=4 route differs",
+    )
+    return expected_routes
+
+
+def _load_route_artifact(
+    spec: object, evidence_root: Path | None
+) -> tuple[dict[str, list[str]], str]:
+    require(evidence_root is not None, "an evidence root is required for the route artifact")
+    require(
+        isinstance(spec, Mapping) and set(spec) == {"path", "sha256"},
+        "route artifact reference must contain exactly path and sha256",
+    )
+    expected_sha256 = spec.get("sha256")
+    require(
+        isinstance(expected_sha256, str) and bool(_SHA256_RE.fullmatch(expected_sha256)),
+        "route artifact SHA256 is required",
+    )
+    path = _resolve_evidence_path(evidence_root, spec.get("path"), "route artifact")
+    require(_file_sha256(path) == expected_sha256, "route artifact SHA256 mismatch")
+    try:
+        artifact = load_strict_json(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise QualificationError(f"route artifact is unreadable: {exc}") from exc
+    return validate_route_artifact(artifact), expected_sha256
+
+
+def validate_routes(
+    routes: Mapping[str, object],
+    evidence_root: Path | None = None,
+    plan_routes: object = None,
+) -> dict[str, object]:
+    artifact_routes, artifact_sha256 = _load_route_artifact(
+        routes.get("artifact"), evidence_root
+    )
+    require(isinstance(plan_routes, Mapping), "campaign plan route contract is required")
+    require(
+        plan_routes.get("artifact")
+        == {"schema": ROUTE_ARTIFACT_SCHEMA, "sha256": artifact_sha256},
+        "route artifact differs from the rendered campaign plan",
+    )
+    require(
+        plan_routes.get("expected_candidate_routes") == artifact_routes,
+        "planned candidate routes differ from the route artifact",
+    )
     expected = routes.get("expected_candidate_routes")
-    require(isinstance(expected, Mapping) and set(expected) == {"prefill", "decode"}, "expected candidate routes must contain prefill and decode")
-    expected_routes = {kind: _validate_route_names(kind, expected[kind]) for kind in ("prefill", "decode")}
+    require(
+        expected == artifact_routes,
+        "expected candidate routes differ from the route artifact",
+    )
+    expected_routes = artifact_routes
     arms = routes.get("arms")
     require(isinstance(arms, Mapping) and set(arms) == {"baseline", "candidate"}, "route arms must be exactly baseline and candidate")
     for arm in ("baseline", "candidate"):
@@ -1327,11 +1558,21 @@ def audit_receipt(receipt: Mapping[str, object], evidence_root: Path | None = No
         require(isinstance(receipt.get(section), Mapping), f"{section} must be an object")
     validate_provenance(receipt["provenance"])
     campaign = validate_campaign(receipt["campaign"])
+    campaign_id = receipt["accuracy"].get("campaign_id")
+    require(
+        isinstance(campaign_id, str) and bool(_SHA256_RE.fullmatch(campaign_id)),
+        "accuracy campaign_id must be a SHA256",
+    )
+    campaign_plan = load_campaign_plan(
+        receipt["accuracy"].get("plan"), evidence_root, campaign_id
+    )
     accuracy = validate_accuracy(
         receipt["accuracy"], evidence_root, receipt["provenance"]
     )
     mtp_probe = validate_mtp_probe(receipt["mtp_probe"])
-    routes = validate_routes(receipt["routes"])
+    routes = validate_routes(
+        receipt["routes"], evidence_root, campaign_plan.get("routes")
+    )
     performance = validate_performance(receipt["performance"])
     return {
         "schema": "gdn-public-qualification-audit-v2",

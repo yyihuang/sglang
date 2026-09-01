@@ -7,8 +7,15 @@ import pathlib
 import subprocess
 import tempfile
 import unittest
+from contextlib import ExitStack
+from unittest.mock import patch
 
-from tools.gdn_public_qualification.contract import EXACT_T4_ROUTE
+from tools.gdn_public_qualification.contract import (
+    EXACT_T4_ROUTE,
+    HASHES,
+    QualificationError,
+    validate_route_artifact,
+)
 from tools.gdn_public_qualification.produce_route_artifact import (
     CORE_SCHEMA,
     OVERLAY_SCHEMA,
@@ -119,6 +126,45 @@ class RouteArtifactTest(unittest.TestCase):
             "overlay_manifest_sha256": self.overlay_sha,
         }
 
+    def consumer_pins(self) -> ExitStack:
+        stack = ExitStack()
+        stack.enter_context(
+            patch(
+                "tools.gdn_public_qualification.contract.SOURCE_COMMIT",
+                self.cake_commit,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "tools.gdn_public_qualification.contract.SOURCE_TREE",
+                self.cake_tree,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "tools.gdn_public_qualification.contract.FLASHINFER_COMMIT",
+                self.fi_commit,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "tools.gdn_public_qualification.contract.FLASHINFER_TREE",
+                self.fi_tree,
+            )
+        )
+        stack.enter_context(
+            patch.dict(
+                HASHES,
+                {
+                    "exporter_sha256": _sha(self.exporter),
+                    "core_manifest_sha256": self.core_sha,
+                    "overlay_manifest_sha256": self.overlay_sha,
+                },
+                clear=False,
+            )
+        )
+        return stack
+
     def test_deterministic_exact_routes(self) -> None:
         first, second = produce(**self.args()), produce(**self.args())
         self.assertEqual(first, second)
@@ -131,6 +177,22 @@ class RouteArtifactTest(unittest.TestCase):
             first["expected_candidate_routes"]["prefill"],
             ["flashinfer.gdn_prefill.noncp.checkpoints.dvsplit", "flashinfer.gdn_prefill.noncp.dvsplit"],
         )
+        with self.consumer_pins():
+            self.assertEqual(
+                validate_route_artifact(first), first["expected_candidate_routes"]
+            )
+
+    def test_artifact_consumer_rejects_unbound_expected_routes(self) -> None:
+        artifact = produce(**self.args())
+        artifact["expected_candidate_routes"]["prefill"] = [
+            "flashinfer.gdn_prefill.noncp.caller_supplied"
+        ]
+        with self.consumer_pins():
+            with self.assertRaisesRegex(
+                QualificationError,
+                "expected routes differ from selected raw routes",
+            ):
+                validate_route_artifact(artifact)
 
     def test_identity_and_dirty_sources_fail_closed(self) -> None:
         args = self.args()

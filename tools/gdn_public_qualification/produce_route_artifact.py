@@ -14,19 +14,16 @@ from collections.abc import Mapping
 
 from tools.gdn_public_qualification.contract import (
     EXACT_T4_ROUTE,
+    REQUIRED_ROUTE_SOURCE_PATHS,
     ROUTE_ARTIFACT_SCHEMA,
     SGLANG_ROUTE_CONTRACT_ROWS,
+    load_strict_json,
 )
 
 CORE_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
 OVERLAY_SCHEMA = "flashinfer-gdn-noncp-public-overlay-v1"
 CAKE_EXPORTER = pathlib.PurePosixPath("tools/export_flashinfer_gdn_noncp_decode.py")
 ARCHITECTURES = ("sm_100a", "sm_103a")
-REQUIRED_FLASHINFER_ROUTE_SOURCES = {
-    "flashinfer/gdn_decode.py",
-    "flashinfer/gdn_prefill.py",
-    "flashinfer/jit/gdn_noncp.py",
-}
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 ROUTE_RE = {
@@ -65,8 +62,8 @@ def _sha256(path: pathlib.Path) -> str:
 def _load_object(path: pathlib.Path, label: str) -> dict[str, object]:
     require(path.is_file() and not path.is_symlink(), f"{label} is not a regular file")
     try:
-        value = json.loads(path.read_text())
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = load_strict_json(path.read_text())
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise RouteArtifactError(f"{label} is not valid UTF-8 JSON: {error}") from error
     require(isinstance(value, dict), f"{label} must be a JSON object")
     return value
@@ -124,7 +121,7 @@ def _validate_overlay(
     require(overlay.get("core_manifest_sha256") == core_sha256, "overlay does not bind the core manifest")
     outputs = overlay.get("outputs")
     require(isinstance(outputs, Mapping) and bool(outputs), "overlay outputs must be a nonempty object")
-    require(REQUIRED_FLASHINFER_ROUTE_SOURCES <= set(outputs), "overlay is missing required FlashInfer route sources")
+    require(REQUIRED_ROUTE_SOURCE_PATHS <= set(outputs), "overlay is missing required FlashInfer route sources")
     verified: dict[str, str] = {}
     for relative in sorted(outputs):
         record = outputs[relative]

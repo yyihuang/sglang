@@ -130,8 +130,8 @@ optimized-route markers. Missing or malformed route evidence fails closed.
 ## Final route artifact
 
 `produce_route_artifact.py` emits the deterministic
-`gdn-noncp-final-sglang-route-artifact-v1` input consumed by the TP4 renderer.
-It does not accept caller-written routes. It selects the four exact campaign
+`gdn-noncp-final-sglang-route-artifact-v1` input consumed by the TP4 renderer
+and auditor. It does not accept caller-written routes. It selects the four exact campaign
 rows pinned in `contract.py` from a hash-authenticated final core manifest,
 requires matching optimized SM100a/SM103a dispatch, and proves every selected
 raw route against literals in the hash-authenticated installed
@@ -160,8 +160,15 @@ python -m tools.gdn_public_qualification.produce_route_artifact \
   --output /absolute/fresh/route-artifact.json
 ```
 
-Hash the result into the unresolved TP4 final pins. This producer does not
-launch servers or alter route, accuracy, KL, or performance acceptance gates.
+Record the fresh output as the required private binding
+`"route_artifact": {"path": "/absolute/route-artifact.json", "sha256":
+"<full-sha256>"}`. The renderer rehashes and validates the artifact against the
+pinned Cake, FlashInfer, exporter, core-manifest, and overlay-manifest identities,
+then derives the exact route sets in the plan from its content. The assembler
+copies that hash into the result, and the auditor reloads the safe relative
+evidence path and repeats the content and hash checks. There is no caller-written
+expected-route form. This producer does not launch servers or alter accuracy,
+KL, or performance acceptance gates.
 
 ## Use
 
@@ -170,7 +177,8 @@ the tokenizer vocabulary size, the exact paths for every key in
 `render_plan.ARTIFACT_HASH_KEYS`, separate baseline/candidate hosts, ports, and
 rank-log paths, fresh absolute `kl_sink_roots.baseline` and
 `kl_sink_roots.candidate` paths whose parents already exist, the candidate
-FlashInfer Python path, CUDA version, GPU name, and container image. The
+FlashInfer Python path, CUDA version, GPU name, container image, and the exact
+route-artifact path/SHA256 pair above. The
 renderer refuses any dirty path in the complete SGLang worktree and creates the
 plan exclusively; an existing plan is never overwritten. It launches both
 servers through the sealed sink adapter, which also installs the default-off
@@ -207,10 +215,33 @@ python -m tools.gdn_public_qualification.collect kl-candidate \
   --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
   --sink-root "$CANDIDATE_SINK_ROOT" \
   --output "$CANDIDATE_SINK_ROOT/manifest.json"
+python -m tools.gdn_public_qualification.assemble \
+  --plan "$CAMPAIGN_EVIDENCE/plan.json" \
+  --accuracy-baseline "$CAMPAIGN_EVIDENCE/accuracy.baseline.json" \
+  --accuracy-candidate "$CAMPAIGN_EVIDENCE/accuracy.candidate.json" \
+  --mtp-baseline "$CAMPAIGN_EVIDENCE/mtp.baseline.json" \
+  --mtp-candidate "$CAMPAIGN_EVIDENCE/mtp.candidate.json" \
+  --routes-baseline "$CAMPAIGN_EVIDENCE/routes.baseline.json" \
+  --routes-candidate "$CAMPAIGN_EVIDENCE/routes.candidate.json" \
+  --kl-baseline-manifest "$BASELINE_SINK_ROOT/manifest.json" \
+  --kl-candidate-manifest "$CANDIDATE_SINK_ROOT/manifest.json" \
+  --performance-dir "$CAMPAIGN_EVIDENCE/performance" \
+  --physical-start-ns "$PHYSICAL_START_NS" \
+  --measured-start-ns "$MEASURED_START_NS" \
+  --finish-ns "$FINISH_NS" \
+  --output "$CAMPAIGN_EVIDENCE/result.json"
 python -m tools.gdn_public_qualification.audit result.json --output audit.json
 ```
 
-`result.json` references the rendered plan, each per-arm client request ledger,
+The performance directory has exactly the 32 collector outputs named
+`performance.<workload-id>.<00..15>.<arm>.json`, where each workload uses
+`baseline,candidate,candidate,baseline` four times. The assembler accepts no
+alternate result schema or unbound route set. Its output must be fresh and
+absolute; the plan, route artifact, sealed GSM8K dataset and prompt IDs, both
+accuracy outputs and ledgers, both KL sink trees, route outputs, MTP outputs,
+and performance directory must all be below the result's evidence directory.
+
+`result.json` references the rendered plan and route artifact, each per-arm client request ledger,
 each source-owned server request authority and sealed receipt, and
 each KL manifest with paths relative to the result file and their SHA256s.
 Place the result so the plan, ledgers, and both sealed sink roots with their
