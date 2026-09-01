@@ -274,6 +274,69 @@ def test_correctness_qualification_passes_all_pairs_and_exact_repeatability():
     assert qualification["thresholds"] == MODEL_QUALIFICATION_THRESHOLDS
 
 
+def test_correctness_qualification_accepts_qualifying_output_frames():
+    reference_results = [_generation_result(), _generation_result()]
+    candidate_results = [_generation_result(0.08), _generation_result(0.08)]
+    cross_variant = summarize_cross_variant_metrics(
+        reference_results, candidate_results
+    )
+
+    for comparison in cross_variant["comparisons"]:
+        frame_metrics = comparison["output_metrics"]["all_frames_metrics"]
+        assert frame_metrics["finite"] is True
+        assert frame_metrics["within_tolerance"] is True
+        assert frame_metrics["cosine_similarity"] >= MODEL_QUALIFICATION_THRESHOLDS[
+            "cosine_min"
+        ]
+        assert frame_metrics["mae"] <= MODEL_QUALIFICATION_THRESHOLDS["mae_max"]
+
+    qualification = evaluate_correctness_qualification(
+        cross_variant,
+        {
+            "reference": summarize_run_repeatability(reference_results),
+            "candidate": summarize_run_repeatability(candidate_results),
+        },
+    )
+
+    assert qualification["passed"] is True
+    assert qualification["failures"] == []
+
+
+def test_correctness_qualification_rejects_finite_but_different_output_frames():
+    reference_results = [_generation_result(), _generation_result()]
+    candidate_results = [_generation_result(0.08), _generation_result(0.08)]
+    different_frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    different_frame[:, :, 0] = 255
+    for result in candidate_results:
+        result.frames = [different_frame.copy()]
+    cross_variant = summarize_cross_variant_metrics(
+        reference_results, candidate_results
+    )
+
+    assert all(
+        comparison["output_metrics"]["all_frames_metrics"]["finite"]
+        for comparison in cross_variant["comparisons"]
+    )
+    qualification = evaluate_correctness_qualification(
+        cross_variant,
+        {
+            "reference": summarize_run_repeatability(reference_results),
+            "candidate": summarize_run_repeatability(candidate_results),
+        },
+    )
+
+    assert qualification["passed"] is False
+    assert {
+        failure["reason"]
+        for failure in qualification["failures"]
+        if failure["scope"] == "cross_variant"
+    } == {
+        "output_frames_outside_atol_rtol",
+        "output_frames_cosine_below_minimum",
+        "output_frames_mae_above_maximum",
+    }
+
+
 def test_correctness_qualification_fails_closed_on_quality_and_repeatability():
     reference_results = [_generation_result(), _generation_result()]
     candidate_results = [_generation_result(0.25), _generation_result(0.5)]

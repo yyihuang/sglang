@@ -571,6 +571,36 @@ def _comparison_failures(
                     "max_abs": output_metrics["max_abs"],
                 }
             )
+        elif not require_exact:
+            if (
+                "within_tolerance" in output_metrics
+                and not output_metrics["within_tolerance"]
+            ):
+                failures.append(
+                    pair
+                    | {
+                        "reason": "output_frames_outside_atol_rtol",
+                        "max_abs": output_metrics["max_abs"],
+                    }
+                )
+            if output_metrics["cosine_similarity"] < MODEL_QUALIFICATION_THRESHOLDS[
+                "cosine_min"
+            ]:
+                failures.append(
+                    pair
+                    | {
+                        "reason": "output_frames_cosine_below_minimum",
+                        "cosine_similarity": output_metrics["cosine_similarity"],
+                    }
+                )
+            if output_metrics["mae"] > MODEL_QUALIFICATION_THRESHOLDS["mae_max"]:
+                failures.append(
+                    pair
+                    | {
+                        "reason": "output_frames_mae_above_maximum",
+                        "mae": output_metrics["mae"],
+                    }
+                )
     return failures
 
 
