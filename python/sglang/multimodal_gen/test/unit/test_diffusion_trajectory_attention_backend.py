@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import copy
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
-
+from sglang.multimodal_gen.tools.aggregate_diffusion_attention_performance import (
+    aggregate_paired_performance_reports,
+)
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MODEL_QUALIFICATION_THRESHOLDS,
     _cosine_similarity,
@@ -405,3 +408,191 @@ def test_build_sampling_kwargs_disables_trajectory_for_performance():
     assert kwargs["return_frames"] is True
     assert kwargs["return_trajectory_latents"] is False
     assert kwargs["return_trajectory_decoded"] is False
+
+
+def _paired_performance_report(
+    run_order: str,
+    *,
+    speedup: float = 1.0,
+    hit_counts: list[int] | None = None,
+):
+    return {
+        "schema_version": 2,
+        "model_path": "/models/wan",
+        "prompt": "fixed prompt",
+        "seed": 42,
+        "warmup_runs": 2,
+        "measure_runs": 5,
+        "comparison_mode": "performance",
+        "run_order": run_order,
+        "trajectory_capture_enabled": False,
+        "server_kwargs": {
+            "reference": {"attention_backend": "fa"},
+            "candidate": {"attention_backend": "wan_hybrid"},
+        },
+        "backend_overrides": {
+            "reference_attention_backend": "fa",
+            "candidate_attention_backend": "wan_hybrid",
+        },
+        "sampling_kwargs": {
+            "width": 640,
+            "height": 384,
+            "num_frames": 17,
+            "num_inference_steps": 12,
+            "guidance_scale": 5.0,
+            "guidance_scale_2": None,
+        },
+        "source_identity": {
+            "sglang": {
+                "git_revision": "a" * 40,
+                "module_file_sha256": "c" * 64,
+            },
+            "flashinfer": {
+                "git_revision": "b" * 40,
+                "module_file_sha256": "d" * 64,
+            },
+        },
+        "device_identity": {
+            "index": 0,
+            "name": "NVIDIA B200",
+            "compute_capability": [10, 0],
+            "total_memory_bytes": 192_000_000_000,
+            "uuid": "GPU-fixed",
+        },
+        "runtime_provenance": {
+            "python": "3.12.3",
+            "torch": "2.9.0",
+            "cuda": "13.0",
+        },
+        "candidate_generation": {
+            "per_run_wan_hybrid_hit_count": hit_counts or [80, 80, 80, 80, 80]
+        },
+        "performance": {"wall_median_speedup": speedup},
+    }
+
+
+def test_paired_performance_qualification_passes_both_orders_at_floor():
+    result = aggregate_paired_performance_reports(
+        _paired_performance_report("reference-first", speedup=1.0),
+        _paired_performance_report("candidate-first", speedup=1.01),
+    )
+
+    assert result["passed"] is True
+    assert result["failures"] == []
+    assert result["paired_speedups"] == {
+        "reference_first": 1.0,
+        "candidate_first": 1.01,
+    }
+
+
+def test_paired_performance_qualification_requires_opposite_orders():
+    result = aggregate_paired_performance_reports(
+        _paired_performance_report("candidate-first"),
+        _paired_performance_report("candidate-first"),
+    )
+
+    assert result["passed"] is False
+    assert {
+        (failure["report"], failure["field"], failure["reason"])
+        for failure in result["failures"]
+    } >= {("reference_first", "run_order", "unexpected_value")}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field", "reason"),
+    [
+        (
+            lambda report: report.update(comparison_mode="correctness"),
+            "comparison_mode",
+            "performance_mode_required",
+        ),
+        (
+            lambda report: report.update(trajectory_capture_enabled=True),
+            "trajectory_capture_enabled",
+            "trajectory_capture_must_be_explicitly_disabled",
+        ),
+        (
+            lambda report: report["candidate_generation"].update(
+                per_run_wan_hybrid_hit_count=[80, 0]
+            ),
+            "candidate_generation.per_run_wan_hybrid_hit_count[1]",
+            "candidate_hit_count_not_positive",
+        ),
+        (
+            lambda report: report["candidate_generation"].update(
+                per_run_wan_hybrid_hit_count=[80]
+            ),
+            "candidate_generation.per_run_wan_hybrid_hit_count",
+            "candidate_hit_count_length_mismatch",
+        ),
+        (
+            lambda report: report["performance"].update(
+                wall_median_speedup=0.999
+            ),
+            "performance.wall_median_speedup",
+            "speedup_below_minimum",
+        ),
+    ],
+)
+def test_paired_performance_qualification_fails_closed_per_order(
+    mutation, field, reason
+):
+    reference_first = _paired_performance_report("reference-first")
+    mutation(reference_first)
+
+    result = aggregate_paired_performance_reports(
+        reference_first,
+        _paired_performance_report("candidate-first"),
+    )
+
+    assert result["passed"] is False
+    assert any(
+        failure["report"] == "reference_first"
+        and failure["field"] == field
+        and failure["reason"] == reason
+        for failure in result["failures"]
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["server_kwargs", "source_identity", "device_identity", "runtime_provenance"],
+)
+def test_paired_performance_qualification_requires_matching_identity(field):
+    reference_first = _paired_performance_report("reference-first")
+    candidate_first = _paired_performance_report("candidate-first")
+    candidate_first[field] = copy.deepcopy(candidate_first[field])
+    candidate_first[field]["mismatch"] = True
+
+    result = aggregate_paired_performance_reports(
+        reference_first, candidate_first
+    )
+
+    assert result["passed"] is False
+    mismatch = next(
+        failure
+        for failure in result["failures"]
+        if failure["report"] == "paired" and failure["field"] == field
+    )
+    assert mismatch["reason"] == "paired_value_mismatch"
+    assert mismatch["reference_first_sha256"] != mismatch[
+        "candidate_first_sha256"
+    ]
+
+
+def test_paired_performance_qualification_requires_device_uuid():
+    reference_first = _paired_performance_report("reference-first")
+    reference_first["device_identity"]["uuid"] = None
+
+    result = aggregate_paired_performance_reports(
+        reference_first,
+        _paired_performance_report("candidate-first"),
+    )
+
+    assert result["passed"] is False
+    assert any(
+        failure["report"] == "reference_first"
+        and failure["field"] == "device_identity.uuid"
+        and failure["reason"] == "physical_device_uuid_required"
+        for failure in result["failures"]
+    )

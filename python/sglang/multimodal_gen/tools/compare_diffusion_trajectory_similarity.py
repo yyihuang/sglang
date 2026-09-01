@@ -24,11 +24,15 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
+import importlib
 import itertools
 import json
 import math
 import os
+import platform
 import statistics
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -48,6 +52,69 @@ MODEL_QUALIFICATION_THRESHOLDS = {
     "repeatability_rtol": 0.0,
     "speedup_min": 1.0,
 }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_revision_for_file(path: Path) -> str | None:
+    for directory in (path.parent, *path.parents):
+        if not (directory / ".git").exists():
+            continue
+        try:
+            return subprocess.check_output(
+                ["git", "-C", str(directory), "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+    return None
+
+
+def _module_source_identity(module_name: str) -> dict[str, Any]:
+    module = importlib.import_module(module_name)
+    module_file_value = getattr(module, "__file__", None)
+    if not module_file_value:
+        raise RuntimeError(f"Cannot resolve the source file for {module_name}.")
+    module_file = Path(module_file_value).resolve()
+    return {
+        "module": module_name,
+        "module_file": str(module_file),
+        "module_file_sha256": _sha256_file(module_file),
+        "git_revision": _git_revision_for_file(module_file),
+        "version": getattr(module, "__version__", None),
+    }
+
+
+def collect_report_provenance() -> dict[str, Any]:
+    """Bind a paired report to its source, runtime, and physical CUDA device."""
+    device_index = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device_index)
+    device_uuid = getattr(properties, "uuid", None)
+    return {
+        "source_identity": {
+            "sglang": _module_source_identity("sglang"),
+            "flashinfer": _module_source_identity("flashinfer"),
+        },
+        "device_identity": {
+            "index": device_index,
+            "name": properties.name,
+            "compute_capability": [properties.major, properties.minor],
+            "total_memory_bytes": properties.total_memory,
+            "uuid": str(device_uuid) if device_uuid is not None else None,
+        },
+        "runtime_provenance": {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+        },
+    }
 
 
 def parse_component_overrides(entries: Sequence[str] | None) -> dict[str, str]:
@@ -1103,8 +1170,10 @@ def main() -> None:
     candidate_run = runs["candidate"]
     reference = reference_run["result"]
     candidate = candidate_run["result"]
+    report_provenance = collect_report_provenance()
 
     result = {
+        "schema_version": 2,
         "model_path": args.model_path,
         "prompt": args.prompt,
         "seed": args.seed,
@@ -1112,6 +1181,11 @@ def main() -> None:
         "measure_runs": args.measure_runs,
         "comparison_mode": args.comparison_mode,
         "run_order": args.run_order,
+        "trajectory_capture_enabled": bool(
+            ref_sampling_kwargs["return_trajectory_latents"]
+            or cand_sampling_kwargs["return_trajectory_latents"]
+        ),
+        **report_provenance,
         "server_kwargs": {
             "reference": ref_server_kwargs,
             "candidate": cand_server_kwargs,
