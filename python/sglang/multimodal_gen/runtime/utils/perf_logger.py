@@ -54,6 +54,7 @@ class RequestMetrics:
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
         self.wan_hybrid_hit_count: int = 0
+        self.wan_hybrid_teacher_forced_blocks: list[dict[str, Any]] = []
         self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
@@ -87,6 +88,9 @@ class RequestMetrics:
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
             "wan_hybrid_hit_count": self.wan_hybrid_hit_count,
+            "wan_hybrid_teacher_forced_blocks": (
+                self.wan_hybrid_teacher_forced_blocks
+            ),
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()

@@ -14,8 +14,9 @@ from sglang.multimodal_gen.tools.aggregate_diffusion_attention_performance impor
 from sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity import (
     MODEL_QUALIFICATION_THRESHOLDS,
     _cosine_similarity,
-    _extract_wan_hybrid_hit_count,
     _extract_generation_time_s,
+    _extract_wan_hybrid_hit_count,
+    _extract_wan_hybrid_teacher_forced_blocks,
     _with_candidate_backend_hit_qualification,
     build_sampling_kwargs,
     build_server_kwargs,
@@ -169,6 +170,31 @@ def test_request_metrics_transports_wan_hybrid_hit_count():
     assert metrics.to_dict()["wan_hybrid_hit_count"] == 0
     metrics.wan_hybrid_hit_count = 11
     assert metrics.to_dict()["wan_hybrid_hit_count"] == 11
+
+
+def test_request_metrics_transports_teacher_forced_block_metrics():
+    metrics = RequestMetrics("request")
+    block_metric = {
+        "block_index": 7,
+        "timestep": 999.0,
+        "attention_output": {"mae": 0.01},
+        "post_residual": {"mae": 0.001},
+    }
+    metrics.wan_hybrid_teacher_forced_blocks.append(block_metric)
+    serialized = metrics.to_dict()
+
+    assert serialized["wan_hybrid_teacher_forced_blocks"] == [block_metric]
+    assert _extract_wan_hybrid_teacher_forced_blocks(
+        SimpleNamespace(metrics=serialized)
+    ) == [block_metric]
+
+
+def test_extract_teacher_forced_block_metrics_rejects_malformed_values():
+    for blocks in (None, {}, [1]):
+        result = SimpleNamespace(
+            metrics={"wan_hybrid_teacher_forced_blocks": blocks}
+        )
+        assert _extract_wan_hybrid_teacher_forced_blocks(result) is None
 
 
 def _generation_result(latent_offset=0.0, frame_offset=0):

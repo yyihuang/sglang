@@ -906,6 +906,20 @@ def _extract_wan_hybrid_hit_count(result: Any) -> int | None:
     return hit_count
 
 
+def _extract_wan_hybrid_teacher_forced_blocks(
+    result: Any,
+) -> list[dict[str, Any]] | None:
+    metrics = getattr(result, "metrics", None)
+    if not isinstance(metrics, dict):
+        return None
+    blocks = metrics.get("wan_hybrid_teacher_forced_blocks")
+    if not isinstance(blocks, list) or not all(
+        isinstance(block, dict) for block in blocks
+    ):
+        return None
+    return blocks
+
+
 def _extract_generation_time_s(result: Any) -> float:
     """Return a populated end-to-end generation duration.
 
@@ -994,6 +1008,10 @@ def run_variant(
         for hit_count in wan_hybrid_hit_counts
         if hit_count is not None
     ]
+    wan_hybrid_teacher_forced_blocks = [
+        _extract_wan_hybrid_teacher_forced_blocks(result)
+        for result in measured_results
+    ]
 
     return {
         "result": final_result,
@@ -1024,6 +1042,14 @@ def run_variant(
             else None
         ),
         "per_run_wan_hybrid_hit_count": wan_hybrid_hit_counts,
+        "wan_hybrid_teacher_forced_blocks": (
+            wan_hybrid_teacher_forced_blocks[-1]
+            if wan_hybrid_teacher_forced_blocks
+            else None
+        ),
+        "per_run_wan_hybrid_teacher_forced_blocks": (
+            wan_hybrid_teacher_forced_blocks
+        ),
     }
 
 
@@ -1353,6 +1379,12 @@ def main() -> None:
         "candidate_per_run_wan_hybrid_hit_count": result["candidate_generation"][
             "per_run_wan_hybrid_hit_count"
         ],
+        "candidate_teacher_forced_block_count": len(
+            result["candidate_generation"][
+                "wan_hybrid_teacher_forced_blocks"
+            ]
+            or []
+        ),
         **result["performance"],
         "qualification_passed": result["qualification"]["passed"],
         "qualification_failures": result["qualification"]["failures"],

@@ -107,6 +107,26 @@ model-level correctness claim. The
 diagnostic gates. A run is not a valid hybrid qualification unless its reported
 `wan_hybrid_hit_count` is greater than zero.
 
+To localize per-block error without allowing it to compound through the model,
+enable the trajectory-only teacher-forced comparison on the candidate:
+
+```bash
+--candidate-attention-backend-config '{
+  "wan_hybrid_teacher_forced_compare": true,
+  "wan_hybrid_teacher_forced_timestep": 999,
+  "wan_hybrid_layer_indices": [0, 1, 2]
+}'
+```
+
+At the selected timestep (999 by default), each selected self-attention block
+runs FA and Wan from the same post-RMSNorm/post-RoPE Q/K/V. FA supplies the live
+hidden state for the next block; Wan is a shadow computation only. Request
+metrics and the trajectory comparison report record cosine similarity, MAE,
+maximum absolute error, finiteness, and exact-match status for the raw attention
+output and the self-attention post-residual state. The option is inactive when
+trajectory capture is disabled, so performance and production routing are
+unchanged.
+
 ### Component residency
 
 Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each

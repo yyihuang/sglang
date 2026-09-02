@@ -114,6 +114,29 @@ def _validate_wan_hybrid_layer_indices(
     return frozenset(indices)
 
 
+def _validate_wan_hybrid_teacher_forced_compare(value: Any) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("wan_hybrid_teacher_forced_compare must be a boolean")
+    return value
+
+
+def _validate_wan_hybrid_teacher_forced_timestep(value: Any) -> float:
+    if value is None:
+        return 999.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "wan_hybrid_teacher_forced_timestep must be a finite number"
+        )
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1000.0:
+        raise ValueError(
+            "wan_hybrid_teacher_forced_timestep must be within [0, 1000]"
+        )
+    return value
+
+
 def _use_wan_hybrid_for_timestep(
     timestep: torch.Tensor, min_timestep: float | None
 ) -> bool:
@@ -122,6 +145,91 @@ def _use_wan_hybrid_for_timestep(
     if timestep.numel() == 0:
         raise ValueError("Wan timestep tensor must not be empty")
     return bool(torch.amin(timestep).item() >= min_timestep)
+
+
+def _is_wan_hybrid_teacher_forced_timestep(
+    timestep: torch.Tensor, target_timestep: float
+) -> bool:
+    if timestep.numel() == 0:
+        raise ValueError("Wan timestep tensor must not be empty")
+    return bool(torch.all(timestep == target_timestep).item())
+
+
+def _run_wan_hybrid_teacher_forced_attention(
+    reference_attention: nn.Module,
+    candidate_attention: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run FA and Wan on the same post-normalization/post-RoPE Q/K/V."""
+    reference_output = reference_attention(query, key, value)
+    candidate_output = candidate_attention(query, key, value)
+    return reference_output, candidate_output
+
+
+def _wan_hybrid_teacher_forced_tensor_metrics(
+    reference: torch.Tensor, candidate: torch.Tensor
+) -> dict[str, Any]:
+    reference_float = reference.detach().float()
+    candidate_float = candidate.detach().float()
+    diff = candidate_float - reference_float
+    reference_flat = reference_float.reshape(-1)
+    candidate_flat = candidate_float.reshape(-1)
+    reference_norm = torch.linalg.vector_norm(reference_flat)
+    candidate_norm = torch.linalg.vector_norm(candidate_flat)
+    reference_norm_value = float(reference_norm.item())
+    candidate_norm_value = float(candidate_norm.item())
+    if reference_norm_value == 0.0 and candidate_norm_value == 0.0:
+        cosine_similarity = 1.0
+    elif reference_norm_value == 0.0 or candidate_norm_value == 0.0:
+        cosine_similarity = 0.0
+    else:
+        cosine_similarity = float(
+            torch.dot(reference_flat, candidate_flat)
+            .div(reference_norm * candidate_norm)
+            .item()
+        )
+        cosine_similarity = max(-1.0, min(1.0, cosine_similarity))
+    return {
+        "cosine_similarity": cosine_similarity,
+        "mae": float(diff.abs().mean().item()),
+        "max_abs": float(diff.abs().max().item()),
+        "finite": bool(
+            torch.isfinite(reference_float).all().item()
+            and torch.isfinite(candidate_float).all().item()
+        ),
+        "exact_match": bool(torch.equal(reference, candidate)),
+    }
+
+
+def _record_wan_hybrid_teacher_forced_metrics(
+    *,
+    block_index: int,
+    timestep: float,
+    reference_attention_output: torch.Tensor,
+    candidate_attention_output: torch.Tensor,
+    reference_post_residual: torch.Tensor,
+    candidate_post_residual: torch.Tensor,
+) -> None:
+    forward_batch = get_forward_context().forward_batch
+    if forward_batch is None or forward_batch.metrics is None:
+        raise RuntimeError(
+            "Wan teacher-forced comparison requires request metrics"
+        )
+    forward_batch.metrics.wan_hybrid_teacher_forced_blocks.append(
+        {
+            "block_index": block_index,
+            "timestep": timestep,
+            "cfg_negative": bool(forward_batch.is_cfg_negative),
+            "attention_output": _wan_hybrid_teacher_forced_tensor_metrics(
+                reference_attention_output, candidate_attention_output
+            ),
+            "post_residual": _wan_hybrid_teacher_forced_tensor_metrics(
+                reference_post_residual, candidate_post_residual
+            ),
+        }
+    )
 
 
 def _wan_cross_attention_backends(
@@ -482,6 +590,8 @@ class WanTransformerBlock(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
+        self.wan_hybrid_block_index = -1
+        self.wan_hybrid_teacher_forced_timestep = 999.0
 
         # 1. Self-attention
         self.norm1 = LayerNormScaleShift(
@@ -638,6 +748,7 @@ class WanTransformerBlock(nn.Module):
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
         use_wan_hybrid: bool = True,
+        teacher_forced_compare: bool = False,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -736,29 +847,65 @@ class WanTransformerBlock(nn.Module):
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attention = (
-            self.attn1
-            if use_wan_hybrid
-            else self.attn1_fallback
-            if self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
-            else self.attn1
-        )
-        assert attention is not None
-        attn_output = attention(query, key, value)
+        candidate_attention_output = None
+        if teacher_forced_compare:
+            assert use_wan_hybrid
+            assert self.attn1_fallback is not None
+            reference_attention_output, candidate_attention_output = (
+                _run_wan_hybrid_teacher_forced_attention(
+                    self.attn1_fallback, self.attn1, query, key, value
+                )
+            )
+            attn_output = reference_attention_output
+        else:
+            attention = (
+                self.attn1
+                if use_wan_hybrid
+                else self.attn1_fallback
+                if self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
+                else self.attn1
+            )
+            assert attention is not None
+            attn_output = attention(query, key, value)
 
-        attn_output = attn_output.flatten(2)
-        attn_output, _ = self.to_out(attn_output)
+        reference_attention_output = attn_output
+        attn_output, _ = self.to_out(attn_output.flatten(2))
         attn_output = attn_output.squeeze(1)
 
         null_shift = null_scale = torch.zeros(
             (1,), device=hidden_states.device, dtype=hidden_states.dtype
         )
+        pre_self_attn_hidden_states = hidden_states
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
+            pre_self_attn_hidden_states,
+            attn_output,
+            gate_msa,
+            null_shift,
+            null_scale,
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
         ), hidden_states.to(orig_dtype)
+        if teacher_forced_compare:
+            assert candidate_attention_output is not None
+            candidate_attn_output, _ = self.to_out(
+                candidate_attention_output.flatten(2)
+            )
+            _, candidate_post_residual = self.self_attn_residual_norm(
+                pre_self_attn_hidden_states,
+                candidate_attn_output.squeeze(1),
+                gate_msa,
+                null_shift,
+                null_scale,
+            )
+            _record_wan_hybrid_teacher_forced_metrics(
+                block_index=self.wan_hybrid_block_index,
+                timestep=self.wan_hybrid_teacher_forced_timestep,
+                reference_attention_output=reference_attention_output,
+                candidate_attention_output=candidate_attention_output,
+                reference_post_residual=hidden_states,
+                candidate_post_residual=candidate_post_residual.to(orig_dtype),
+            )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -1066,6 +1213,16 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             attention_backend_config.get("wan_hybrid_layer_indices"),
             config.num_layers,
         )
+        self.wan_hybrid_teacher_forced_compare = (
+            _validate_wan_hybrid_teacher_forced_compare(
+                attention_backend_config.get("wan_hybrid_teacher_forced_compare")
+            )
+        )
+        self.wan_hybrid_teacher_forced_timestep = (
+            _validate_wan_hybrid_teacher_forced_timestep(
+                attention_backend_config.get("wan_hybrid_teacher_forced_timestep")
+            )
+        )
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -1110,6 +1267,12 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 for i in range(config.num_layers)
             ]
         )
+        for block_index, block in enumerate(self.blocks):
+            if isinstance(block, WanTransformerBlock):
+                block.wan_hybrid_block_index = block_index
+                block.wan_hybrid_teacher_forced_timestep = (
+                    self.wan_hybrid_teacher_forced_timestep
+                )
         uses_wan_hybrid = any(
             getattr(getattr(block, "attn1", None), "backend", None)
             == AttentionBackendEnum.WAN_HYBRID
@@ -1120,6 +1283,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             # component. Avoid a needless timestep device synchronization.
             self.wan_hybrid_min_timestep = None
             self.wan_hybrid_layer_indices = None
+            self.wan_hybrid_teacher_forced_compare = False
         else:
             route_parts = []
             if self.wan_hybrid_min_timestep is not None:
@@ -1225,6 +1389,14 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         orig_dtype = hidden_states.dtype
         use_wan_hybrid = _use_wan_hybrid_for_timestep(
             timestep, self.wan_hybrid_min_timestep
+        )
+        teacher_forced_compare = bool(
+            self.wan_hybrid_teacher_forced_compare
+            and forward_batch is not None
+            and forward_batch.return_trajectory_latents
+            and _is_wan_hybrid_teacher_forced_timestep(
+                timestep, self.wan_hybrid_teacher_forced_timestep
+            )
         )
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -1384,10 +1556,13 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             for block_index, block in enumerate(self.blocks):
                 block_kwargs = {"rope_cos_sin_cache": rope_cos_sin_cache}
                 if isinstance(block, WanTransformerBlock):
-                    block_kwargs["use_wan_hybrid"] = use_wan_hybrid and (
+                    block_use_wan_hybrid = use_wan_hybrid and (
                         self.wan_hybrid_layer_indices is None
                         or block_index in self.wan_hybrid_layer_indices
                     )
+                    block_kwargs["use_wan_hybrid"] = block_use_wan_hybrid
+                    if teacher_forced_compare and block_use_wan_hybrid:
+                        block_kwargs["teacher_forced_compare"] = True
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states,

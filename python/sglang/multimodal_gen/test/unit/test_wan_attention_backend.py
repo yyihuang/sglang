@@ -8,9 +8,14 @@ from torch import nn
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanSelfAttention,
     WanTransformer3DModel,
+    _is_wan_hybrid_teacher_forced_timestep,
+    _run_wan_hybrid_teacher_forced_attention,
     _use_wan_hybrid_for_timestep,
     _validate_wan_hybrid_layer_indices,
     _validate_wan_hybrid_min_timestep,
+    _validate_wan_hybrid_teacher_forced_compare,
+    _validate_wan_hybrid_teacher_forced_timestep,
+    _wan_hybrid_teacher_forced_tensor_metrics,
     _wan_cross_attention_backends,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -42,6 +47,71 @@ class TestWanAttentionBackendRole(unittest.TestCase):
         for invalid in (True, 1, "0", [False], [1.0], [-1], [40], [3, 3]):
             with self.subTest(invalid=invalid), pytest.raises(ValueError):
                 _validate_wan_hybrid_layer_indices(invalid, 40)
+
+    def test_wan_hybrid_teacher_forced_config_validation(self):
+        self.assertFalse(_validate_wan_hybrid_teacher_forced_compare(None))
+        self.assertTrue(_validate_wan_hybrid_teacher_forced_compare(True))
+        for invalid in (0, 1, "true", []):
+            with self.subTest(invalid=invalid), pytest.raises(ValueError):
+                _validate_wan_hybrid_teacher_forced_compare(invalid)
+
+        self.assertEqual(_validate_wan_hybrid_teacher_forced_timestep(None), 999.0)
+        self.assertEqual(_validate_wan_hybrid_teacher_forced_timestep(750), 750.0)
+        for invalid in (True, "999", -1, 1001, float("inf")):
+            with self.subTest(invalid=invalid), pytest.raises(ValueError):
+                _validate_wan_hybrid_teacher_forced_timestep(invalid)
+
+    def test_wan_hybrid_teacher_forced_timestep_requires_exact_match(self):
+        self.assertTrue(
+            _is_wan_hybrid_teacher_forced_timestep(torch.tensor([999]), 999.0)
+        )
+        self.assertFalse(
+            _is_wan_hybrid_teacher_forced_timestep(torch.tensor([998]), 999.0)
+        )
+        self.assertFalse(
+            _is_wan_hybrid_teacher_forced_timestep(
+                torch.tensor([999, 998]), 999.0
+            )
+        )
+
+    def test_teacher_forced_attention_shares_qkv_and_keeps_fa_live(self):
+        calls = []
+
+        class Attention(nn.Module):
+            def __init__(self, offset):
+                super().__init__()
+                self.offset = offset
+
+            def forward(self, query, key, value):
+                calls.append((query, key, value))
+                return value + self.offset
+
+        query = torch.randn(1, 2, 1, 4)
+        key = torch.randn(1, 2, 1, 4)
+        value = torch.randn(1, 2, 1, 4)
+        fa_output, wan_output = _run_wan_hybrid_teacher_forced_attention(
+            Attention(0.0), Attention(1.0), query, key, value
+        )
+
+        self.assertIs(calls[0][0], query)
+        self.assertIs(calls[0][1], key)
+        self.assertIs(calls[0][2], value)
+        self.assertIs(calls[1][0], query)
+        self.assertIs(calls[1][1], key)
+        self.assertIs(calls[1][2], value)
+        torch.testing.assert_close(fa_output, value)
+        torch.testing.assert_close(wan_output, value + 1.0)
+
+    def test_teacher_forced_tensor_metrics_report_local_error(self):
+        reference = torch.tensor([1.0, 2.0, 3.0])
+        candidate = torch.tensor([1.0, 2.5, 2.0])
+
+        metrics = _wan_hybrid_teacher_forced_tensor_metrics(reference, candidate)
+
+        self.assertAlmostEqual(metrics["mae"], 0.5)
+        self.assertEqual(metrics["max_abs"], 1.0)
+        self.assertTrue(metrics["finite"])
+        self.assertFalse(metrics["exact_match"])
 
     def test_wan_hybrid_is_admitted_for_wan_self_attention_only(self):
         self.assertIn(
