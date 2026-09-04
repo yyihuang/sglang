@@ -95,7 +95,8 @@ class TestWanAttentionBackendRole(unittest.TestCase):
         query = torch.randn(1, 2, 1, 4)
         key = torch.randn(1, 2, 1, 4)
         value = torch.randn(1, 2, 1, 4)
-        stream = SimpleNamespace(cuda_stream=123)
+        # CUDA's default stream has the valid null handle 0.
+        stream = SimpleNamespace(cuda_stream=0)
         properties = SimpleNamespace(
             name="B200",
             uuid="device-uuid",
@@ -159,7 +160,7 @@ class TestWanAttentionBackendRole(unittest.TestCase):
             self.assertIs(observed_q, query)
             self.assertIs(observed_k, key)
             self.assertIs(observed_v, value)
-        self.assertEqual(record["stream"], 123)
+        self.assertEqual(record["stream"], 0)
         self.assertEqual(record["query_id"], id(query))
         self.assertEqual(record["key_id"], id(key))
         self.assertEqual(record["value_id"], id(value))
