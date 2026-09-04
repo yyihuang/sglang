@@ -164,17 +164,35 @@ def _is_wan_hybrid_teacher_forced_timestep(
     return bool(torch.all(timestep == target_timestep).item())
 
 
+def _use_wan_hybrid_for_request_timestep(
+    timestep: torch.Tensor,
+    min_timestep: float | None,
+    *,
+    teacher_forced_request: bool,
+    teacher_forced_timestep: float,
+) -> bool:
+    """Select the candidate route without contaminating teacher-forced inputs."""
+    if teacher_forced_request:
+        return _is_wan_hybrid_teacher_forced_timestep(
+            timestep, teacher_forced_timestep
+        )
+    return _use_wan_hybrid_for_timestep(timestep, min_timestep)
+
+
 def _run_wan_hybrid_teacher_forced_attention(
     reference_attention: nn.Module,
     candidate_attention: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run FA and Wan on the same post-normalization/post-RoPE Q/K/V."""
     reference_output = reference_attention(query, key, value)
-    candidate_output = candidate_attention(query, key, value)
-    return reference_output, candidate_output
+    # The serving backend reuses its caller-owned output buffer. Preserve the
+    # first result before the repeat launch overwrites that buffer.
+    candidate_output = candidate_attention(query, key, value).clone()
+    candidate_repeat_output = candidate_attention(query, key, value)
+    return reference_output, candidate_output, candidate_repeat_output
 
 
 def _bench_wan_hybrid_attention(fn):
@@ -415,6 +433,9 @@ def _wan_hybrid_teacher_forced_tensor_metrics(
             torch.isfinite(reference_float).all().item()
             and torch.isfinite(candidate_float).all().item()
         ),
+        "within_tolerance": bool(
+            torch.allclose(reference, candidate, atol=1.0, rtol=0.1)
+        ),
         "exact_match": bool(torch.equal(reference, candidate)),
     }
 
@@ -425,8 +446,11 @@ def _record_wan_hybrid_teacher_forced_metrics(
     timestep: float,
     reference_attention_output: torch.Tensor,
     candidate_attention_output: torch.Tensor,
+    candidate_attention_repeat_output: torch.Tensor,
     reference_post_residual: torch.Tensor,
     candidate_post_residual: torch.Tensor,
+    candidate_post_residual_repeat: torch.Tensor,
+    actual_timestep: torch.Tensor,
 ) -> None:
     forward_batch = get_forward_context().forward_batch
     if forward_batch is None or forward_batch.metrics is None:
@@ -437,6 +461,8 @@ def _record_wan_hybrid_teacher_forced_metrics(
         {
             "block_index": block_index,
             "timestep": timestep,
+            "actual_timestep": float(torch.amin(actual_timestep).item()),
+            "denoising_step_index": get_forward_context().current_timestep,
             "cfg_negative": bool(forward_batch.is_cfg_negative),
             "attention_output": _wan_hybrid_teacher_forced_tensor_metrics(
                 reference_attention_output, candidate_attention_output
@@ -444,6 +470,16 @@ def _record_wan_hybrid_teacher_forced_metrics(
             "post_residual": _wan_hybrid_teacher_forced_tensor_metrics(
                 reference_post_residual, candidate_post_residual
             ),
+            "candidate_repeatability": {
+                "attention_output": _wan_hybrid_teacher_forced_tensor_metrics(
+                    candidate_attention_output,
+                    candidate_attention_repeat_output,
+                ),
+                "post_residual": _wan_hybrid_teacher_forced_tensor_metrics(
+                    candidate_post_residual,
+                    candidate_post_residual_repeat,
+                ),
+            },
         }
     )
 
@@ -1065,7 +1101,7 @@ class WanTransformerBlock(nn.Module):
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        candidate_attention_output = None
+        candidate_attention_output = candidate_attention_repeat_output = None
         forward_batch = (
             get_forward_context().forward_batch
             if wan_hybrid_abba_benchmark
@@ -1111,10 +1147,12 @@ class WanTransformerBlock(nn.Module):
         if teacher_forced_compare:
             assert use_wan_hybrid
             assert self.attn1_fallback is not None
-            reference_attention_output, candidate_attention_output = (
-                _run_wan_hybrid_teacher_forced_attention(
-                    self.attn1_fallback, self.attn1, query, key, value
-                )
+            (
+                reference_attention_output,
+                candidate_attention_output,
+                candidate_attention_repeat_output,
+            ) = _run_wan_hybrid_teacher_forced_attention(
+                self.attn1_fallback, self.attn1, query, key, value
             )
             attn_output = reference_attention_output
         elif not run_abba_benchmark:
@@ -1148,6 +1186,8 @@ class WanTransformerBlock(nn.Module):
         ), hidden_states.to(orig_dtype)
         if teacher_forced_compare:
             assert candidate_attention_output is not None
+            assert candidate_attention_repeat_output is not None
+            assert wan_hybrid_timestep is not None
             candidate_attn_output, _ = self.to_out(
                 candidate_attention_output.flatten(2)
             )
@@ -1158,13 +1198,28 @@ class WanTransformerBlock(nn.Module):
                 null_shift,
                 null_scale,
             )
+            candidate_attn_repeat_output, _ = self.to_out(
+                candidate_attention_repeat_output.flatten(2)
+            )
+            _, candidate_post_residual_repeat = self.self_attn_residual_norm(
+                pre_self_attn_hidden_states,
+                candidate_attn_repeat_output.squeeze(1),
+                gate_msa,
+                null_shift,
+                null_scale,
+            )
             _record_wan_hybrid_teacher_forced_metrics(
                 block_index=self.wan_hybrid_block_index,
                 timestep=self.wan_hybrid_teacher_forced_timestep,
                 reference_attention_output=reference_attention_output,
                 candidate_attention_output=candidate_attention_output,
+                candidate_attention_repeat_output=candidate_attention_repeat_output,
                 reference_post_residual=hidden_states,
                 candidate_post_residual=candidate_post_residual.to(orig_dtype),
+                candidate_post_residual_repeat=candidate_post_residual_repeat.to(
+                    orig_dtype
+                ),
+                actual_timestep=wan_hybrid_timestep,
             )
 
         # 2. Cross-attention
@@ -1665,13 +1720,19 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         orig_dtype = hidden_states.dtype
-        use_wan_hybrid = _use_wan_hybrid_for_timestep(
-            timestep, self.wan_hybrid_min_timestep
-        )
-        teacher_forced_compare = bool(
+        teacher_forced_request = bool(
             self.wan_hybrid_teacher_forced_compare
             and forward_batch is not None
             and forward_batch.return_trajectory_latents
+        )
+        use_wan_hybrid = _use_wan_hybrid_for_request_timestep(
+            timestep,
+            self.wan_hybrid_min_timestep,
+            teacher_forced_request=teacher_forced_request,
+            teacher_forced_timestep=self.wan_hybrid_teacher_forced_timestep,
+        )
+        teacher_forced_compare = bool(
+            teacher_forced_request
             and _is_wan_hybrid_teacher_forced_timestep(
                 timestep, self.wan_hybrid_teacher_forced_timestep
             )
@@ -1834,8 +1895,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             for block_index, block in enumerate(self.blocks):
                 block_kwargs = {"rope_cos_sin_cache": rope_cos_sin_cache}
                 if isinstance(block, WanTransformerBlock):
-                    if abba_benchmark:
+                    if abba_benchmark or teacher_forced_request:
                         block_kwargs["wan_hybrid_timestep"] = timestep
+                    if abba_benchmark:
                         block_kwargs["wan_hybrid_abba_benchmark"] = True
                     block_use_wan_hybrid = use_wan_hybrid and (
                         self.wan_hybrid_layer_indices is None

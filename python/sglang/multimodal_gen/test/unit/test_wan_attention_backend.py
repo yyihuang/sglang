@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     _is_wan_hybrid_teacher_forced_timestep,
     _run_wan_hybrid_abba_benchmark,
     _run_wan_hybrid_teacher_forced_attention,
+    _use_wan_hybrid_for_request_timestep,
     _use_wan_hybrid_for_timestep,
     _validate_wan_hybrid_abba_activity,
     _validate_wan_hybrid_layer_indices,
@@ -252,6 +253,37 @@ class TestWanAttentionBackendRole(unittest.TestCase):
             )
         )
 
+    def test_teacher_forced_request_routes_only_the_exact_timestep(self):
+        for timestep in (999, 937, 214):
+            with self.subTest(timestep=timestep):
+                self.assertEqual(
+                    _use_wan_hybrid_for_request_timestep(
+                        torch.tensor([timestep]),
+                        214.0,
+                        teacher_forced_request=True,
+                        teacher_forced_timestep=937.0,
+                    ),
+                    timestep == 937,
+                )
+
+    def test_non_teacher_forced_request_preserves_threshold_routing(self):
+        self.assertTrue(
+            _use_wan_hybrid_for_request_timestep(
+                torch.tensor([999]),
+                937.0,
+                teacher_forced_request=False,
+                teacher_forced_timestep=937.0,
+            )
+        )
+        self.assertFalse(
+            _use_wan_hybrid_for_request_timestep(
+                torch.tensor([899]),
+                937.0,
+                teacher_forced_request=False,
+                teacher_forced_timestep=937.0,
+            )
+        )
+
     def test_teacher_forced_attention_shares_qkv_and_keeps_fa_live(self):
         calls = []
 
@@ -267,8 +299,10 @@ class TestWanAttentionBackendRole(unittest.TestCase):
         query = torch.randn(1, 2, 1, 4)
         key = torch.randn(1, 2, 1, 4)
         value = torch.randn(1, 2, 1, 4)
-        fa_output, wan_output = _run_wan_hybrid_teacher_forced_attention(
-            Attention(0.0), Attention(1.0), query, key, value
+        fa_output, wan_output, wan_repeat_output = (
+            _run_wan_hybrid_teacher_forced_attention(
+                Attention(0.0), Attention(1.0), query, key, value
+            )
         )
 
         self.assertIs(calls[0][0], query)
@@ -277,8 +311,39 @@ class TestWanAttentionBackendRole(unittest.TestCase):
         self.assertIs(calls[1][0], query)
         self.assertIs(calls[1][1], key)
         self.assertIs(calls[1][2], value)
+        self.assertIs(calls[2][0], query)
+        self.assertIs(calls[2][1], key)
+        self.assertIs(calls[2][2], value)
         torch.testing.assert_close(fa_output, value)
         torch.testing.assert_close(wan_output, value + 1.0)
+        torch.testing.assert_close(wan_repeat_output, value + 1.0)
+
+    def test_teacher_forced_repeat_preserves_reused_candidate_output(self):
+        class ReferenceAttention(nn.Module):
+            def forward(self, query, key, value):
+                return value
+
+        class ReusingAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.output = torch.zeros(1)
+                self.calls = 0
+
+            def forward(self, query, key, value):
+                self.calls += 1
+                return self.output.fill_(self.calls)
+
+        candidate = ReusingAttention()
+        _, first, second = _run_wan_hybrid_teacher_forced_attention(
+            ReferenceAttention(),
+            candidate,
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.zeros(1),
+        )
+
+        torch.testing.assert_close(first, torch.ones(1))
+        torch.testing.assert_close(second, torch.full((1,), 2.0))
 
     def test_teacher_forced_tensor_metrics_report_local_error(self):
         reference = torch.tensor([1.0, 2.0, 3.0])
@@ -289,6 +354,7 @@ class TestWanAttentionBackendRole(unittest.TestCase):
         self.assertAlmostEqual(metrics["mae"], 0.5)
         self.assertEqual(metrics["max_abs"], 1.0)
         self.assertTrue(metrics["finite"])
+        self.assertTrue(metrics["within_tolerance"])
         self.assertFalse(metrics["exact_match"])
 
     def test_wan_hybrid_is_admitted_for_wan_self_attention_only(self):
