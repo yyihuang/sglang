@@ -599,6 +599,7 @@ class SchedulerDisaggregationPrefillMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -638,6 +639,7 @@ class SchedulerDisaggregationPrefillMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -852,9 +854,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
                 if self.enable_overlap and not req.pending_bootstrap:
-                    assert (
-                        req.metadata_buffer_index >= 0
-                    ), f"Req {req.rid} does not have metadata buffer allocated"
+                    assert req.metadata_buffer_index >= 0, (
+                        f"Req {req.rid} does not have metadata buffer allocated"
+                    )
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
