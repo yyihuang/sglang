@@ -251,6 +251,10 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
+    # Run one in-worker, cold-L2 CUPTI comparison of co-resident Wan hybrid and
+    # FA4 self-attention on real post-RoPE Q/K/V. This diagnostic is deliberately
+    # request-scoped and participates in the dynamic-batch signature.
+    wan_hybrid_abba_benchmark: bool = False
     rollout_return_denoising_env: bool = (
         False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
     )
@@ -330,6 +334,12 @@ class SamplingParams:
 
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
+
+        if self.wan_hybrid_abba_benchmark:
+            # The benchmark records its own evidence in RequestMetrics. Keeping
+            # trajectory tensors would perturb the request being measured.
+            self.return_trajectory_latents = False
+            self.return_trajectory_decoded = False
 
         if self.width is None and self._default_width is not None:
             self.width = self._default_width
@@ -459,6 +469,9 @@ class SamplingParams:
                 f"quality must be one of {list(QUALITY_LEVELS)}, "
                 f"got {self.quality!r}"
             )
+
+        if not isinstance(self.wan_hybrid_abba_benchmark, bool):
+            raise ValueError("wan_hybrid_abba_benchmark must be a boolean")
 
         # These are always required to be sane regardless of pipeline.
         if (
@@ -1306,6 +1319,14 @@ class SamplingParams:
             "--return-trajectory-latents",
             action="store_true",
             help="Whether to return the trajectory",
+        )
+        add_argument(
+            "--wan-hybrid-abba-benchmark",
+            action="store_true",
+            help=(
+                "Run the request-scoped Wan hybrid versus FA4 paired benchmark. "
+                "Trajectory capture is disabled for this request."
+            ),
         )
 
         # Rollout arguments

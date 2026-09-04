@@ -2,12 +2,16 @@
 
 import argparse
 import copy
+import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    PerformanceLogger,
+    RequestMetrics,
+)
 from sglang.multimodal_gen.tools.aggregate_diffusion_attention_performance import (
     aggregate_paired_performance_reports,
 )
@@ -187,6 +191,48 @@ def test_request_metrics_transports_teacher_forced_block_metrics():
     assert _extract_wan_hybrid_teacher_forced_blocks(
         SimpleNamespace(metrics=serialized)
     ) == [block_metric]
+
+
+def test_request_metrics_transports_wan_hybrid_abba_evidence():
+    metrics = RequestMetrics("request")
+    evidence = {
+        "timing_primitive": "flashinfer.testing.bench_gpu_time",
+        "orders": {"candidate_fa4_fa4_candidate": {"speedup": 1.01}},
+    }
+    metrics.wan_hybrid_abba_benchmarks.append(evidence)
+
+    assert metrics.to_dict()["wan_hybrid_abba_benchmarks"] == [evidence]
+
+
+def test_benchmark_report_persists_wan_hybrid_abba_evidence(tmp_path):
+    metrics = RequestMetrics("request")
+    evidence = {"cfg_negative": False, "orders": {}}
+    metrics.wan_hybrid_abba_benchmarks.append(evidence)
+    report_path = tmp_path / "benchmark.json"
+
+    PerformanceLogger.dump_benchmark_report(str(report_path), metrics)
+
+    report = json.loads(report_path.read_text())
+    assert report["wan_hybrid_abba_benchmarks"] == [evidence]
+
+
+def test_performance_log_persists_wan_hybrid_abba_evidence(tmp_path, monkeypatch):
+    metrics = RequestMetrics("request")
+    evidence = {"cfg_negative": False, "orders": {}}
+    metrics.wan_hybrid_abba_benchmarks.append(evidence)
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.utils.perf_logger.get_is_main_process",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.utils.perf_logger.get_diffusion_perf_log_dir",
+        lambda: str(tmp_path),
+    )
+
+    PerformanceLogger.log_request_summary(metrics)
+
+    record = json.loads((tmp_path / "performance.log").read_text())
+    assert record["wan_hybrid_abba_benchmarks"] == [evidence]
 
 
 def test_extract_teacher_forced_block_metrics_rejects_malformed_values():

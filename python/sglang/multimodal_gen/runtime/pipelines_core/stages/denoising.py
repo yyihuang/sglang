@@ -152,6 +152,45 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 
 logger = init_logger(__name__)
 
+
+def _validate_wan_hybrid_abba_configuration(
+    batch: Req, server_args: ServerArgs
+) -> None:
+    if not getattr(batch, "wan_hybrid_abba_benchmark", False):
+        return
+    if server_args.enable_cfg_parallel and batch.do_classifier_free_guidance:
+        raise RuntimeError(
+            "Wan hybrid AB/BA benchmarking requires serial CFG so both "
+            "request-owned CFG-side records are available in one process"
+        )
+
+
+def _validate_wan_hybrid_abba_records(batch: Req) -> None:
+    """Require exactly one benchmark record for every request-local CFG side."""
+    if not getattr(batch, "wan_hybrid_abba_benchmark", False):
+        return
+    if batch.metrics is None:
+        raise RuntimeError("Wan hybrid AB/BA benchmarking requires request metrics")
+
+    records = batch.metrics.wan_hybrid_abba_benchmarks
+    expected_sides = {False, True} if batch.do_classifier_free_guidance else {False}
+    side_counts = {side: 0 for side in expected_sides}
+    for record in records:
+        side = record.get("cfg_negative") if isinstance(record, dict) else None
+        if not isinstance(side, bool) or side not in expected_sides:
+            raise RuntimeError(
+                "Wan hybrid AB/BA benchmarking emitted an invalid CFG-side record"
+            )
+        side_counts[side] += 1
+
+    if len(records) != len(expected_sides) or any(
+        count != 1 for count in side_counts.values()
+    ):
+        raise RuntimeError(
+            "Wan hybrid AB/BA benchmarking requires exactly one record per CFG "
+            f"side; expected {sorted(expected_sides)}, got {side_counts}"
+        )
+
 _QUALITY_FUSION_HANDLERS: tuple[
     tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
 ] = (
@@ -1354,6 +1393,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> None:
         """Finalize the shared loop by handing state to post-denoising processing."""
         self._log_cfg_gate_summary(ctx, batch)
+        if not ctx.is_warmup:
+            _validate_wan_hybrid_abba_records(batch)
         self._post_denoising_loop(
             batch=batch,
             latents=ctx.latents,
@@ -1667,6 +1708,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """
         Run the denoising loop.
         """
+        _validate_wan_hybrid_abba_configuration(batch, server_args)
         ctx = self._prepare_denoising_loop(batch, server_args)
         if batch.rollout:
             self._maybe_init_denoising_env_collection(

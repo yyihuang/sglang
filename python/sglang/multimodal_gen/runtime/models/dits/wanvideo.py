@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
+import statistics
 from functools import lru_cache
 from typing import Any
 
@@ -77,6 +79,13 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+
+_WAN_HYBRID_ABBA_WARMUP_ITERS = 2
+_WAN_HYBRID_ABBA_MEASURE_ITERS = 5
+_WAN_HYBRID_ABBA_ORDERS = {
+    "candidate_fa4_fa4_candidate": ("candidate", "fa4", "fa4", "candidate"),
+    "fa4_candidate_candidate_fa4": ("fa4", "candidate", "candidate", "fa4"),
+}
 
 
 def _validate_wan_hybrid_min_timestep(value: Any) -> float | None:
@@ -166,6 +175,213 @@ def _run_wan_hybrid_teacher_forced_attention(
     reference_output = reference_attention(query, key, value)
     candidate_output = candidate_attention(query, key, value)
     return reference_output, candidate_output
+
+
+def _bench_wan_hybrid_attention(fn):
+    """Run the reportable timing primitive only for the explicit AB/BA mode."""
+    from importlib.metadata import version as distribution_version
+
+    try:
+        from cupti import cupti as _cupti  # noqa: F401
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            "cupti-python is required for Wan hybrid AB/BA benchmarking"
+        ) from error
+
+    cupti_version = distribution_version("cupti-python")
+    if int(cupti_version.split(".", maxsplit=1)[0]) < 13:
+        raise RuntimeError(
+            "Wan hybrid AB/BA benchmarking requires cupti-python>=13, "
+            f"found {cupti_version}"
+        )
+
+    from flashinfer.testing import bench_gpu_time
+
+    activity_evidence = []
+    times_ms = [
+        float(sample)
+        for sample in bench_gpu_time(
+            fn=fn,
+            dry_run_iters=_WAN_HYBRID_ABBA_WARMUP_ITERS,
+            repeat_iters=_WAN_HYBRID_ABBA_MEASURE_ITERS,
+            enable_cupti=True,
+            use_cuda_graph=False,
+            cold_l2_cache=True,
+            cupti_activity_evidence=activity_evidence,
+        )
+    ]
+    if len(activity_evidence) != len(times_ms):
+        raise RuntimeError(
+            "Wan hybrid AB/BA CUPTI activity count does not match samples"
+        )
+    return times_ms, activity_evidence
+
+
+def _wan_hybrid_abba_timing_payload(
+    times_ms, activity_evidence
+) -> dict[str, Any]:
+    times_ms = [float(value) for value in times_ms]
+    if len(times_ms) != _WAN_HYBRID_ABBA_MEASURE_ITERS:
+        raise RuntimeError(
+            "Wan hybrid AB/BA benchmarking expected "
+            f"{_WAN_HYBRID_ABBA_MEASURE_ITERS} samples, got {len(times_ms)}"
+        )
+
+    return {
+        "backend": "cupti",
+        "requested_backend": "cupti",
+        "warmup_iters": _WAN_HYBRID_ABBA_WARMUP_ITERS,
+        "measure_iters": _WAN_HYBRID_ABBA_MEASURE_ITERS,
+        "cold_l2": True,
+        "times_ms": times_ms,
+        "median_ms": float(statistics.median(times_ms)),
+        "cupti_activity_evidence": {
+            "sample_count": len(activity_evidence),
+            "iterations": activity_evidence,
+        },
+    }
+
+
+def _validate_wan_hybrid_abba_activity(kind: str, activity_evidence) -> None:
+    expected_candidate_kernels = (
+        "kernel_wan_hybrid_quantize_value",
+        "kernel_wan_hybrid_attention",
+    )
+    for iteration in activity_evidence:
+        kernel_names = [
+            activity["name"] for activity in iteration["kernel_activities"]
+        ]
+        if kind == "candidate" and (
+            len(kernel_names) != len(expected_candidate_kernels)
+            or any(
+                expected not in actual
+                for expected, actual in zip(expected_candidate_kernels, kernel_names)
+            )
+        ):
+            raise RuntimeError(
+                "Wan hybrid candidate measurement must contain value "
+                "quantization followed by attention/materialization"
+            )
+        if kind == "fa4" and len(kernel_names) != 1:
+            raise RuntimeError(
+                "Wan hybrid production FA4 measurement must contain exactly "
+                "one kernel activity"
+            )
+
+
+def _wan_hybrid_abba_side_recorded(metrics, cfg_negative: bool) -> bool:
+    """Return whether this request already captured the current CFG side."""
+    return any(
+        isinstance(record, dict)
+        and record.get("cfg_negative") is bool(cfg_negative)
+        for record in metrics.wan_hybrid_abba_benchmarks
+    )
+
+
+def _run_wan_hybrid_abba_benchmark(
+    reference_attention: nn.Module,
+    candidate_attention: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Measure both paired orders on one live model state and keep Wan output."""
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        flash_attn as flash_attn_backend,
+    )
+
+    if flash_attn_backend.fa_ver != 4:
+        raise RuntimeError(
+            "Wan hybrid AB/BA benchmarking requires the co-resident FA fallback "
+            "to use FlashAttention 4"
+        )
+
+    if query.device != key.device or query.device != value.device:
+        raise RuntimeError("Wan hybrid AB/BA benchmark requires co-resident Q/K/V")
+    device_index = query.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    stream = torch.cuda.current_stream(query.device)
+    endpoints = {
+        "candidate": lambda: candidate_attention(query, key, value),
+        "fa4": lambda: reference_attention(query, key, value),
+    }
+    orders: dict[str, Any] = {}
+    for order_name, sequence in _WAN_HYBRID_ABBA_ORDERS.items():
+        arms = []
+        samples = {"candidate": [], "fa4": []}
+        for arm_index, kind in enumerate(sequence):
+            if (
+                torch.cuda.current_stream(query.device).cuda_stream
+                != stream.cuda_stream
+            ):
+                raise RuntimeError(
+                    "Wan hybrid AB/BA benchmark changed the current CUDA stream"
+                )
+            times_ms, activity_evidence = _bench_wan_hybrid_attention(
+                endpoints[kind]
+            )
+            _validate_wan_hybrid_abba_activity(kind, activity_evidence)
+            payload = _wan_hybrid_abba_timing_payload(
+                times_ms, activity_evidence
+            )
+            payload.update({"arm_index": arm_index, "kind": kind})
+            arms.append(payload)
+            samples[kind].extend(payload["times_ms"])
+        candidate_median_ms = float(statistics.median(samples["candidate"]))
+        fa4_median_ms = float(statistics.median(samples["fa4"]))
+        if sequence[0] == "candidate":
+            pairwise_speedups = [
+                arms[1]["median_ms"] / arms[0]["median_ms"],
+                arms[2]["median_ms"] / arms[3]["median_ms"],
+            ]
+        else:
+            pairwise_speedups = [
+                arms[0]["median_ms"] / arms[1]["median_ms"],
+                arms[3]["median_ms"] / arms[2]["median_ms"],
+            ]
+        orders[order_name] = {
+            "sequence": list(sequence),
+            "arms": arms,
+            "candidate_median_ms": candidate_median_ms,
+            "fa4_median_ms": fa4_median_ms,
+            "delta_ms": candidate_median_ms - fa4_median_ms,
+            "speedup": fa4_median_ms / candidate_median_ms,
+            "pairwise_arm_speedups": pairwise_speedups,
+        }
+
+    if torch.cuda.current_stream(query.device).cuda_stream != stream.cuda_stream:
+        raise RuntimeError("Wan hybrid AB/BA benchmark changed the current CUDA stream")
+
+    # Preserve the normal candidate request semantics after the diagnostic.
+    output = candidate_attention(query, key, value)
+    device_properties = torch.cuda.get_device_properties(device_index)
+    device_uuid = getattr(device_properties, "uuid", None)
+    return output, {
+        "schema_version": 1,
+        "timing_primitive": "flashinfer.testing.bench_gpu_time",
+        "warmup_iters": _WAN_HYBRID_ABBA_WARMUP_ITERS,
+        "measure_iters": _WAN_HYBRID_ABBA_MEASURE_ITERS,
+        "cold_l2": True,
+        "trajectory_capture_enabled": False,
+        "process_id": os.getpid(),
+        "device_index": device_index,
+        "device_name": device_properties.name,
+        "device_uuid": str(device_uuid) if device_uuid is not None else None,
+        "compute_capability": [device_properties.major, device_properties.minor],
+        "total_memory_bytes": device_properties.total_memory,
+        "stream": int(stream.cuda_stream),
+        "shape": list(query.shape),
+        "dtype": str(query.dtype),
+        "qkv_layout": "NHD",
+        "query_id": id(query),
+        "key_id": id(key),
+        "value_id": id(value),
+        "candidate_attention_id": id(candidate_attention),
+        "fa4_attention_id": id(reference_attention),
+        "output_backend": "candidate",
+        "orders": orders,
+    }
 
 
 def _wan_hybrid_teacher_forced_tensor_metrics(
@@ -747,6 +963,8 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
+        wan_hybrid_timestep: torch.Tensor | None = None,
+        wan_hybrid_abba_benchmark: bool = False,
         use_wan_hybrid: bool = True,
         teacher_forced_compare: bool = False,
     ) -> torch.Tensor:
@@ -848,6 +1066,48 @@ class WanTransformerBlock(nn.Module):
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
         candidate_attention_output = None
+        forward_batch = (
+            get_forward_context().forward_batch
+            if wan_hybrid_abba_benchmark
+            else None
+        )
+        run_abba_benchmark = bool(
+            use_wan_hybrid
+            and wan_hybrid_abba_benchmark
+            and forward_batch is not None
+            and forward_batch.metrics is not None
+            and not _wan_hybrid_abba_side_recorded(
+                forward_batch.metrics, forward_batch.is_cfg_negative
+            )
+        )
+        if run_abba_benchmark:
+            if (
+                forward_batch.return_trajectory_latents
+                or forward_batch.return_trajectory_decoded
+            ):
+                raise RuntimeError(
+                    "Wan hybrid AB/BA benchmarking requires trajectory capture off"
+                )
+            if self.attn1_fallback is None:
+                raise RuntimeError(
+                    "Wan hybrid AB/BA benchmarking requires a co-resident FA4 fallback"
+                )
+            attn_output, abba_record = _run_wan_hybrid_abba_benchmark(
+                self.attn1_fallback, self.attn1, query, key, value
+            )
+            abba_record.update(
+                {
+                    "block_index": self.wan_hybrid_block_index,
+                    "denoising_step_index": get_forward_context().current_timestep,
+                    "timestep": (
+                        float(torch.amin(wan_hybrid_timestep).item())
+                        if wan_hybrid_timestep is not None
+                        else None
+                    ),
+                    "cfg_negative": bool(forward_batch.is_cfg_negative),
+                }
+            )
+            forward_batch.metrics.wan_hybrid_abba_benchmarks.append(abba_record)
         if teacher_forced_compare:
             assert use_wan_hybrid
             assert self.attn1_fallback is not None
@@ -857,7 +1117,7 @@ class WanTransformerBlock(nn.Module):
                 )
             )
             attn_output = reference_attention_output
-        else:
+        elif not run_abba_benchmark:
             attention = (
                 self.attn1
                 if use_wan_hybrid
@@ -1278,6 +1538,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             == AttentionBackendEnum.WAN_HYBRID
             for block in self.blocks
         )
+        self.uses_wan_hybrid = uses_wan_hybrid
         if not uses_wan_hybrid:
             # Component-scoped FA models share the server configuration with the
             # component. Avoid a needless timestep device synchronization.
@@ -1375,6 +1636,23 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         **kwargs,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
+        abba_benchmark = bool(
+            forward_batch is not None
+            and getattr(forward_batch, "wan_hybrid_abba_benchmark", False)
+        )
+        if abba_benchmark:
+            if not self.uses_wan_hybrid:
+                raise RuntimeError(
+                    "Wan hybrid AB/BA benchmarking requires "
+                    "attention_backend=wan_hybrid"
+                )
+            if (
+                forward_batch.return_trajectory_latents
+                or forward_batch.return_trajectory_decoded
+            ):
+                raise RuntimeError(
+                    "Wan hybrid AB/BA benchmarking requires trajectory capture off"
+                )
         if forward_batch is not None:
             sequence_shard_enabled = (
                 forward_batch.enable_sequence_shard and self.sp_size > 1
@@ -1556,6 +1834,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             for block_index, block in enumerate(self.blocks):
                 block_kwargs = {"rope_cos_sin_cache": rope_cos_sin_cache}
                 if isinstance(block, WanTransformerBlock):
+                    if abba_benchmark:
+                        block_kwargs["wan_hybrid_timestep"] = timestep
+                        block_kwargs["wan_hybrid_abba_benchmark"] = True
                     block_use_wan_hybrid = use_wan_hybrid and (
                         self.wan_hybrid_layer_indices is None
                         or block_index in self.wan_hybrid_layer_indices

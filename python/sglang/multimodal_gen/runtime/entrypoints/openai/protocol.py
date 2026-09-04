@@ -102,6 +102,7 @@ class VideoResponse(BaseModel):
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
     action: Optional[Dict[str, Any]] = None
+    wan_hybrid_abba_benchmarks: Optional[List[Dict[str, Any]]] = None
 
 
 class VideoGenerationsRequest(BaseModel):
@@ -134,6 +135,7 @@ class VideoGenerationsRequest(BaseModel):
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
     enable_teacache: Optional[bool] = False
+    wan_hybrid_abba_benchmark: Optional[bool] = False
     # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False
     frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×

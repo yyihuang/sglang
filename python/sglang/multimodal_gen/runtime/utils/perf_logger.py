@@ -55,6 +55,7 @@ class RequestMetrics:
         self.total_duration_ms: float = 0.0
         self.wan_hybrid_hit_count: int = 0
         self.wan_hybrid_teacher_forced_blocks: list[dict[str, Any]] = []
+        self.wan_hybrid_abba_benchmarks: list[dict[str, Any]] = []
         self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
@@ -91,6 +92,7 @@ class RequestMetrics:
             "wan_hybrid_teacher_forced_blocks": (
                 self.wan_hybrid_teacher_forced_blocks
             ),
+            "wan_hybrid_abba_benchmarks": self.wan_hybrid_abba_benchmarks,
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()
@@ -165,6 +167,9 @@ class RequestPerfRecord:
     steps: list[float]
     total_duration_ms: float
     memory_snapshots: dict[str, dict] = dataclasses.field(default_factory=dict)
+    wan_hybrid_abba_benchmarks: list[dict[str, Any]] = dataclasses.field(
+        default_factory=list
+    )
 
     def __init__(
         self,
@@ -176,6 +181,7 @@ class RequestPerfRecord:
         total_duration_ms,
         memory_snapshots=None,
         timestamp=None,
+        wan_hybrid_abba_benchmarks=None,
     ):
         self.request_id = request_id
         if timestamp is not None:
@@ -189,6 +195,7 @@ class RequestPerfRecord:
         self.steps = steps
         self.total_duration_ms = total_duration_ms
         self.memory_snapshots = memory_snapshots or {}
+        self.wan_hybrid_abba_benchmarks = wan_hybrid_abba_benchmarks or []
 
 
 class StageProfiler:
@@ -337,6 +344,7 @@ class PerformanceLogger:
             "steps": formatted_steps,
             "denoise_steps_ms": denoise_steps_ms,
             "memory_checkpoints": memory_checkpoints,
+            "wan_hybrid_abba_benchmarks": metrics.wan_hybrid_abba_benchmarks,
             "meta": meta or {},
         }
 
@@ -378,6 +386,7 @@ class PerformanceLogger:
             steps=metrics.steps,
             total_duration_ms=metrics.total_duration_ms,
             memory_snapshots=memory_checkpoints,
+            wan_hybrid_abba_benchmarks=metrics.wan_hybrid_abba_benchmarks,
         )
 
         try:

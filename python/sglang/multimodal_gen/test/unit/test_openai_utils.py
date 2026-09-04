@@ -12,8 +12,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size_or_raise,
     _save_upload_to_path,
     _validate_positive_int,
+    add_common_data_to_response,
     build_sampling_params,
 )
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 
 
 def test_save_upload_to_path_accepts_starlette_upload_file(tmp_path):
@@ -61,6 +63,22 @@ def test_validate_positive_int_rejects_non_positive_sampling_fields():
         assert "num_frames must be positive" in exc.detail
     else:
         raise AssertionError("expected bad request")
+
+
+def test_video_response_persists_wan_hybrid_abba_evidence():
+    metrics = RequestMetrics("request-id")
+    evidence = {"cfg_negative": False, "orders": {}}
+    metrics.wan_hybrid_abba_benchmarks.append(evidence)
+    result = SimpleNamespace(
+        peak_memory_mb=0.0,
+        metrics=metrics,
+        usage=None,
+        action_pred=None,
+    )
+
+    response = add_common_data_to_response({}, "request-id", result)
+
+    assert response["wan_hybrid_abba_benchmarks"] == [evidence]
 
 
 def test_build_sampling_params_resolves_size_and_explicit_dimensions(monkeypatch):

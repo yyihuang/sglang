@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -9,21 +10,198 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanSelfAttention,
     WanTransformer3DModel,
     _is_wan_hybrid_teacher_forced_timestep,
+    _run_wan_hybrid_abba_benchmark,
     _run_wan_hybrid_teacher_forced_attention,
     _use_wan_hybrid_for_timestep,
+    _validate_wan_hybrid_abba_activity,
     _validate_wan_hybrid_layer_indices,
     _validate_wan_hybrid_min_timestep,
     _validate_wan_hybrid_teacher_forced_compare,
     _validate_wan_hybrid_teacher_forced_timestep,
+    _wan_hybrid_abba_side_recorded,
+    _wan_hybrid_abba_timing_payload,
     _wan_hybrid_teacher_forced_tensor_metrics,
     _wan_cross_attention_backends,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    _validate_wan_hybrid_abba_configuration,
+    _validate_wan_hybrid_abba_records,
+)
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 
 _WAN = "sglang.multimodal_gen.runtime.models.dits.wanvideo"
 
 
 class TestWanAttentionBackendRole(unittest.TestCase):
+    def test_abba_timing_payload_requires_five_samples(self):
+        activities = [
+            {"kernel_activities": [{"name": "kernel"}]} for _ in range(5)
+        ]
+        payload = _wan_hybrid_abba_timing_payload(
+            [0.5, 0.4, 0.6, 0.3, 0.7], activities
+        )
+
+        self.assertEqual(payload["backend"], "cupti")
+        self.assertEqual(payload["median_ms"], 0.5)
+        self.assertEqual(
+            payload["cupti_activity_evidence"]["sample_count"], 5
+        )
+        with self.assertRaisesRegex(RuntimeError, "expected 5 samples"):
+            _wan_hybrid_abba_timing_payload([0.5], activities[:1])
+
+    def test_abba_activity_requires_exact_candidate_and_fa4_surfaces(self):
+        candidate = [
+            {
+                "kernel_activities": [
+                    {"name": "kernel_wan_hybrid_quantize_value"},
+                    {"name": "kernel_wan_hybrid_attention"},
+                ]
+            }
+        ]
+        fa4 = [{"kernel_activities": [{"name": "flash_fwd"}]}]
+        _validate_wan_hybrid_abba_activity("candidate", candidate)
+        _validate_wan_hybrid_abba_activity("fa4", fa4)
+
+        with self.assertRaisesRegex(RuntimeError, "quantization followed"):
+            _validate_wan_hybrid_abba_activity("candidate", fa4)
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            _validate_wan_hybrid_abba_activity("fa4", candidate)
+
+    def test_abba_side_scoping_records_each_cfg_side_once(self):
+        metrics = RequestMetrics("request")
+        self.assertFalse(_wan_hybrid_abba_side_recorded(metrics, False))
+        metrics.wan_hybrid_abba_benchmarks.append({"cfg_negative": False})
+        self.assertTrue(_wan_hybrid_abba_side_recorded(metrics, False))
+        self.assertFalse(_wan_hybrid_abba_side_recorded(metrics, True))
+        metrics.wan_hybrid_abba_benchmarks.append({"cfg_negative": True})
+        self.assertTrue(_wan_hybrid_abba_side_recorded(metrics, True))
+
+    def test_abba_runs_both_orders_on_the_same_qkv_and_stream(self):
+        calls = []
+
+        class Attention(nn.Module):
+            def __init__(self, kind):
+                super().__init__()
+                self.kind = kind
+
+            def forward(self, query, key, value):
+                calls.append((self.kind, query, key, value))
+                return value
+
+        reference = Attention("fa4")
+        candidate = Attention("candidate")
+        query = torch.randn(1, 2, 1, 4)
+        key = torch.randn(1, 2, 1, 4)
+        value = torch.randn(1, 2, 1, 4)
+        stream = SimpleNamespace(cuda_stream=123)
+        properties = SimpleNamespace(
+            name="B200",
+            uuid="device-uuid",
+            major=10,
+            minor=0,
+            total_memory=1,
+        )
+
+        def fake_bench(fn):
+            fn()
+            elapsed = 1.0 if calls[-1][0] == "fa4" else 2.0
+            kernel_names = (
+                ["flash_fwd"]
+                if calls[-1][0] == "fa4"
+                else [
+                    "kernel_wan_hybrid_quantize_value",
+                    "kernel_wan_hybrid_attention",
+                ]
+            )
+            activity_evidence = [
+                {
+                    "kernel_activities": [
+                        {"name": name} for name in kernel_names
+                    ]
+                }
+                for _ in range(5)
+            ]
+            return [elapsed] * 5, activity_evidence
+
+        with (
+            patch(f"{_WAN}._bench_wan_hybrid_attention", side_effect=fake_bench),
+            patch(f"{_WAN}.torch.cuda.current_stream", return_value=stream),
+            patch(f"{_WAN}.torch.cuda.current_device", return_value=0),
+            patch(f"{_WAN}.torch.cuda.get_device_properties", return_value=properties),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "flash_attn.fa_ver",
+                4,
+            ),
+        ):
+            output, record = _run_wan_hybrid_abba_benchmark(
+                reference, candidate, query, key, value
+            )
+
+        self.assertIs(output, value)
+        self.assertEqual(
+            [kind for kind, *_ in calls],
+            [
+                "candidate",
+                "fa4",
+                "fa4",
+                "candidate",
+                "fa4",
+                "candidate",
+                "candidate",
+                "fa4",
+                "candidate",
+            ],
+        )
+        for _, observed_q, observed_k, observed_v in calls:
+            self.assertIs(observed_q, query)
+            self.assertIs(observed_k, key)
+            self.assertIs(observed_v, value)
+        self.assertEqual(record["stream"], 123)
+        self.assertEqual(record["query_id"], id(query))
+        self.assertEqual(record["key_id"], id(key))
+        self.assertEqual(record["value_id"], id(value))
+        self.assertEqual(
+            record["timing_primitive"], "flashinfer.testing.bench_gpu_time"
+        )
+
+    def test_abba_finalization_requires_one_record_per_cfg_side(self):
+        metrics = RequestMetrics("request")
+        batch = SimpleNamespace(
+            wan_hybrid_abba_benchmark=True,
+            do_classifier_free_guidance=True,
+            metrics=metrics,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "exactly one record"):
+            _validate_wan_hybrid_abba_records(batch)
+
+        metrics.wan_hybrid_abba_benchmarks.extend(
+            [{"cfg_negative": False}, {"cfg_negative": True}]
+        )
+        _validate_wan_hybrid_abba_records(batch)
+
+        metrics.wan_hybrid_abba_benchmarks.append({"cfg_negative": True})
+        with self.assertRaisesRegex(RuntimeError, "exactly one record"):
+            _validate_wan_hybrid_abba_records(batch)
+
+    def test_abba_rejects_cfg_parallel_explicitly(self):
+        batch = SimpleNamespace(
+            wan_hybrid_abba_benchmark=True,
+            do_classifier_free_guidance=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires serial CFG"):
+            _validate_wan_hybrid_abba_configuration(
+                batch, SimpleNamespace(enable_cfg_parallel=True)
+            )
+
+        batch.do_classifier_free_guidance = False
+        _validate_wan_hybrid_abba_configuration(
+            batch, SimpleNamespace(enable_cfg_parallel=True)
+        )
+
     def test_wan_hybrid_timestep_threshold(self):
         self.assertTrue(_use_wan_hybrid_for_timestep(torch.tensor([999]), 975.0))
         self.assertTrue(_use_wan_hybrid_for_timestep(torch.tensor([975]), 975.0))

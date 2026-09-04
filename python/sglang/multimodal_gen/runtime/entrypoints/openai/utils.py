@@ -434,6 +434,11 @@ def add_common_data_to_response(
     if result.metrics and result.metrics.total_duration_s > 0:
         response["inference_time_s"] = result.metrics.total_duration_s
 
+    if result.metrics and result.metrics.wan_hybrid_abba_benchmarks:
+        response["wan_hybrid_abba_benchmarks"] = (
+            result.metrics.wan_hybrid_abba_benchmarks
+        )
+
     if result.usage is not None:
         usage = dict(result.usage)
         cached_tokens = usage.pop("cached_tokens", None)

@@ -61,6 +61,29 @@ class TestSamplingParamsValidate(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r"quality must be one of"):
                 SamplingParams(quality=bad)  # type: ignore[arg-type]
 
+    def test_wan_hybrid_abba_benchmark_is_opt_in_and_disables_trajectory(self):
+        default = SamplingParams(
+            return_trajectory_latents=True,
+            return_trajectory_decoded=True,
+        )
+        self.assertFalse(default.wan_hybrid_abba_benchmark)
+        self.assertTrue(default.return_trajectory_latents)
+        self.assertTrue(default.return_trajectory_decoded)
+
+        benchmark = SamplingParams(
+            wan_hybrid_abba_benchmark=True,
+            return_trajectory_latents=True,
+            return_trajectory_decoded=True,
+        )
+        self.assertFalse(benchmark.return_trajectory_latents)
+        self.assertFalse(benchmark.return_trajectory_decoded)
+
+    def test_wan_hybrid_abba_benchmark_requires_boolean(self):
+        with self.assertRaisesRegex(
+            ValueError, r"wan_hybrid_abba_benchmark must be a boolean"
+        ):
+            SamplingParams(wan_hybrid_abba_benchmark=1)  # type: ignore[arg-type]
+
     def test_seed_accepts_int_or_non_empty_int_list(self):
         self.assertEqual(SamplingParams(seed=7).seed, 7)
         self.assertEqual(SamplingParams(seed=[7, 8]).seed, [7, 8])
@@ -325,6 +348,11 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(kwargs["guidance_scale"], SamplingParams.guidance_scale)
         self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
         self.assertTrue(kwargs["save_output"])
+
+    def test_cli_forwards_wan_hybrid_abba_benchmark(self):
+        kwargs = self._parse_cli_kwargs(["--wan-hybrid-abba-benchmark"])
+
+        self.assertTrue(kwargs["wan_hybrid_abba_benchmark"])
 
     def test_get_cli_args_accepts_seed_list(self):
         self.assertEqual(self._parse_cli_kwargs(["--seed", "7"])["seed"], 7)
