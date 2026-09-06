@@ -20,6 +20,12 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     UlyssesAttention_VSA,
     USPAttention,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    record_wan_attention_route,
+)
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
@@ -55,6 +61,106 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+WAN_HYBRID_DEFAULT_LAYER_INDICES = (39,)
+
+
+def _validate_wan_hybrid_min_timestep(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("wan_hybrid_min_timestep must be a finite number")
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1000.0:
+        raise ValueError("wan_hybrid_min_timestep must be within [0, 1000]")
+    return value
+
+
+def _validate_wan_hybrid_max_timestep(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("wan_hybrid_max_timestep must be a finite number")
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1000.0:
+        raise ValueError("wan_hybrid_max_timestep must be within [0, 1000]")
+    return value
+
+
+def _validate_wan_hybrid_layer_indices(
+    value: Any, num_layers: int
+) -> frozenset[int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("wan_hybrid_layer_indices must be a list of layer indices")
+    indices: list[int] = []
+    for index in value:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError(
+                "wan_hybrid_layer_indices must contain only integer layer indices"
+            )
+        if not 0 <= index < num_layers:
+            raise ValueError(
+                "wan_hybrid_layer_indices entries must be within "
+                f"[0, {num_layers - 1}]"
+            )
+        indices.append(index)
+    if len(indices) != len(set(indices)):
+        raise ValueError("wan_hybrid_layer_indices must not contain duplicates")
+    return frozenset(indices)
+
+
+def _resolve_wan_hybrid_layer_indices(
+    value: Any,
+    num_layers: int,
+    *,
+    explicitly_configured: bool,
+    wan_hybrid_enabled: bool,
+) -> frozenset[int] | None:
+    validated = _validate_wan_hybrid_layer_indices(value, num_layers)
+    if not wan_hybrid_enabled:
+        return None
+    if explicitly_configured:
+        return validated
+    return _validate_wan_hybrid_layer_indices(
+        WAN_HYBRID_DEFAULT_LAYER_INDICES, num_layers
+    )
+
+
+def _use_wan_hybrid_for_timestep(
+    timestep: torch.Tensor,
+    min_timestep: float | None,
+    max_timestep: float | None,
+) -> bool:
+    if min_timestep is None and max_timestep is None:
+        return True
+    if timestep.numel() == 0:
+        raise ValueError("Wan timestep tensor must not be empty")
+    if min_timestep is not None and torch.amin(timestep).item() < min_timestep:
+        return False
+    return max_timestep is None or torch.amax(timestep).item() <= max_timestep
+
+
+def _wan_cross_attention_backends(
+    backends: set[AttentionBackendEnum],
+) -> set[AttentionBackendEnum]:
+    """Keep cross-attention on dense backends with unequal Q/KV support."""
+    dense_backends = {
+        backend
+        for backend in backends
+        if not backend.is_sparse and backend != AttentionBackendEnum.WAN_HYBRID
+    }
+    selected_backend = get_global_forced_attn_backend()
+    if selected_backend is None:
+        selected_backend_name = get_global_server_args().attention_backend
+        if selected_backend_name is not None:
+            selected_backend = AttentionBackendEnum[selected_backend_name.upper()]
+    if (
+        selected_backend == AttentionBackendEnum.WAN_HYBRID
+        and AttentionBackendEnum.FA in dense_backends
+    ):
+        return {AttentionBackendEnum.FA}
+    return dense_backends
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -324,6 +430,18 @@ class WanTransformerBlock(nn.Module):
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
                 prefix=f"{prefix}.attn1",
+                is_cross_attention=False,
+            )
+        self.attn1_fallback = None
+        if self.attn1.backend == AttentionBackendEnum.WAN_HYBRID:
+            self.attn1_fallback = USPAttention(
+                num_heads=self.local_num_heads,
+                head_size=dim // num_heads,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+                selected_attention_backend=AttentionBackendEnum.FA,
+                prefix=f"{prefix}.attn1_fallback",
+                is_cross_attention=False,
             )
 
         self.hidden_dim = dim
@@ -352,6 +470,9 @@ class WanTransformerBlock(nn.Module):
         )
 
         # 2. Cross-attention
+        cross_attn_backends = _wan_cross_attention_backends(
+            supported_attention_backends
+        )
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -359,7 +480,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         else:
             # T2V
@@ -368,7 +489,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -391,6 +512,8 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        use_wan_hybrid: bool = True,
+        wan_evidence_layer_index: int | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -424,6 +547,20 @@ class WanTransformerBlock(nn.Module):
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
 
+        hybrid_configured = self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
+        use_wan_hybrid = hybrid_configured and use_wan_hybrid
+        if wan_evidence_layer_index is not None:
+            record_wan_attention_route(
+                layer_index=wan_evidence_layer_index,
+                hybrid_configured=hybrid_configured,
+                eligible_for_hybrid=use_wan_hybrid,
+            )
+        if use_wan_hybrid:
+            if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
+                raise NotImplementedError(
+                    "Wan hybrid Wan serving requires unsharded across-head RMSNorm"
+                )
+
         if self.norm_q is not None:
             if self.tp_rmsnorm:
                 query = tensor_parallel_rms_norm(query, self.norm_q)
@@ -455,7 +592,17 @@ class WanTransformerBlock(nn.Module):
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attn_output = self.attn1(query, key, value)
+        attention = (
+            self.attn1
+            if use_wan_hybrid
+            else (
+                self.attn1_fallback
+                if self.attn1.backend == AttentionBackendEnum.WAN_HYBRID
+                else self.attn1
+            )
+        )
+        assert attention is not None
+        attn_output = attention(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -545,9 +692,10 @@ class WanTransformerBlock_VSA(nn.Module):
             compute_dtype=torch.float32,
         )
 
-        if AttentionBackendEnum.VIDEO_SPARSE_ATTN in supported_attention_backends:
-            supported_attention_backends.remove(AttentionBackendEnum.VIDEO_SPARSE_ATTN)
         # 2. Cross-attention
+        cross_attn_backends = _wan_cross_attention_backends(
+            supported_attention_backends
+        )
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -555,7 +703,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         else:
             # T2V
@@ -564,7 +712,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -673,7 +821,9 @@ class WanTransformerBlock_VSA(nn.Module):
 class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
-    _supported_attention_backends = WanVideoConfig()._supported_attention_backends
+    _supported_attention_backends = WanVideoConfig()._supported_attention_backends | {
+        AttentionBackendEnum.WAN_HYBRID
+    }
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
@@ -689,6 +839,29 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.num_channels_latents = config.num_channels_latents
         self.patch_size = config.patch_size
         self.text_len = config.text_len
+        attention_backend_config = (
+            get_global_server_args().attention_backend_config or {}
+        )
+        self.wan_hybrid_min_timestep = _validate_wan_hybrid_min_timestep(
+            attention_backend_config.get("wan_hybrid_min_timestep")
+        )
+        self.wan_hybrid_max_timestep = _validate_wan_hybrid_max_timestep(
+            attention_backend_config.get("wan_hybrid_max_timestep")
+        )
+        if (
+            self.wan_hybrid_min_timestep is not None
+            and self.wan_hybrid_max_timestep is not None
+            and self.wan_hybrid_min_timestep > self.wan_hybrid_max_timestep
+        ):
+            raise ValueError(
+                "wan_hybrid_min_timestep must not exceed wan_hybrid_max_timestep"
+            )
+        wan_hybrid_layer_indices_explicit = (
+            "wan_hybrid_layer_indices" in attention_backend_config
+        )
+        configured_wan_hybrid_layer_indices = attention_backend_config.get(
+            "wan_hybrid_layer_indices"
+        )
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -732,6 +905,36 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 for i in range(config.num_layers)
             ]
         )
+        uses_wan_hybrid = any(
+            getattr(getattr(block, "attn1", None), "backend", None)
+            == AttentionBackendEnum.WAN_HYBRID
+            for block in self.blocks
+        )
+        self.wan_hybrid_layer_indices = _resolve_wan_hybrid_layer_indices(
+            configured_wan_hybrid_layer_indices,
+            config.num_layers,
+            explicitly_configured=wan_hybrid_layer_indices_explicit,
+            wan_hybrid_enabled=uses_wan_hybrid,
+        )
+        if not uses_wan_hybrid:
+            self.wan_hybrid_min_timestep = None
+            self.wan_hybrid_max_timestep = None
+        else:
+            route_parts = []
+            if self.wan_hybrid_min_timestep is not None:
+                route_parts.append(f"at timestep >= {self.wan_hybrid_min_timestep:g}")
+            if self.wan_hybrid_max_timestep is not None:
+                route_parts.append(f"at timestep <= {self.wan_hybrid_max_timestep:g}")
+            if self.wan_hybrid_layer_indices is not None:
+                route_parts.append(
+                    f"for transformer blocks {sorted(self.wan_hybrid_layer_indices)}"
+                )
+            if route_parts:
+                logger.info_once(
+                    "Wan hybrid self-attention is enabled "
+                    + " ".join(route_parts)
+                    + " and falls back to FA elsewhere"
+                )
 
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
@@ -782,12 +985,18 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         guidance=None,
         **kwargs,
     ) -> torch.Tensor:
-        forward_batch = get_forward_context().forward_batch
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
         self.enable_teacache = (
             forward_batch is not None and forward_batch.enable_teacache
         )
 
         orig_dtype = hidden_states.dtype
+        use_wan_hybrid = _use_wan_hybrid_for_timestep(
+            timestep,
+            self.wan_hybrid_min_timestep,
+            self.wan_hybrid_max_timestep,
+        )
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
         if (
@@ -873,9 +1082,21 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            for block in self.blocks:
+            for block_index, block in enumerate(self.blocks):
+                block_kwargs = {}
+                if isinstance(block, WanTransformerBlock):
+                    block_kwargs["use_wan_hybrid"] = use_wan_hybrid and (
+                        self.wan_hybrid_layer_indices is None
+                        or block_index in self.wan_hybrid_layer_indices
+                    )
+                    if forward_context.wan_hybrid_evidence_collector is not None:
+                        block_kwargs["wan_evidence_layer_index"] = block_index
                 hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    freqs_cis,
+                    **block_kwargs,
                 )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:

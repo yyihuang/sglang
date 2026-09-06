@@ -36,6 +36,37 @@ pynvml = import_pynvml()  # type: ignore[no-untyped-call]
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 
+class _WanHybridAttentionBackendResolver:
+    required_capabilities = {(10, 0), (10, 3)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        if capability is None or tuple(capability) not in cls.required_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "Wan hybrid attention requires compute capability 10.0 or 10.3; "
+                f"this device reports {found}."
+            )
+        try:
+            from flashinfer import (
+                WanHybridAttentionWorkspace,  # noqa: F401
+                is_wan_hybrid_attention_available,
+                wan_hybrid_attention,  # noqa: F401
+            )
+        except ImportError as error:
+            raise ImportError(
+                "Wan hybrid attention requires a FlashInfer build that exports "
+                "the public wan_hybrid attention API."
+            ) from error
+        if not is_wan_hybrid_attention_available():
+            raise RuntimeError(
+                "Wan hybrid attention requires an installed FlashInfer "
+                "wan_hybrid implementation."
+            )
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid.WanHybridAttentionBackend"
+
+
 def device_id_to_physical_device_id(device_id: int) -> int:
     if "CUDA_VISIBLE_DEVICES" in os.environ:
         device_ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
@@ -240,6 +271,8 @@ class CudaPlatformBase(Platform):
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+        elif selected_backend == AttentionBackendEnum.WAN_HYBRID:
+            return _WanHybridAttentionBackendResolver.resolve(cls)
         elif selected_backend == AttentionBackendEnum.SLA_ATTN:
             logger.info("Using Sparse Linear Attention backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"

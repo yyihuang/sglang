@@ -33,6 +33,9 @@ class RequestTimings:
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
+        self.wan_hybrid_hit_count: int = 0
+        self.wan_hybrid_coverage: dict[str, Any] | None = None
+        self.attention_backend_identity: dict[str, Any] | None = None
 
     @property
     def total_duration_s(self) -> float:
@@ -54,6 +57,9 @@ class RequestTimings:
             "stages": self.stages,
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            "wan_hybrid_hit_count": self.wan_hybrid_hit_count,
+            "wan_hybrid_coverage": self.wan_hybrid_coverage,
+            "attention_backend_identity": self.attention_backend_identity,
         }
 
 

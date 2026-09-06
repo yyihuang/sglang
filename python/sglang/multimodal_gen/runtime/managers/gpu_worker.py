@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_tp_group,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    WanHybridEvidenceCollector,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -37,6 +40,54 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 from sglang.multimodal_gen.runtime.utils.perf_logger import PerformanceLogger
 
 logger = init_logger(__name__)
+
+
+def _create_wan_hybrid_evidence_collectors(
+    request_ids: list[str],
+) -> dict[str, WanHybridEvidenceCollector]:
+    collectors: dict[str, WanHybridEvidenceCollector] = {}
+    for request_id in request_ids:
+        if not isinstance(request_id, str) or not request_id:
+            raise RuntimeError("Wan hybrid evidence requires a nonempty request_id")
+        if request_id in collectors:
+            raise RuntimeError(
+                "Wan hybrid evidence cannot attribute duplicate request_id "
+                f"{request_id!r}"
+            )
+        collectors[request_id] = WanHybridEvidenceCollector(request_id=request_id)
+    return collectors
+
+
+def _publish_wan_hybrid_evidence(
+    output_timings: list[object],
+    collectors_by_request_id: dict[str, WanHybridEvidenceCollector],
+    *,
+    require_complete: bool = True,
+) -> None:
+    observed_request_ids: set[str] = set()
+    for timings in output_timings:
+        request_id = timings.request_id
+        if request_id in observed_request_ids:
+            raise RuntimeError(
+                "Wan hybrid evidence cannot publish duplicate output request_id "
+                f"{request_id!r}"
+            )
+        observed_request_ids.add(request_id)
+        collector = collectors_by_request_id.get(request_id)
+        if collector is None:
+            raise RuntimeError(
+                "Wan hybrid evidence could not map output request_id "
+                f"{request_id!r}"
+            )
+        timings.wan_hybrid_hit_count = collector.hit_count()
+        timings.wan_hybrid_coverage = collector.coverage()
+    if require_complete:
+        missing_request_ids = set(collectors_by_request_id) - observed_request_ids
+        if missing_request_ids:
+            raise RuntimeError(
+                "Wan hybrid evidence outputs omitted request_id values: "
+                f"{sorted(missing_request_ids)}"
+            )
 
 
 class GPUWorker:
@@ -157,6 +208,12 @@ class GPUWorker:
         req = batch[0]
         output_batch = None
         try:
+            collectors_by_request_id = _create_wan_hybrid_evidence_collectors(
+                [req.request_id]
+            )
+            req._wan_hybrid_evidence_collector = collectors_by_request_id[
+                req.request_id
+            ]
             if self.rank == 0:
                 torch.cuda.reset_peak_memory_stats()
 
@@ -183,6 +240,9 @@ class GPUWorker:
 
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.timings.total_duration_ms = duration_ms
+            _publish_wan_hybrid_evidence(
+                [output_batch.timings], collectors_by_request_id
+            )
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:

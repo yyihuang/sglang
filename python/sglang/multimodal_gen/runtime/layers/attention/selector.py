@@ -90,6 +90,9 @@ def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
     supported_attention_backends: set[AttentionBackendEnum] | None = None,
+    selected_attention_backend: AttentionBackendEnum | None = None,
+    default_attention_backend: AttentionBackendEnum | None = None,
+    is_cross_attention: bool = False,
 ) -> type[AttentionBackend]:
     if supported_attention_backends is None:
         be_tuple = tuple()
@@ -98,7 +101,14 @@ def get_attn_backend(
         be_tuple = tuple(
             sorted(list(supported_attention_backends), key=lambda b: b.name)
         )
-    return _cached_get_attn_backend(head_size, dtype, be_tuple)
+    return _cached_get_attn_backend(
+        head_size,
+        dtype,
+        be_tuple,
+        selected_attention_backend,
+        default_attention_backend,
+        is_cross_attention,
+    )
 
 
 @cache
@@ -106,19 +116,22 @@ def _cached_get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
     supported_attention_backends: tuple[AttentionBackendEnum],
+    selected_backend: AttentionBackendEnum | None = None,
+    default_attention_backend: AttentionBackendEnum | None = None,
+    is_cross_attention: bool = False,
 ) -> type[AttentionBackend]:
     # Check whether a particular choice of backend was
     # previously forced via global_force_attn_backend() or --attention-backend CLI arg.
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     supported_attention_backends = set(supported_attention_backends)
-    selected_backend = None
-    backend_by_global_setting: AttentionBackendEnum | None = (
-        get_global_forced_attn_backend()
-    )
-    if backend_by_global_setting is not None:
-        selected_backend = backend_by_global_setting
-    else:
+    if selected_backend is None:
+        backend_by_global_setting: AttentionBackendEnum | None = (
+            get_global_forced_attn_backend()
+        )
+        if backend_by_global_setting is not None:
+            selected_backend = backend_by_global_setting
+    if selected_backend is None:
         # Check the server arguments for a backend override
         server_args = get_global_server_args()
         if server_args.attention_backend is not None:
@@ -132,6 +145,11 @@ def _cached_get_attn_backend(
                     f"Invalid attention backend '{server_args.attention_backend}' specified via command line. "
                     f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
                 )
+
+    if is_cross_attention and selected_backend == AttentionBackendEnum.WAN_HYBRID:
+        selected_backend = default_attention_backend
+    elif selected_backend is None:
+        selected_backend = default_attention_backend
 
     # get device-specific attn_backend
     if len(supported_attention_backends) == 0:

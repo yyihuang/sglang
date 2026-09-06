@@ -64,6 +64,100 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
+### Wan hybrid attention for Wan
+
+On B200/GB200 (`sm_100`) and B300/GB300 (`sm_103`), a FlashInfer build that
+exports the public `flashinfer.wan_hybrid_attention` API can run the exact Wan
+self-attention shape through the explicit hybrid backend:
+
+```bash
+sglang generate \
+  --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
+  --attention-backend wan_hybrid \
+  --prompt "A curious raccoon walks through a sunlit forest" \
+  --save-output
+```
+
+The backend is intentionally fail-closed: it accepts caller-owned contiguous
+BF16 NHD Q/K/V and output at exactly `B=1, S=4800, H=40, D=128`, with
+noncausal dense self-attention and the default `1 / sqrt(128)` score scale.
+Q/K remain BF16; FlashInfer owns the reusable FP4 V/P workspace and writes
+directly into the caller's BF16 output. Wan cross-attention continues to use
+the normal dense backend because its query and KV sequence lengths differ.
+Packed-varlen, masks, GQA/MQA, and ring attention are not supported.
+
+This integration remains explicit opt-in and the production route stays on FA.
+Complete all-step/all-pair diffusion trajectories and generated frames must be
+qualified against that production route; isolated attention accuracy is not a
+model-level correctness claim. The `wan_hybrid_min_timestep` and
+`wan_hybrid_layer_indices` backend options are diagnostic gates. A run is not a
+valid hybrid qualification unless its reported `wan_hybrid_hit_count` is
+greater than zero.
+
+Use `compare_diffusion_trajectory_similarity` for model-level qualification.
+The tool requires at least two warmup runs and five measured runs. Correctness
+captures every trajectory step and evaluates every same-variant and
+cross-variant run pair. Performance disables trajectory capture, executes both
+reference-first and candidate-first orders, and passes only when both median
+speedups are at least 1.0 and every measured candidate run reports a positive
+backend hit count.
+
+The qualification runner builds fixed single-block, full-transformer, and
+generation matrices without depending on a particular cluster layout. Pass the
+staged public revisions explicitly so the manifest records what was measured:
+
+```bash
+python -m sglang.multimodal_gen.tools.run_wan_hybrid_qualification \
+  --model-path /models/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
+  --model-id nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
+  --output-dir /results/wan-hybrid \
+  --sglang-revision "$SGLANG_REVISION" \
+  --flashinfer-revision "$FLASHINFER_REVISION" \
+  --staging-label "$STAGING_LABEL" \
+  --scenario generation \
+  --mode correctness
+```
+
+A correctness invocation runs both execution orders as separate generation
+trajectory reports. A performance invocation runs one comparison command with
+`--run-order both`; it disables trajectory capture and records both orders in
+the same report. `single-block` selects block zero through
+`wan_hybrid_layer_indices`; `full-transformer` selects the primary Wan
+transformer component; and `generation` enables every eligible self-attention
+layer.
+
+For an independent transformer single-forward check, first capture the exact
+keyword arguments from one real singleton serving request:
+
+```bash
+python -m sglang.multimodal_gen.tools.capture_wan_transformer_inputs \
+  --model-path /models/wan \
+  --output-dir /results/wan-inputs \
+  --output-index-json /results/wan-inputs/index.json \
+  --prompt "qualification prompt" --seed 4254 \
+  --width 1280 --height 720 --num-frames 81 \
+  --num-inference-steps 30 --guidance-scale 5.0 --guidance-scale-2 5.0 \
+  --component transformer --component transformer_2
+```
+
+Each worker manifest binds the request, sampling parameters, model/component
+identity, step/timestep/CFG branch, and CPU tensor artifact. Use each manifest
+to load the real component twice and run a direct forward in both orders:
+
+```bash
+python -m sglang.multimodal_gen.tools.run_wan_transformer_forward_report \
+  --capture-manifest /results/wan-inputs/<transformer-manifest>.json \
+  --run-order reference-first \
+  --output-json /results/transformer-reference-first.json
+```
+
+Repeat for `candidate-first` and `transformer_2`, then provide all four reports
+to a `full-transformer` qualification. The harness reuses the trajectory
+evaluator over snapshots from every `model.blocks` entry, computes the complete
+5-by-5 cross-variant product and all ten same-instance run pairs, and separately
+checks the final transformer output. Hook capture is a correctness path and must
+not be used for performance timing.
+
 ### LoRA support
 
 Apply LoRA adapters via `--lora-path`:

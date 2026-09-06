@@ -12,6 +12,7 @@ import time
 import weakref
 from collections.abc import Iterable
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -40,12 +41,18 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.backends.wan_hybrid import (
+    WanHybridEvidenceCollector,
+)
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -60,6 +67,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
+)
+from sglang.multimodal_gen.runtime.qualification.attention_backend_identity import (
+    collect_runtime_attention_backend_identity,
+)
+from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
+    WanTransformerInputCapture,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -115,6 +128,15 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+        self._wan_hybrid_evidence_enabled = any(
+            getattr(module, "backend", None) == AttentionBackendEnum.WAN_HYBRID
+            for transformer in (self.transformer, self.transformer_2)
+            if transformer is not None
+            for module in transformer.modules()
+        )
+        self._wan_transformer_input_capture = (
+            WanTransformerInputCapture.from_environment()
+        )
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -939,6 +961,22 @@ class DenoisingStage(PipelineStage):
         """
         Run the denoising loop.
         """
+        collector = None
+        if self._wan_hybrid_evidence_enabled:
+            collector = getattr(batch, "_wan_hybrid_evidence_collector", None)
+            if collector is None:
+                collector = WanHybridEvidenceCollector(request_id=batch.request_id)
+                batch._wan_hybrid_evidence_collector = collector
+            if collector.request_id != batch.request_id:
+                raise RuntimeError(
+                    "Wan hybrid evidence collector request_id does not match batch"
+                )
+            if (
+                collector.route_events
+                or collector.success_events
+                or collector.raw_success_count
+            ):
+                raise RuntimeError("Wan hybrid evidence collector was reused")
         # Prepare variables for the denoising loop
 
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
@@ -1035,6 +1073,12 @@ class DenoisingStage(PipelineStage):
                             server_args=server_args,
                             guidance=guidance,
                             latents=latents,
+                            wan_component_name=(
+                                "transformer"
+                                if current_model is self.transformer
+                                else "transformer_2"
+                            ),
+                            wan_actual_timestep=t_int,
                         )
 
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
@@ -1086,6 +1130,17 @@ class DenoisingStage(PipelineStage):
             server_args=server_args,
             is_warmup=is_warmup,
         )
+        if collector is not None:
+            batch.timings.wan_hybrid_hit_count = collector.hit_count()
+            batch.timings.wan_hybrid_coverage = collector.coverage()
+            del batch._wan_hybrid_evidence_collector
+        if batch.request_id.startswith("wan-hybrid-qualification-"):
+            batch.timings.attention_backend_identity = (
+                collect_runtime_attention_backend_identity(
+                    (self.transformer, self.transformer_2),
+                    requested_backend=server_args.attention_backend,
+                )
+            )
         return batch
 
     # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare
@@ -1211,12 +1266,34 @@ class DenoisingStage(PipelineStage):
         guidance: torch.Tensor,
         **kwargs,
     ):
-        return current_model(
+        call_kwargs = dict(
             hidden_states=latent_model_input,
             timestep=timestep,
             guidance=guidance,
             **kwargs,
         )
+        capture = self._wan_transformer_input_capture
+        if capture is not None:
+            forward_context = get_forward_context()
+            component_name = forward_context.wan_component_name
+            if component_name is None:
+                raise RuntimeError("Wan transformer capture requires a component name")
+            pipeline = self.pipeline() if self.pipeline else None
+            if pipeline is None:
+                raise RuntimeError("Wan transformer capture requires a pipeline")
+            component_model_path = getattr(self.server_args, "component_paths", {}).get(
+                component_name,
+                str(Path(pipeline.model_path) / component_name),
+            )
+            capture.capture(
+                current_model=current_model,
+                call_kwargs=call_kwargs,
+                component_name=component_name,
+                component_model_path=component_model_path,
+                model_root=pipeline.model_path,
+                forward_context=forward_context,
+            )
+        return current_model(**call_kwargs)
 
     def _predict_noise_with_cfg(
         self,
@@ -1234,6 +1311,8 @@ class DenoisingStage(PipelineStage):
         server_args,
         guidance,
         latents,
+        wan_component_name: str | None = None,
+        wan_actual_timestep: int | None = None,
     ):
         """
         Predict the noise residual with classifier-free guidance.
@@ -1264,6 +1343,12 @@ class DenoisingStage(PipelineStage):
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
+                wan_component_name=wan_component_name,
+                wan_actual_timestep=wan_actual_timestep,
+                wan_cfg_branch_index=0,
+                wan_hybrid_evidence_collector=getattr(
+                    batch, "_wan_hybrid_evidence_collector", None
+                ),
             ):
                 noise_pred_cond = self._predict_noise(
                     current_model=current_model,
@@ -1289,6 +1374,12 @@ class DenoisingStage(PipelineStage):
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
+                wan_component_name=wan_component_name,
+                wan_actual_timestep=wan_actual_timestep,
+                wan_cfg_branch_index=1,
+                wan_hybrid_evidence_collector=getattr(
+                    batch, "_wan_hybrid_evidence_collector", None
+                ),
             ):
                 noise_pred_uncond = self._predict_noise(
                     current_model=current_model,

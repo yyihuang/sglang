@@ -72,6 +72,7 @@ class UlyssesAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        self._resolved_attn_backend_cls = attn_backend
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -230,6 +231,9 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        selected_attention_backend: AttentionBackendEnum | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
+        is_cross_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -242,7 +246,12 @@ class LocalAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            selected_attention_backend=selected_attention_backend,
+            default_attention_backend=default_attention_backend,
+            is_cross_attention=is_cross_attention,
         )
         impl_cls = attn_backend.get_impl_cls()
         self.attn_impl = impl_cls(
@@ -253,6 +262,7 @@ class LocalAttention(nn.Module):
             causal=causal,
             **extra_impl_args,
         )
+        self._resolved_attn_backend_cls = attn_backend
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -303,8 +313,12 @@ class USPAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        selected_attention_backend: AttentionBackendEnum | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
+        skip_sequence_parallel: bool = False,
+        is_cross_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -318,7 +332,12 @@ class USPAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            selected_attention_backend=selected_attention_backend,
+            default_attention_backend=default_attention_backend,
+            is_cross_attention=is_cross_attention,
         )
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
         self.attn_impl = impl_cls(
@@ -330,6 +349,7 @@ class USPAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        self._resolved_attn_backend_cls = attn_backend
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -337,6 +357,7 @@ class USPAttention(nn.Module):
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
+        self.skip_sequence_parallel = skip_sequence_parallel
 
     def forward(
         self,
@@ -359,7 +380,7 @@ class USPAttention(nn.Module):
         ), "USPAttention does not support replicated_qkv."
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
-        if get_sequence_parallel_world_size() == 1:
+        if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
             return out
