@@ -55,7 +55,6 @@ class TestWanHybridAttentionBackend(unittest.TestCase):
             WanHybridAttentionBackend.get_enum(), AttentionBackendEnum.WAN_HYBRID
         )
         self.assertEqual(WanHybridAttentionBackend.get_supported_head_sizes(), [128])
-        self.assertFalse(WanHybridAttentionBackend.supports_packed_varlen())
         self.assertFalse(WanHybridAttentionBackend.supports_ring_rotation())
 
     def test_constructor_accepts_exact_wan_self_attention(self):

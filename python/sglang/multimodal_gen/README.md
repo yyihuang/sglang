@@ -156,8 +156,11 @@ python -m sglang.multimodal_gen.tools.run_wan_transformer_forward_report \
   --output-json /results/transformer-reference-first.json
 ```
 
-Repeat for `candidate-first` and `transformer_2`, then provide all four reports
-to a `full-transformer` qualification. The harness reuses the trajectory
+Repeat for `candidate-first` and `transformer_2`, producing
+`transformer-reference-first.json`, `transformer-candidate-first.json`,
+`transformer-2-reference-first.json`, and
+`transformer-2-candidate-first.json`, then provide all four reports to a
+`full-transformer` qualification. The harness reuses the trajectory
 evaluator over snapshots from every `model.blocks` entry, computes the complete
 5-by-5 cross-variant product and all ten same-instance run pairs, and separately
 checks the final transformer output. Direct performance instead prepares FA
