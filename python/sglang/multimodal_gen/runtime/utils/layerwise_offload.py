@@ -276,6 +276,18 @@ class LayerwiseOffloadManager:
         for layer_idx in list(self._gpu_layers):
             self.sync_layer_to_cpu(layer_idx)
 
+    def iter_cpu_weights(self):
+        """Yield the materialized tensors stored in the consolidated CPU buffers."""
+        for layer_idx in sorted(self._weight_metadata):
+            metadata = self._weight_metadata[layer_idx]
+            buffers = self._consolidated_cpu_weights[layer_idx]
+            for name in sorted(metadata):
+                meta = metadata[name]
+                start = meta["offset"]
+                yield name, buffers[meta["dtype"]][
+                    start : start + meta["numel"]
+                ].view(meta["shape"])
+
     def register_forward_hooks(self) -> None:
         if not self.enabled:
             return
@@ -383,3 +395,30 @@ class OffloadableDiTMixin:
                 manager.sync_all_layers_to_cpu()
                 manager.release_all()
                 manager.register_forward_hooks()
+
+
+def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
+    return isinstance(module, OffloadableDiTMixin) and any(
+        manager.enabled for manager in module.layerwise_offload_managers
+    )
+
+
+def iter_materialized_weights(module: torch.nn.Module):
+    """Yield real model weights rather than layerwise-offload placeholders."""
+    managers = (
+        [manager for manager in module.layerwise_offload_managers if manager.enabled]
+        if is_layerwise_offloaded_module(module)
+        else []
+    )
+    if not managers:
+        yield from module.named_parameters()
+        return
+
+    offloaded_names: set[str] = set()
+    for manager in managers:
+        for name, tensor in manager.iter_cpu_weights():
+            offloaded_names.add(name)
+            yield name, tensor
+    for name, parameter in module.named_parameters():
+        if name not in offloaded_names:
+            yield name, parameter

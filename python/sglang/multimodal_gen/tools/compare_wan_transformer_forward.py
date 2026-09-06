@@ -43,7 +43,7 @@ from sglang.multimodal_gen.runtime.layers.attention.layer import (
     prepare_attention_backend_override,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.qualification.attention_backend_identity import (

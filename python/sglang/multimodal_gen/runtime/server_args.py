@@ -229,12 +229,15 @@ class Backend(str, Enum):
 class ServerArgs:
     # Model and path configuration (for convenience)
     model_path: str
+    model_id: str | None = None
 
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
 
     # Attention
     attention_backend: str = None
+    attention_backend_config: dict[str, Any] | str | None = None
+    component_attention_backends: dict[str, str] = field(default_factory=dict)
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -279,6 +282,11 @@ class ServerArgs:
 
     # VAE parameters
     vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
+    component_paths: dict[str, str] = field(default_factory=dict)
+    transformer_weights_path: str | None = None
+    component_transformer_weights_paths: dict[str, str] = field(
+        default_factory=dict
+    )
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -324,6 +332,7 @@ class ServerArgs:
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    strict_ports: bool = False
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -401,6 +410,26 @@ class ServerArgs:
 
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+        if isinstance(self.attention_backend_config, str):
+            try:
+                parsed_attention_backend_config = json.loads(
+                    self.attention_backend_config
+                )
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "attention_backend_config must be a JSON object"
+                ) from exc
+            if not isinstance(parsed_attention_backend_config, dict):
+                raise ValueError("attention_backend_config must be a JSON object")
+            self.attention_backend_config = parsed_attention_backend_config
+        elif self.attention_backend_config is None:
+            self.attention_backend_config = {}
+        elif not isinstance(self.attention_backend_config, dict):
+            raise ValueError("attention_backend_config must be a JSON object")
+        self.component_attention_backends = {
+            component.replace("-", "_"): backend.lower()
+            for component, backend in self.component_attention_backends.items()
+        }
 
         # handle warmup
         if self.warmup_resolutions is not None:
@@ -413,12 +442,16 @@ class ServerArgs:
 
         # network initialization: port and host
         self.port = self.settle_port(self.port)
-        # Add randomization to avoid race condition when multiple servers start simultaneously
-        initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
-        self.scheduler_port = self.settle_port(initial_scheduler_port)
-        # TODO: remove hard code
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
-        self.master_port = self.settle_port(initial_master_port, 37)
+        if self.strict_ports:
+            self.scheduler_port = self.settle_port(self.scheduler_port)
+            self.master_port = self.settle_port(self.master_port or 30005)
+        else:
+            # Add randomization to avoid race condition when multiple servers start simultaneously
+            initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
+            self.scheduler_port = self.settle_port(initial_scheduler_port)
+            # TODO: remove hard code
+            initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
+            self.master_port = self.settle_port(initial_master_port, 37)
         if self.moba_config_path:
             try:
                 with open(self.moba_config_path) as f:
@@ -449,6 +482,12 @@ class ServerArgs:
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         )
         parser.add_argument(
+            "--model-id",
+            type=str,
+            default=None,
+            help="Stable model identifier recorded by qualification tooling.",
+        )
+        parser.add_argument(
             "--vae-path",
             type=str,
             default=ServerArgs.vae_path,
@@ -466,6 +505,12 @@ class ServerArgs:
                 "use diffusers attention backend names such as flash, _flash_3_hub, "
                 "sage, or xformers."
             ),
+        )
+        parser.add_argument(
+            "--attention-backend-config",
+            type=str,
+            default=None,
+            help="JSON object configuring the selected attention backend.",
         )
         parser.add_argument(
             "--diffusers-attention-backend",
@@ -696,6 +741,12 @@ class ServerArgs:
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--strict-ports",
+            action=StoreBoolean,
+            default=ServerArgs.strict_ports,
+            help="Fail if an explicitly requested port is unavailable.",
+        )
+        parser.add_argument(
             "--webui",
             action=StoreBoolean,
             default=ServerArgs.webui,
@@ -771,6 +822,11 @@ class ServerArgs:
         """
         Find an available port with retry logic.
         """
+        if self.strict_ports:
+            if not is_port_available(port):
+                raise RuntimeError(f"Requested port {port} is unavailable")
+            return port
+
         attempts = 0
         original_port = port
 
@@ -793,6 +849,28 @@ class ServerArgs:
             f"Failed to find available port after {max_attempts} attempts "
             f"(started from port {original_port})"
         )
+
+    def resolve_component_attention_backend(
+        self, *component_names: str | None
+    ) -> tuple[AttentionBackendEnum | None, str | None]:
+        for component_name in component_names:
+            if component_name is None:
+                continue
+            key = component_name.replace("-", "_")
+            fallback_keys = [key]
+            if key.endswith("_2"):
+                fallback_keys.append(key[:-2])
+            for backend_key in fallback_keys:
+                backend = self.component_attention_backends.get(backend_key)
+                if backend is not None:
+                    try:
+                        return AttentionBackendEnum[backend.upper()], backend_key
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"Invalid attention backend {backend!r} for component "
+                            f"{backend_key!r}"
+                        ) from exc
+        return None, None
 
     @classmethod
     def from_cli_args(

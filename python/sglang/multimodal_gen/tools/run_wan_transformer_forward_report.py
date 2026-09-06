@@ -27,26 +27,17 @@ def _configure_standalone_layerwise_offload(
 ) -> None:
     """Mirror worker layerwise setup after loading one standalone component."""
 
-    if not server_args.has_layerwise_offload_components():
+    if not server_args.dit_layerwise_offload:
         return
-    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-        configure_layerwise_offload_modules,
+    from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+        OffloadableDiTMixin,
     )
 
-    configure_layerwise_offload_modules(
-        {component_name: model},
-        server_args,
-        component_names=(
-            None
-            if server_args.component_residency is not None
-            else server_args.layerwise_offload_components
-        ),
-        warn_missing=(
-            server_args.component_residency is not None
-            or server_args.is_arg_explicitly_set("layerwise_offload_components")
-            or server_args.is_arg_explicitly_set("dit_layerwise_offload")
-        ),
-    )
+    if not isinstance(model, OffloadableDiTMixin):
+        raise TypeError(
+            f"component {component_name!r} does not support layerwise offload"
+        )
+    model.configure_layerwise_offload(server_args)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -147,17 +138,12 @@ def _initialize_single_gpu_runtime(master_port: int) -> None:
     maybe_init_distributed_environment_and_model_parallel(
         tp_size=1,
         sp_size=1,
-        cfg_degree=1,
+        enable_cfg_parallel=False,
         ulysses_degree=1,
         ring_degree=1,
         dp_size=1,
         distributed_init_method=f"tcp://127.0.0.1:{master_port}",
     )
-    from sglang.srt.runtime_context import get_context
-    from sglang.srt.server_args import ServerArgs as SrtServerArgs
-
-    if get_context()._server_args is None:
-        get_context().set_server_args(SrtServerArgs(model_path="dummy"))
 
 
 def build_direct_server_kwargs(
@@ -177,7 +163,7 @@ def build_direct_server_kwargs(
         "model_path": model_root,
         "backend": "sglang",
         "num_gpus": 1,
-        "warmup_mode": "off",
+        "warmup": False,
         "scheduler_port": scheduler_port,
         "strict_ports": strict_ports,
         "attention_backend": attention_backend,
@@ -220,7 +206,7 @@ def _load_component(
     strict_ports: bool,
     http_port: int | None = None,
 ) -> Any:
-    from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    from sglang.multimodal_gen.runtime.loader.component_loader import (
         PipelineComponentLoader,
     )
     from sglang.multimodal_gen.runtime.server_args import (
@@ -242,25 +228,11 @@ def _load_component(
     )
     server_args = ServerArgs.from_kwargs(**kwargs)
     set_global_server_args(server_args)
-    config = json.loads(
-        (Path(component_path) / "config.json").read_text(encoding="utf-8")
-    )
-    architecture = config.get("_class_name")
-    if not isinstance(architecture, str) or not architecture:
-        raise ValueError("captured component config has no _class_name")
-    backend, matched_name = server_args.resolve_component_attention_backend(
-        component_name
-    )
-    if backend is None:
-        raise RuntimeError("direct Wan qualification did not resolve attention backend")
-    model, _memory_usage = PipelineComponentLoader.load_component(
-        component_name=component_name,
+    model, _memory_usage = PipelineComponentLoader.load_module(
+        module_name=component_name,
         component_model_path=component_path,
         transformers_or_diffusers="diffusers",
         server_args=server_args,
-        component_architecture=architecture,
-        component_attn_backend=backend,
-        component_attn_name=matched_name or component_name,
     )
     _configure_standalone_layerwise_offload(
         model,

@@ -23,7 +23,7 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     iter_materialized_weights,
 )
 

@@ -17,8 +17,8 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    LayerwiseOffloadableModuleMixin,
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+    OffloadableDiTMixin,
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.qualification.wan_transformer_capture import (
@@ -621,7 +621,7 @@ class _LayerwiseCudaBlock(nn.Module):
         return hidden_states + self.weight
 
 
-class _LayerwiseCudaTransformer(nn.Module, LayerwiseOffloadableModuleMixin):
+class _LayerwiseCudaTransformer(nn.Module, OffloadableDiTMixin):
     layer_names = ["blocks"]
 
     def __init__(self):
@@ -635,27 +635,9 @@ class _LayerwiseCudaTransformer(nn.Module, LayerwiseOffloadableModuleMixin):
 
 
 class _DirectLayerwiseServerArgs:
-    component_residency = None
-    layerwise_offload_components = ["dit"]
-    pipeline_class_name = None
+    dit_layerwise_offload = True
+    dit_offload_prefetch_size = 1
     pin_cpu_memory = False
-
-    @staticmethod
-    def has_layerwise_offload_components():
-        return True
-
-    @staticmethod
-    def is_arg_explicitly_set(_name):
-        return False
-
-    @staticmethod
-    def layerwise_tuning_for(_component_name, *, dit_group):
-        assert dit_group is True
-        return 1, 0, "leading"
-
-    @staticmethod
-    def record_component_layerwise_capability(_component_name, *, supported):
-        assert supported is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA autocast")

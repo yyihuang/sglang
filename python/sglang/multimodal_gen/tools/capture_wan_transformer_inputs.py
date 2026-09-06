@@ -129,7 +129,7 @@ def main() -> None:
         "backend": "sglang",
         "num_gpus": 1,
         "master_port": args.master_port,
-        "warmup_mode": "off",
+        "warmup": False,
         "attention_backend": args.attention_backend,
     }
     if args.model_id:

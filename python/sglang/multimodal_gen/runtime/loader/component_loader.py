@@ -10,7 +10,7 @@ import os
 import traceback
 from abc import ABC
 from collections.abc import Generator, Iterable
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import Any, cast
 
 import torch
@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
     shard_model,
@@ -160,6 +163,14 @@ class ComponentLoader(ABC):
             )
             source = "sgl-diffusion"
         except Exception as e:
+            if (
+                _normalize_module_type(module_name) == "transformer"
+                and server_args.transformer_weights_path is not None
+            ):
+                raise RuntimeError(
+                    "explicit transformer_weights_path failed customized loading; "
+                    "refusing native fallback"
+                ) from e
             if "Unsupported model architecture" in str(e):
                 logger.info(
                     f"Module: {module_name} doesn't have a customized version yet, using native version"
@@ -900,31 +911,23 @@ class TransformerLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        # Find all safetensors files
-        safetensors_list = _list_safetensors_files(component_model_path)
-        if not safetensors_list:
-            raise ValueError(f"No safetensors files found in {component_model_path}")
-
-        # Check if we should use custom initialization weights
-        custom_weights_path = getattr(
-            server_args, "init_weights_from_safetensors", None
-        )
-        use_custom_weights = False
-
-        if use_custom_weights:
-            logger.info(
-                "Using custom initialization weights from: %s", custom_weights_path
+        # Find all safetensors files, honoring an explicit qualification
+        # checkpoint without changing the component config source.
+        custom_weights_path = server_args.transformer_weights_path
+        if custom_weights_path is None:
+            safetensors_list = _list_safetensors_files(component_model_path)
+        elif os.path.isdir(custom_weights_path):
+            safetensors_list = _list_safetensors_files(custom_weights_path)
+        elif custom_weights_path.endswith(".safetensors"):
+            safetensors_list = [custom_weights_path]
+        else:
+            raise ValueError(
+                "transformer_weights_path must be a safetensors file or directory"
             )
-            assert (
-                custom_weights_path is not None
-            ), "Custom initialization weights must be provided"
-            if os.path.isdir(custom_weights_path):
-                safetensors_list = _list_safetensors_files(custom_weights_path)
-            else:
-                assert custom_weights_path.endswith(
-                    ".safetensors"
-                ), "Custom initialization weights must be a safetensors file"
-                safetensors_list = [custom_weights_path]
+        if not safetensors_list:
+            raise ValueError(
+                f"No safetensors files found in {custom_weights_path or component_model_path}"
+            )
 
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
@@ -1105,15 +1108,27 @@ class PipelineComponentLoader:
 
         # Get the appropriate loader for this module type
         loader = ComponentLoader.for_module_type(module_name, transformers_or_diffusers)
+        component_server_args = server_args
+        if _normalize_module_type(module_name) == "transformer":
+            component_override = server_args.component_transformer_weights_paths.get(
+                module_name
+            )
+            if module_name != "transformer" or component_override is not None:
+                component_server_args = copy(server_args)
+                component_server_args.transformer_weights_path = component_override
+        component_backend, _ = server_args.resolve_component_attention_backend(
+            module_name
+        )
 
         try:
             # Load the module
-            return loader.load(
-                component_model_path,
-                server_args,
-                module_name,
-                transformers_or_diffusers,
-            )
+            with component_attn_backend_context_manager(component_backend):
+                return loader.load(
+                    component_model_path,
+                    component_server_args,
+                    module_name,
+                    transformers_or_diffusers,
+                )
         except Exception as e:
             logger.error(
                 f"Error while loading component: {module_name}, {component_model_path=}"

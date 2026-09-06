@@ -6,6 +6,7 @@
 import os
 from collections.abc import Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cache
 from typing import cast
 
@@ -61,6 +62,9 @@ def get_env_variable_attn_backend() -> AttentionBackendEnum | None:
 # THIS SELECTION TAKES PRECEDENCE OVER THE
 # FASTVIDEO ATTENTION BACKEND ENVIRONMENT VARIABLE
 forced_attn_backend: AttentionBackendEnum | None = None
+component_forced_attn_backend: ContextVar[AttentionBackendEnum | None] = ContextVar(
+    "component_forced_attn_backend", default=None
+)
 
 
 def global_force_attn_backend(attn_backend: AttentionBackendEnum | None) -> None:
@@ -87,8 +91,7 @@ def get_global_forced_attn_backend() -> AttentionBackendEnum | None:
 
 
 def get_component_forced_attn_backend() -> AttentionBackendEnum | None:
-    """Current main has no component override scope; retain the public hook."""
-    return None
+    return component_forced_attn_backend.get()
 
 
 def get_attn_backend(
@@ -106,11 +109,16 @@ def get_attn_backend(
         be_tuple = tuple(
             sorted(list(supported_attention_backends), key=lambda b: b.name)
         )
+    effective_selected_backend = selected_attention_backend
+    if effective_selected_backend is None:
+        effective_selected_backend = get_global_forced_attn_backend()
+    if effective_selected_backend is None:
+        effective_selected_backend = get_component_forced_attn_backend()
     return _cached_get_attn_backend(
         head_size,
         dtype,
         be_tuple,
-        selected_attention_backend,
+        effective_selected_backend,
         default_attention_backend,
         is_cross_attention,
     )
@@ -180,6 +188,20 @@ def _cached_get_attn_backend(
             f"Invalid attention backend for {current_platform.device_name}"
         )
     return cast(type[AttentionBackend], resolve_obj_by_qualname(attention_cls))
+
+
+@contextmanager
+def component_attn_backend_context_manager(
+    attn_backend: AttentionBackendEnum | None,
+) -> Generator[None, None, None]:
+    if attn_backend is None:
+        yield
+        return
+    token = component_forced_attn_backend.set(attn_backend)
+    try:
+        yield
+    finally:
+        component_forced_attn_backend.reset(token)
 
 
 @contextmanager
