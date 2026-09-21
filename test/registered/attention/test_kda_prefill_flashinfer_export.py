@@ -71,12 +71,19 @@ def _make_inputs(seq_lens, num_heads, *, state_dtype=torch.float32):
         beta=torch.randn(1, total_tokens, 40, device="cuda", dtype=torch.bfloat16)[
             :, :, 8 : 8 + num_heads
         ],
-        A_log=(
-            torch.randn(1, 1, num_heads, 1, device="cuda", dtype=torch.float32) * 0.2
-        ).contiguous(),
-        dt_bias=(
-            torch.randn(num_heads * K, device="cuda", dtype=torch.float32) * 0.1
-        ).contiguous(),
+        # Real models hand these over as nn.Parameters (requires_grad=True); the
+        # adapter must detach them before calling the export.
+        A_log=torch.nn.Parameter(
+            (
+                torch.randn(1, 1, num_heads, 1, device="cuda", dtype=torch.float32)
+                * 0.2
+            ).contiguous()
+        ),
+        dt_bias=torch.nn.Parameter(
+            (
+                torch.randn(num_heads * K, device="cuda", dtype=torch.float32) * 0.1
+            ).contiguous()
+        ),
         state=(
             torch.randn(pool_size, num_heads, V, K, device="cuda", dtype=state_dtype)
             * 0.01

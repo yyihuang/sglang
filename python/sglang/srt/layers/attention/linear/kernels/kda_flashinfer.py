@@ -446,9 +446,13 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         cached = self._gate_cache.get(key)
         if cached is not None:
             return cached
-        A_log_fi = A_log.reshape(-1).float().contiguous()
+        # Model weights arrive as nn.Parameters (requires_grad=True); the
+        # exported prepared prefill refuses autograd-tracked inputs, so detach.
+        A_log_fi = A_log.detach().reshape(-1).float().contiguous()
         dt_bias_fi = (
-            dt_bias.reshape(-1).float().contiguous() if dt_bias is not None else None
+            dt_bias.detach().reshape(-1).float().contiguous()
+            if dt_bias is not None
+            else None
         )
         self._gate_cache[key] = (A_log_fi, dt_bias_fi)
         return A_log_fi, dt_bias_fi
