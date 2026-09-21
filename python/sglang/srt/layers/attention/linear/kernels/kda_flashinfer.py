@@ -210,6 +210,37 @@ def _get_flashinfer_prepared_bf16_prefill():
     return _flashinfer_prepared_bf16_available, _flashinfer_prepare_bf16_kda_prefill
 
 
+_KDA_PREFILL_DUMP_DIR = os.environ.get("SGLANG_KDA_PREFILL_DUMP_DIR", "")
+_KDA_PREFILL_DUMP_LIMIT = int(os.environ.get("SGLANG_KDA_PREFILL_DUMP_LIMIT", "64"))
+_kda_prefill_dump_count = 0
+
+
+def _maybe_dump_kda_prefill_call(layer_id: int, **tensors) -> None:
+    """Persist real prefill activations (opt-in) for offline per-chunk state checks.
+
+    Enabled by SGLANG_KDA_PREFILL_DUMP_DIR; saves at most
+    SGLANG_KDA_PREFILL_DUMP_LIMIT calls per process. Tensors are cloned to CPU
+    after a device sync, so this is a diagnostic mode only.
+    """
+    global _kda_prefill_dump_count
+    if not _KDA_PREFILL_DUMP_DIR or _kda_prefill_dump_count >= _KDA_PREFILL_DUMP_LIMIT:
+        return
+    torch.cuda.synchronize()
+    os.makedirs(_KDA_PREFILL_DUMP_DIR, exist_ok=True)
+    record = {"layer_id": int(layer_id), "rank": int(os.environ.get("RANK", "0") or 0)}
+    for name, value in tensors.items():
+        if isinstance(value, torch.Tensor):
+            record[name] = value.detach().to("cpu", copy=True)
+        else:
+            record[name] = value
+    path = os.path.join(
+        _KDA_PREFILL_DUMP_DIR,
+        f"kda_prefill_rank{record['rank']}_{_kda_prefill_dump_count:04d}_layer{int(layer_id)}.pt",
+    )
+    torch.save(record, path)
+    _kda_prefill_dump_count += 1
+
+
 def _cake_prefill_api_policy() -> str:
     """``auto`` (default), ``prepared`` or ``facade`` from SGLANG_KDA_CAKE_PREFILL_API.
 
@@ -979,6 +1010,35 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 and track_ssm_h_src.numel() > 0
             )
             if self._cake_prefill_uses_prepared_export(ssm_states):
+                if _KDA_PREFILL_DUMP_DIR:
+                    _maybe_dump_kda_prefill_call(
+                        layer_id,
+                        q=q,
+                        k=k,
+                        v=v,
+                        g=g,
+                        beta=beta,
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        lower_bound=lower_bound,
+                        cu_seqlens=query_start_loc_fi,
+                        sequence_lengths=tuple(
+                            int(n) for n in (kwargs.get("extend_seq_lens_cpu") or ())
+                        ),
+                        cache_indices=cache_indices,
+                        initial_state=ssm_states[cache_indices.long()],
+                        checkpoint_cu_starts=(
+                            state_checkpoint_cu_starts if needs_checkpoints else None
+                        ),
+                        num_state_checkpoints=(
+                            int(num_state_checkpoints) if needs_checkpoints else 0
+                        ),
+                        checkpoint_every_n_tokens=(
+                            int(state_checkpoint_every_n_tokens)
+                            if needs_checkpoints
+                            else 0
+                        ),
+                    )
                 output, state_checkpoints, schedule = self._extend_cake_prepared_bf16(
                     q,
                     k,
