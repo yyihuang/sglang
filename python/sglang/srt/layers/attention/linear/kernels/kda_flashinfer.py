@@ -178,6 +178,54 @@ def _get_flashinfer_kda_prefill_kernel():
     return _flashinfer_kda_prefill_available, _flashinfer_recurrent_kda_facade
 
 
+_flashinfer_prepared_bf16_available: Optional[bool] = None
+_flashinfer_prepare_bf16_kda_prefill = None
+
+
+def _get_flashinfer_prepared_bf16_prefill():
+    """Lazy import for the exported BF16 KDA prepared-call prefill API.
+
+    ``flashinfer.prepare_bf16_kda_prefill`` (flashinfer-ai/flashinfer#5278,
+    routing #5363, regenerated modules #5370) prepares one complete packed
+    prefill on an FP32 external state pool with BF16 checkpoints and submits it
+    with ``launch()``. It is the export of the Cake BF16 dispatcher that the
+    346-row source/export campaign validated bitwise.
+    """
+    global _flashinfer_prepared_bf16_available, _flashinfer_prepare_bf16_kda_prefill
+    if _flashinfer_prepared_bf16_available is None:
+        try:
+            from flashinfer import prepare_bf16_kda_prefill
+
+            _flashinfer_prepare_bf16_kda_prefill = prepare_bf16_kda_prefill
+            _flashinfer_prepared_bf16_available = True
+            logger.info(
+                "FlashInfer prepared BF16 KDA prefill export loaded successfully"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "FlashInfer prepared BF16 KDA prefill export unavailable: %s", exc
+            )
+            _flashinfer_prepared_bf16_available = False
+            _flashinfer_prepare_bf16_kda_prefill = None
+    return _flashinfer_prepared_bf16_available, _flashinfer_prepare_bf16_kda_prefill
+
+
+def _cake_prefill_api_policy() -> str:
+    """``auto`` (default), ``prepared`` or ``facade`` from SGLANG_KDA_CAKE_PREFILL_API.
+
+    ``auto`` selects the prepared BF16 export whenever the recurrent state pool
+    is FP32 (the export's external-state contract) and the FlashInfer build
+    exposes it; BF16 pools keep the ``recurrent_kda(backend="cake")`` facade.
+    """
+    policy = os.environ.get("SGLANG_KDA_CAKE_PREFILL_API", "auto").strip().lower()
+    if policy not in ("auto", "prepared", "facade"):
+        raise ValueError(
+            "SGLANG_KDA_CAKE_PREFILL_API must be auto, prepared or facade, "
+            f"got {policy!r}"
+        )
+    return policy
+
+
 def _get_flashinfer_packed_kda_kernel():
     """Lazy import for the exported CAKE packed-decode facade."""
     global _flashinfer_packed_kda_available, _flashinfer_packed_kda_decode
@@ -500,6 +548,135 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
     @staticmethod
+    def _check_cake_fp32_state_contract(
+        ssm_states: torch.Tensor,
+        *,
+        num_v_heads: int,
+        head_v_dim: int,
+        head_k_dim: int,
+    ) -> None:
+        expected_inner = (num_v_heads, head_v_dim, head_k_dim)
+        if ssm_states.dtype != torch.float32:
+            raise ValueError(
+                "prepared BF16 KDA export requires an FP32 state pool, got "
+                f"{ssm_states.dtype}"
+            )
+        if ssm_states.dim() != 4 or tuple(ssm_states.shape[1:]) != expected_inner:
+            raise ValueError(
+                "prepared BF16 KDA export needs a [N, HV, V, K] state pool with "
+                f"(HV, V, K)={expected_inner}; got {tuple(ssm_states.shape)}"
+            )
+        if ssm_states.stride()[1:] != (head_v_dim * head_k_dim, head_k_dim, 1):
+            raise ValueError(
+                "prepared BF16 KDA export needs compact per-slot state strides, "
+                f"got {tuple(ssm_states.stride())}"
+            )
+
+    def _cake_prefill_uses_prepared_export(self, ssm_states: torch.Tensor) -> bool:
+        policy = _cake_prefill_api_policy()
+        if policy == "facade":
+            return False
+        available, _ = _get_flashinfer_prepared_bf16_prefill()
+        if policy == "prepared":
+            if not available:
+                raise RuntimeError(
+                    "SGLANG_KDA_CAKE_PREFILL_API=prepared but the installed FlashInfer "
+                    "does not export prepare_bf16_kda_prefill"
+                )
+            return True
+        return bool(available) and ssm_states.dtype == torch.float32
+
+    def _extend_cake_prepared_bf16(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc_fi: torch.Tensor,
+        extend_seq_lens_cpu,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float,
+        needs_checkpoints: bool,
+        num_state_checkpoints: int,
+        state_checkpoint_cu_starts: Optional[torch.Tensor],
+        state_checkpoint_every_n_tokens: int,
+    ):
+        """Run the exported prepared BF16 prefill; returns (output, checkpoints, schedule)."""
+        _, prepare_bf16_kda_prefill = _get_flashinfer_prepared_bf16_prefill()
+        num_v_heads, head_v_dim, head_k_dim = v.shape[2], v.shape[3], q.shape[3]
+        self._check_cake_fp32_state_contract(
+            ssm_states,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            head_k_dim=head_k_dim,
+        )
+        if extend_seq_lens_cpu is None:
+            raise ValueError(
+                "prepared BF16 KDA export requires host extend_seq_lens_cpu"
+            )
+        sequence_lengths = tuple(int(n) for n in extend_seq_lens_cpu)
+        if len(sequence_lengths) != query_start_loc_fi.numel() - 1:
+            raise ValueError(
+                "extend_seq_lens_cpu does not match query_start_loc: "
+                f"{len(sequence_lengths)} lengths for "
+                f"{query_start_loc_fi.numel() - 1} sequences"
+            )
+        A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
+        num_heads = q.shape[2]
+        A_log_fi = A_log_fi.reshape(num_heads)
+        dt_bias_fi = dt_bias_fi.reshape(num_heads, head_k_dim)
+        if cache_indices.dtype != torch.int32:
+            cache_indices = cache_indices.to(torch.int32)
+        out = torch.empty_like(q)
+        state_checkpoints = (
+            torch.empty(
+                (num_state_checkpoints, num_v_heads, head_v_dim, head_k_dim),
+                device=q.device,
+                dtype=torch.bfloat16,
+            )
+            if needs_checkpoints
+            else None
+        )
+        prepared = prepare_bf16_kda_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log_fi,
+            dt_bias=dt_bias_fi,
+            out=out,
+            initial_state=ssm_states,
+            final_state=ssm_states,
+            scale=None,
+            lower_bound=float(lower_bound),
+            cu_seqlens=query_start_loc_fi,
+            sequence_lengths=sequence_lengths,
+            state_indices=cache_indices,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=(
+                state_checkpoint_cu_starts if needs_checkpoints else None
+            ),
+            checkpoint_every_n_tokens=(
+                int(state_checkpoint_every_n_tokens) if needs_checkpoints else 0
+            ),
+            beta_is_logit=True,
+        )
+        try:
+            prepared.launch()
+            schedule = str(getattr(prepared, "schedule", "prepared_bf16"))
+        finally:
+            close = getattr(prepared, "close", None)
+            if callable(close):
+                close()
+        return out, state_checkpoints, schedule
+
+    @staticmethod
     def _cake_prefill_is_supported(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -791,6 +968,56 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             return output
 
         try:
+            query_start_loc_fi = (
+                cake_query_start_loc
+                if cake_query_start_loc is not None
+                else query_start_loc.to(torch.int64)
+            )
+            needs_checkpoints = bool(
+                return_intermediate_states
+                and track_ssm_h_src is not None
+                and track_ssm_h_src.numel() > 0
+            )
+            if self._cake_prefill_uses_prepared_export(ssm_states):
+                output, state_checkpoints, schedule = self._extend_cake_prepared_bf16(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc_fi=query_start_loc_fi,
+                    extend_seq_lens_cpu=kwargs.get("extend_seq_lens_cpu"),
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    lower_bound=lower_bound,
+                    needs_checkpoints=needs_checkpoints,
+                    num_state_checkpoints=num_state_checkpoints,
+                    state_checkpoint_cu_starts=state_checkpoint_cu_starts,
+                    state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+                )
+                if return_intermediate_states:
+                    h = (
+                        state_checkpoints.to(ssm_states.dtype).unsqueeze(0)
+                        if state_checkpoints is not None
+                        else ssm_states.new_empty((1, 0, *ssm_states.shape[1:]))
+                    )
+                    result = output, h
+                else:
+                    result = output
+                record_kda_terminal_route(
+                    mode="prefill",
+                    layer_id=layer_id,
+                    eligible=True,
+                    attempted_cake=True,
+                    cake_success=True,
+                    triton_fallback=False,
+                    fatal=False,
+                    reason=admission.reason,
+                    detail=f"prepared_bf16:{schedule}",
+                )
+                return result
             self._check_cake_state_contract(
                 ssm_states,
                 num_v_heads=v.shape[2],
@@ -805,16 +1032,6 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 )
 
             A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
-            query_start_loc_fi = (
-                cake_query_start_loc
-                if cake_query_start_loc is not None
-                else query_start_loc.to(torch.int64)
-            )
-            needs_checkpoints = bool(
-                return_intermediate_states
-                and track_ssm_h_src is not None
-                and track_ssm_h_src.numel() > 0
-            )
             state_checkpoints = (
                 ssm_states.new_empty((num_state_checkpoints, *ssm_states.shape[1:]))
                 if needs_checkpoints
