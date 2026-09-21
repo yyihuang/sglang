@@ -241,6 +241,17 @@ def _maybe_dump_kda_prefill_call(layer_id: int, **tensors) -> None:
     _kda_prefill_dump_count += 1
 
 
+def _cake_prefill_gate_bound_ok(
+    lower_bound: Optional[float], allow_unbounded: bool
+) -> bool:
+    """Bounded gate: finite negative lower bound. The prepared BF16 export also
+    serves the unbounded softplus gate (``lower_bound=None``, e.g. Kimi-Linear);
+    the recurrent_kda facade does not."""
+    if lower_bound is None:
+        return allow_unbounded
+    return math.isfinite(float(lower_bound)) and float(lower_bound) < 0.0
+
+
 def _cake_prefill_api_policy() -> str:
     """``auto`` (default), ``prepared`` or ``facade`` from SGLANG_KDA_CAKE_PREFILL_API.
 
@@ -631,7 +642,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         extend_seq_lens_cpu,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
-        lower_bound: float,
+        lower_bound: Optional[float],
         needs_checkpoints: bool,
         num_state_checkpoints: int,
         state_checkpoint_cu_starts: Optional[torch.Tensor],
@@ -685,7 +696,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             initial_state=ssm_states,
             final_state=ssm_states,
             scale=None,
-            lower_bound=float(lower_bound),
+            lower_bound=None if lower_bound is None else float(lower_bound),
             cu_seqlens=query_start_loc_fi,
             sequence_lengths=sequence_lengths,
             state_indices=cache_indices,
@@ -725,6 +736,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
         num_state_checkpoints: int = 0,
         state_checkpoint_every_n_tokens: int = 0,
+        allow_unbounded_gate: bool = False,
     ) -> bool:
         """Check the public frozen-prefill contract without a device sync."""
         needs_checkpoints = bool(
@@ -744,9 +756,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                     or state_checkpoint_every_n_tokens % 32 != 0
                 )
             )
-            or lower_bound is None
-            or not math.isfinite(float(lower_bound))
-            or float(lower_bound) >= 0.0
+            or not _cake_prefill_gate_bound_ok(lower_bound, allow_unbounded_gate)
         ):
             return False
         if (
@@ -792,6 +802,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
         num_state_checkpoints: int = 0,
         state_checkpoint_every_n_tokens: int = 0,
+        allow_unbounded_gate: bool = False,
     ) -> CakePrefillAdmission:
         """Attach stable telemetry reasons without changing admission policy."""
         supported = CakeKDAKernel._cake_prefill_is_supported(
@@ -810,6 +821,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             state_checkpoint_cu_starts=state_checkpoint_cu_starts,
             num_state_checkpoints=num_state_checkpoints,
             state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            allow_unbounded_gate=allow_unbounded_gate,
         )
         if supported:
             return CakePrefillAdmission(True, CakePrefillReason.ELIGIBLE)
@@ -836,11 +848,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 CakePrefillReason.INTERIOR_CHECKPOINT,
                 "state_checkpoint_plan",
             )
-        if (
-            lower_bound is None
-            or not math.isfinite(float(lower_bound))
-            or float(lower_bound) >= 0.0
-        ):
+        if not _cake_prefill_gate_bound_ok(lower_bound, allow_unbounded_gate):
             return CakePrefillAdmission(
                 False, CakePrefillReason.INVALID_LOWER_BOUND, "lower_bound"
             )
@@ -938,6 +946,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         )
         track_ssm_h_src = kwargs.get("track_ssm_h_src")
         try:
+            use_prepared_export = self._cake_prefill_uses_prepared_export(ssm_states)
             admission = self._cake_prefill_admission(
                 q,
                 k,
@@ -954,6 +963,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 state_checkpoint_cu_starts=state_checkpoint_cu_starts,
                 num_state_checkpoints=num_state_checkpoints,
                 state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+                allow_unbounded_gate=use_prepared_export,
             )
         except Exception as exc:
             record_kda_terminal_route(
@@ -1009,7 +1019,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 and track_ssm_h_src is not None
                 and track_ssm_h_src.numel() > 0
             )
-            if self._cake_prefill_uses_prepared_export(ssm_states):
+            if use_prepared_export:
                 if _KDA_PREFILL_DUMP_DIR:
                     _maybe_dump_kda_prefill_call(
                         layer_id,

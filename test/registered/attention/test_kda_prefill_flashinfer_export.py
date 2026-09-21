@@ -86,7 +86,7 @@ def _make_inputs(seq_lens, num_heads, *, state_dtype=torch.float32):
     )
 
 
-def _extend(kernel, data, state, seq_lens, **kwargs):
+def _extend(kernel, data, state, seq_lens, lower_bound=LOWER_BOUND, **kwargs):
     if getattr(kernel, "supports_cake_route_telemetry", False):
         kwargs["layer_id"] = 7
     beta = data["beta"]
@@ -103,7 +103,7 @@ def _extend(kernel, data, state, seq_lens, **kwargs):
         query_start_loc=data["cu_seqlens"],
         A_log=data["A_log"],
         dt_bias=data["dt_bias"],
-        lower_bound=LOWER_BOUND,
+        lower_bound=lower_bound,
         extend_seq_lens_cpu=seq_lens,
         **kwargs,
     )
@@ -200,6 +200,34 @@ def test_kda_prefill_prepared_export_native_checkpoints():
         for j in range(first + 1, starts[seq + 1]):
             err = _rel_l2(h[0, j], h_ref[0, j])
             assert err < 1e-2, f"sequence {seq} chunk {j - first}: rel L2 {err:.4g}"
+
+
+@pytest.mark.parametrize(
+    "num_heads,seq_lens",
+    [(16, [64, 160]), (8, [17, 64, 65, 127, 128, 255]), (16, [8192])],
+)
+def test_kda_prefill_prepared_export_unbounded_gate_matches_triton(num_heads, seq_lens):
+    """Kimi-Linear has no gate lower bound; the export serves the unbounded softplus gate."""
+    torch.manual_seed(99 + num_heads + sum(seq_lens))
+    data = _make_inputs(seq_lens, num_heads)
+    state_triton = data["state"].clone()
+    state_cake = data["state"].clone()
+    output_triton = _extend(
+        TritonKDAKernel(), data, state_triton, seq_lens, lower_bound=None
+    )
+    with patch.object(
+        CakeKDAKernel,
+        "_extend_triton",
+        side_effect=AssertionError("unbounded gate must not fall back to Triton"),
+    ):
+        output_cake = _extend(
+            CakeKDAKernel(), data, state_cake, seq_lens, lower_bound=None
+        )
+    _assert_close("output", output_cake, output_triton)
+    idx = data["cache_indices"].long()
+    _assert_close(
+        "final_state", state_cake[idx], state_triton[idx], atol=1e-2, rtol=1e-2
+    )
 
 
 def test_kda_prefill_policy_facade_keeps_bf16_pool_path():
