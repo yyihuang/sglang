@@ -227,7 +227,10 @@ def _maybe_dump_kda_prefill_call(layer_id: int, **tensors) -> None:
         return
     torch.cuda.synchronize()
     os.makedirs(_KDA_PREFILL_DUMP_DIR, exist_ok=True)
-    record = {"layer_id": int(layer_id), "rank": int(os.environ.get("RANK", "0") or 0)}
+    rank = int(os.environ.get("RANK", "-1") or -1)
+    if rank < 0 and torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    record = {"layer_id": int(layer_id), "rank": max(rank, 0)}
     for name, value in tensors.items():
         if isinstance(value, torch.Tensor):
             record[name] = value.detach().to("cpu", copy=True)
@@ -235,7 +238,10 @@ def _maybe_dump_kda_prefill_call(layer_id: int, **tensors) -> None:
             record[name] = value
     path = os.path.join(
         _KDA_PREFILL_DUMP_DIR,
-        f"kda_prefill_rank{record['rank']}_{_kda_prefill_dump_count:04d}_layer{int(layer_id)}.pt",
+        # TP ranks are separate processes; the pid keeps their files distinct
+        # even when no rank information is available.
+        f"kda_prefill_rank{record['rank']}_pid{os.getpid()}_"
+        f"{_kda_prefill_dump_count:04d}_layer{int(layer_id)}.pt",
     )
     torch.save(record, path)
     _kda_prefill_dump_count += 1
