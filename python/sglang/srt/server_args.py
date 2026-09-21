@@ -6397,16 +6397,19 @@ class ServerArgs:
         # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
         # for correctness and best performance.
         prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        # CAKE prefill has two SM100+ paths: the recurrent_kda facade on a BF16
+        # state pool and the exported prepared BF16 call (FlashInfer
+        # prepare_bf16_kda_prefill) on an FP32 state pool.
         if (
             prefill == "cake"
-            and self.mamba_ssm_dtype != "bfloat16"
+            and self.mamba_ssm_dtype not in ("bfloat16", "float32")
             and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
         ):
             raise ValueError(
                 "--linear-attn-prefill-backend cake on SM100+ requires "
-                "--mamba-ssm-dtype bfloat16, "
-                f"got {self.mamba_ssm_dtype!r}"
+                "--mamba-ssm-dtype bfloat16 (recurrent_kda facade) or float32 "
+                f"(prepared BF16 export), got {self.mamba_ssm_dtype!r}"
             )
         cuda_version = torch.version.cuda
         cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
