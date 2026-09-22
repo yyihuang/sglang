@@ -360,7 +360,7 @@ class KDATerminalRouteTelemetry:
                 self._events.append(event)
                 self._event_count += 1
                 self._counters[key].add(event)
-        if self._emit_log:
+        if self._emit_log and self._logger.isEnabledFor(logging.INFO):
             for event in events:
                 self._logger.info("%s%s", KDA_ROUTE_EVENT_PREFIX, event.to_json())
 

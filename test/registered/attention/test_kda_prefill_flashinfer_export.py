@@ -158,15 +158,25 @@ def test_kda_prefill_prepared_export_matches_triton(num_heads, seq_lens):
     assert torch.equal(state_cake[untouched], data["state"][untouched])
 
 
+def _export_has_fp32_checkpoints() -> bool:
+    """Whether the installed FlashInfer exports FP32 intermediate states here."""
+    try:
+        from flashinfer.kda_prefill import kda_prefill_supports_fp32_checkpoints
+    except ImportError:
+        return False
+    return bool(kda_prefill_supports_fp32_checkpoints(torch.device("cuda")))
+
+
 def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12))
 
 
 @torch.no_grad()
-def _fp32_reference(data, seq, seq_lens):
+def _fp32_reference(data, seq, seq_lens, chunk_every=None):
     """Token-by-token FP32 KDA recurrence for one sequence of ``data`` (the same
     math as the kernels: L2-normalised q/k, softplus gate scaled by -exp(A_log),
-    sigmoid beta). Returns (output [T, H, V], final state [H, V, K])."""
+    sigmoid beta). Returns (output [T, H, V], final state [H, V, K]); with
+    ``chunk_every`` also the list of states at the start of every chunk."""
     start = sum(seq_lens[:seq])
     stop = start + seq_lens[seq]
     q = data["q"][0, start:stop].float()
@@ -185,11 +195,16 @@ def _fp32_reference(data, seq, seq_lens):
     state = data["state"][data["cache_indices"][seq].long()].float()
     s = state.transpose(-1, -2).clone()  # [H, K, V]
     out = torch.empty(q.shape[0], num_heads, V, device=q.device, dtype=torch.float32)
+    chunks = [s.transpose(-1, -2).clone()]
     for t in range(q.shape[0]):
         s = s * torch.exp(g[t])[:, :, None]
         v_pred = torch.einsum("hk,hkv->hv", k[t], s)
         s = s + torch.einsum("hk,hv->hkv", k[t], beta[t][:, None] * (v[t] - v_pred))
         out[t] = torch.einsum("hk,hkv->hv", q[t], s)
+        if chunk_every and (t + 1) % chunk_every == 0 and t + 1 < q.shape[0]:
+            chunks.append(s.transpose(-1, -2).clone())
+    if chunk_every:
+        return out, s.transpose(-1, -2), chunks
     return out, s.transpose(-1, -2)
 
 
@@ -231,12 +246,16 @@ def test_kda_prefill_prepared_export_native_checkpoints():
     idx = data["cache_indices"].long()
     assert _rel_l2(state_cake[idx], state_ref[idx]) < 1e-2
     starts = checkpoint_cu_starts.tolist()
+    fp32_rows = _export_has_fp32_checkpoints()
     for seq in range(len(seq_lens)):
         first = starts[seq]
-        # Checkpoint 0 of every sequence is its initial state; the export stores
-        # checkpoints in BF16, so it must equal the BF16-rounded initial state exactly.
+        # Checkpoint 0 of every sequence is its initial state.  FP32 exports
+        # return it exactly; BF16 exports return the BF16-rounded state exactly.
         initial = data["state"][idx[seq]]
-        assert torch.equal(h[0, first], initial.to(torch.bfloat16).to(h.dtype))
+        if fp32_rows:
+            assert torch.equal(h[0, first], initial)
+        else:
+            assert torch.equal(h[0, first], initial.to(torch.bfloat16).to(h.dtype))
         assert _rel_l2(h[0, first], initial) < 1e-2
         for j in range(first + 1, starts[seq + 1]):
             err = _rel_l2(h[0, j], h_ref[0, j])
@@ -334,3 +353,82 @@ def test_kda_prefill_unbounded_gate_extreme_decay_matches_fp32_reference():
         assert state_err <= max(triton_state_err, 1e-2), (
             f"sequence {seq}: export {state_err:.4g} vs Triton {triton_state_err:.4g}"
         )
+
+
+def test_kda_prefill_plan_cache_reuses_prepared_launch_bitwise():
+    """Consecutive layers rebind one prepared launch; results equal an uncached kernel bit for bit."""
+    torch.manual_seed(99)
+    seq_lens = [64] * 16
+    data = _make_inputs(seq_lens, 12)
+    cp_kwargs = dict(
+        return_intermediate_states=True,
+        track_ssm_h_src=torch.arange(len(seq_lens), device="cuda", dtype=torch.int64),
+        state_checkpoint_cu_starts=torch.arange(
+            len(seq_lens) + 1, device="cuda", dtype=torch.int64
+        ),
+        num_state_checkpoints=len(seq_lens),
+        state_checkpoint_every_n_tokens=64,
+    )
+    cached = CakeKDAKernel()
+    uncached = CakeKDAKernel()
+    uncached._kda_prefill_plan_cache_disabled = True
+    # Two "layers": same shapes, different state pools (different addresses).
+    pools = [data["state"].clone(), (data["state"] * 3.0).clone()]
+    results = {}
+    for name, kernel in (("cached", cached), ("uncached", uncached)):
+        results[name] = []
+        for layer_id, pool in enumerate(pools):
+            state = pool.clone()
+            output, h = kernel.extend(
+                data["q"].clone(),
+                data["k"].clone(),
+                data["v"].clone(),
+                data["g"].clone(),
+                data["beta"],
+                ssm_states=state,
+                cache_indices=data["cache_indices"],
+                query_start_loc=data["cu_seqlens"],
+                A_log=data["A_log"],
+                dt_bias=data["dt_bias"],
+                lower_bound=None,
+                extend_seq_lens_cpu=seq_lens,
+                layer_id=layer_id,
+                **cp_kwargs,
+            )
+            results[name].append((output.clone(), state.clone(), h.clone()))
+    cache = cached._cake_prefill_plan_cache()
+    assert cache is not None and cache.misses == 1 and cache.hits == 1
+    for (o_c, s_c, h_c), (o_u, s_u, h_u) in zip(results["cached"], results["uncached"]):
+        assert torch.equal(o_c, o_u)
+        assert torch.equal(s_c, s_u)
+        assert torch.equal(h_c, h_u)
+
+
+def test_kda_prefill_fp32_checkpoints_track_fp32_reference_per_chunk():
+    """With the FP32 export, per-chunk intermediate states stay within the FP32
+    reference budget across a long sequence (no BF16 carrier drift)."""
+    if not _export_has_fp32_checkpoints():
+        pytest.skip("installed FlashInfer export writes BF16 checkpoint rows")
+    torch.manual_seed(4321)
+    seq_lens = [1024]
+    data = _make_inputs(seq_lens, 12)
+    n_cp = 16
+    cp_kwargs = dict(
+        return_intermediate_states=True,
+        track_ssm_h_src=torch.zeros(1, device="cuda", dtype=torch.int64),
+        state_checkpoint_cu_starts=torch.tensor([0, n_cp], device="cuda", dtype=torch.int64),
+        num_state_checkpoints=n_cp,
+        state_checkpoint_every_n_tokens=64,
+    )
+    state = data["state"].clone()
+    output, h = _extend(
+        CakeKDAKernel(), data, state, seq_lens, lower_bound=None, **cp_kwargs
+    )
+    assert h.dtype == torch.float32
+    ref_out, ref_state, ref_chunks = _fp32_reference(data, 0, seq_lens, chunk_every=64)
+    idx = data["cache_indices"].long()
+    assert _rel_l2(state[idx][0], ref_state) < 1e-2
+    errors = [_rel_l2(h[0, j], ref_chunks[j]) for j in range(1, n_cp)]
+    assert max(errors) < 1e-2, errors
+    # Exact carrier: the last checkpoint is no worse than the first.
+    assert errors[-1] <= 2.0 * max(errors[0], 1e-3), errors

@@ -120,7 +120,7 @@ def maybe_build_cake_checkpoint_plan(
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
     checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
 
-    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
+    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.pin_memory().to(
         device, non_blocking=True
     )
     forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
@@ -178,8 +178,23 @@ def _get_flashinfer_kda_prefill_kernel():
     return _flashinfer_kda_prefill_available, _flashinfer_recurrent_kda_facade
 
 
+_cuda_device_capability_cache: dict = {}
+
+
+def _cuda_device_capability(device: torch.device) -> tuple:
+    """Per-device cached ``torch.cuda.get_device_capability`` for the hot path."""
+    key = device.index
+    capability = _cuda_device_capability_cache.get(key)
+    if capability is None:
+        capability = torch.cuda.get_device_capability(device)
+        _cuda_device_capability_cache[key] = capability
+    return capability
+
+
 _flashinfer_prepared_bf16_available: Optional[bool] = None
 _flashinfer_prepare_bf16_kda_prefill = None
+_flashinfer_kda_prefill_plan_cache_cls = None
+_flashinfer_kda_prefill_fp32_checkpoints = False
 
 
 def _get_flashinfer_prepared_bf16_prefill():
@@ -192,12 +207,32 @@ def _get_flashinfer_prepared_bf16_prefill():
     346-row source/export campaign validated bitwise.
     """
     global _flashinfer_prepared_bf16_available, _flashinfer_prepare_bf16_kda_prefill
+    global _flashinfer_kda_prefill_plan_cache_cls
+    global _flashinfer_kda_prefill_fp32_checkpoints
     if _flashinfer_prepared_bf16_available is None:
         try:
             from flashinfer import prepare_bf16_kda_prefill
+            from flashinfer import kda_prefill as _kda_prefill_module
 
             _flashinfer_prepare_bf16_kda_prefill = prepare_bf16_kda_prefill
             _flashinfer_prepared_bf16_available = True
+            # FP32 intermediate states (FP32 chunk carrier + FP32 checkpoint
+            # rows) exist only in FlashInfer builds whose module registry
+            # exports them for this GPU; older exports write BF16 rows.
+            probe = getattr(
+                _kda_prefill_module, "kda_prefill_supports_fp32_checkpoints", None
+            )
+            _flashinfer_kda_prefill_fp32_checkpoints = bool(
+                probe(torch.device("cuda", torch.cuda.current_device()))
+                if callable(probe) and is_cuda()
+                else False
+            )
+            try:
+                from flashinfer import KDAPrefillPlanCache
+
+                _flashinfer_kda_prefill_plan_cache_cls = KDAPrefillPlanCache
+            except ImportError:
+                _flashinfer_kda_prefill_plan_cache_cls = None
             logger.info(
                 "FlashInfer prepared BF16 KDA prefill export loaded successfully"
             )
@@ -690,15 +725,26 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         if cache_indices.dtype != torch.int32:
             cache_indices = cache_indices.to(torch.int32)
         out = torch.empty_like(q)
+        # Radix-cache resumes from these rows; the FP32 export keeps them at
+        # the pool's precision and removes the BF16 -> FP32 conversion below.
+        checkpoint_dtype = (
+            torch.float32
+            if _flashinfer_kda_prefill_fp32_checkpoints
+            else torch.bfloat16
+        )
         state_checkpoints = (
             torch.empty(
                 (num_state_checkpoints, num_v_heads, head_v_dim, head_k_dim),
                 device=q.device,
-                dtype=torch.bfloat16,
+                dtype=checkpoint_dtype,
             )
             if needs_checkpoints
             else None
         )
+        plan_cache = self._cake_prefill_plan_cache()
+        prepare_kwargs = {}
+        if plan_cache is not None:
+            prepare_kwargs["plan_cache"] = plan_cache
         prepared = prepare_bf16_kda_prefill(
             q,
             k,
@@ -723,7 +769,13 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 int(state_checkpoint_every_n_tokens) if needs_checkpoints else 0
             ),
             beta_is_logit=True,
+            **prepare_kwargs,
         )
+        if plan_cache is not None:
+            # Cached launches are owned by the plan cache and are rebound to
+            # the next call's tensors; closing them would drop the workspace.
+            prepared.launch()
+            return out, state_checkpoints, str(getattr(prepared, "schedule", "prepared_bf16"))
         try:
             prepared.launch()
             schedule = str(getattr(prepared, "schedule", "prepared_bf16"))
@@ -732,6 +784,28 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             if callable(close):
                 close()
         return out, state_checkpoints, schedule
+
+    def _cake_prefill_plan_cache(self):
+        """Per-kernel FlashInfer plan cache shared by every KDA layer.
+
+        Layers of one forward batch share token shape, ``sequence_lengths``
+        and checkpoint plan and differ only in tensor addresses (state pool,
+        output, checkpoint rows), which the cache rebinds without preparing
+        again.  ``SGLANG_KDA_CAKE_PREFILL_PLAN_CACHE=0`` disables it.
+        """
+        cache = getattr(self, "_kda_prefill_plan_cache", None)
+        if cache is not None:
+            return cache
+        if getattr(self, "_kda_prefill_plan_cache_disabled", False):
+            return None
+        _get_flashinfer_prepared_bf16_prefill()
+        cache_cls = _flashinfer_kda_prefill_plan_cache_cls
+        capacity = int(os.environ.get("SGLANG_KDA_CAKE_PREFILL_PLAN_CACHE", "64"))
+        if cache_cls is None or capacity <= 0:
+            self._kda_prefill_plan_cache_disabled = True
+            return None
+        self._kda_prefill_plan_cache = cache_cls(capacity)
+        return self._kda_prefill_plan_cache
 
     @staticmethod
     def _cake_prefill_is_supported(
@@ -797,7 +871,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             return False
         if beta.shape != q.shape[:-1]:
             return False
-        return torch.cuda.get_device_capability(q.device) in ((10, 0), (10, 3))
+        return _cuda_device_capability(q.device) in ((10, 0), (10, 3))
 
     @staticmethod
     def _cake_prefill_admission(
@@ -893,7 +967,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             return CakePrefillAdmission(False, CakePrefillReason.SHAPE_MISMATCH, detail)
         if beta.shape != q.shape[:-1]:
             return CakePrefillAdmission(False, CakePrefillReason.SHAPE_MISMATCH, "beta")
-        if torch.cuda.get_device_capability(q.device) not in ((10, 0), (10, 3)):
+        if _cuda_device_capability(q.device) not in ((10, 0), (10, 3)):
             return CakePrefillAdmission(
                 False, CakePrefillReason.UNSUPPORTED_ARCH, "device_capability"
             )
@@ -1084,7 +1158,11 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 )
                 if return_intermediate_states:
                     h = (
-                        state_checkpoints.to(ssm_states.dtype).unsqueeze(0)
+                        (
+                            state_checkpoints
+                            if state_checkpoints.dtype == ssm_states.dtype
+                            else state_checkpoints.to(ssm_states.dtype)
+                        ).unsqueeze(0)
                         if state_checkpoints is not None
                         else ssm_states.new_empty((1, 0, *ssm_states.shape[1:]))
                     )
