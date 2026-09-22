@@ -216,8 +216,13 @@ def test_kda_prefill_prepared_export_native_checkpoints():
     "num_heads,seq_lens",
     [(16, [64, 160]), (8, [17, 64, 65, 127, 128, 255]), (16, [8192])],
 )
-def test_kda_prefill_prepared_export_unbounded_gate_matches_triton(num_heads, seq_lens):
-    """Kimi-Linear has no gate lower bound; the export serves the unbounded softplus gate."""
+def test_kda_prefill_prepared_export_unbounded_gate_matches_triton(
+    num_heads, seq_lens, monkeypatch
+):
+    """Kimi-Linear has no gate lower bound; the export serves the unbounded softplus gate
+    only when explicitly enabled (its balanced exp2 decay split is not safe for the gate
+    magnitudes seen on real Kimi-Linear activations)."""
+    monkeypatch.setenv("SGLANG_KDA_CAKE_ALLOW_UNBOUNDED_GATE", "1")
     torch.manual_seed(99 + num_heads + sum(seq_lens))
     data = _make_inputs(seq_lens, num_heads)
     state_triton = data["state"].clone()
@@ -253,3 +258,22 @@ def test_kda_prefill_policy_facade_keeps_bf16_pool_path():
         assert not CakeKDAKernel()._cake_prefill_uses_prepared_export(
             data["state"].float()
         )
+
+
+def test_kda_prefill_unbounded_gate_defaults_to_triton(monkeypatch):
+    """Without the opt-in the unbounded gate is not admitted to the export."""
+    monkeypatch.delenv("SGLANG_KDA_CAKE_ALLOW_UNBOUNDED_GATE", raising=False)
+    torch.manual_seed(0)
+    seq_lens = [64, 160]
+    data = _make_inputs(seq_lens, 16)
+    state_ref = data["state"].clone()
+    output_ref = _extend(TritonKDAKernel(), data, state_ref, seq_lens, lower_bound=None)
+    state = data["state"].clone()
+    with patch.object(
+        CakeKDAKernel,
+        "_extend_cake_prepared_bf16",
+        side_effect=AssertionError("unbounded gate must stay on Triton by default"),
+    ):
+        output = _extend(CakeKDAKernel(), data, state, seq_lens, lower_bound=None)
+    assert torch.equal(output, output_ref)
+    assert torch.equal(state, state_ref)
