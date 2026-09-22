@@ -162,6 +162,37 @@ def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12))
 
 
+@torch.no_grad()
+def _fp32_reference(data, seq, seq_lens):
+    """Token-by-token FP32 KDA recurrence for one sequence of ``data`` (the same
+    math as the kernels: L2-normalised q/k, softplus gate scaled by -exp(A_log),
+    sigmoid beta). Returns (output [T, H, V], final state [H, V, K])."""
+    start = sum(seq_lens[:seq])
+    stop = start + seq_lens[seq]
+    q = data["q"][0, start:stop].float()
+    k = data["k"][0, start:stop].float()
+    v = data["v"][0, start:stop].float()
+    g_raw = data["g"][0, start:stop].float()
+    beta = torch.sigmoid(data["beta"][0, start:stop].float())
+    num_heads = q.shape[1]
+    q = torch.nn.functional.normalize(q, dim=-1) * (K**-0.5)
+    k = torch.nn.functional.normalize(k, dim=-1)
+    a_log = data["A_log"].detach().float().reshape(num_heads)
+    bias = data["dt_bias"].detach().float().reshape(num_heads, K)
+    g = -torch.exp(a_log)[None, :, None] * torch.nn.functional.softplus(
+        g_raw + bias[None]
+    )
+    state = data["state"][data["cache_indices"][seq].long()].float()
+    s = state.transpose(-1, -2).clone()  # [H, K, V]
+    out = torch.empty(q.shape[0], num_heads, V, device=q.device, dtype=torch.float32)
+    for t in range(q.shape[0]):
+        s = s * torch.exp(g[t])[:, :, None]
+        v_pred = torch.einsum("hk,hkv->hv", k[t], s)
+        s = s + torch.einsum("hk,hv->hkv", k[t], beta[t][:, None] * (v[t] - v_pred))
+        out[t] = torch.einsum("hk,hkv->hv", q[t], s)
+    return out, s.transpose(-1, -2)
+
+
 def test_kda_prefill_prepared_export_native_checkpoints():
     """Per-64-token-chunk states match Triton's intermediate states chunk by chunk.
 
@@ -217,12 +248,10 @@ def test_kda_prefill_prepared_export_native_checkpoints():
     [(16, [64, 160]), (8, [17, 64, 65, 127, 128, 255]), (16, [8192])],
 )
 def test_kda_prefill_prepared_export_unbounded_gate_matches_triton(
-    num_heads, seq_lens, monkeypatch
+    num_heads, seq_lens
 ):
-    """Kimi-Linear has no gate lower bound; the export serves the unbounded softplus gate
-    only when explicitly enabled (its balanced exp2 decay split is not safe for the gate
-    magnitudes seen on real Kimi-Linear activations)."""
-    monkeypatch.setenv("SGLANG_KDA_CAKE_ALLOW_UNBOUNDED_GATE", "1")
+    """Kimi-Linear has no gate lower bound; the export serves the unbounded softplus
+    gate by default (tile-anchored floored-prefix decay in the fused BF16 schedule)."""
     torch.manual_seed(99 + num_heads + sum(seq_lens))
     data = _make_inputs(seq_lens, num_heads)
     state_triton = data["state"].clone()
@@ -260,20 +289,48 @@ def test_kda_prefill_policy_facade_keeps_bf16_pool_path():
         )
 
 
-def test_kda_prefill_unbounded_gate_defaults_to_triton(monkeypatch):
-    """Without the opt-in the unbounded gate is not admitted to the export."""
-    monkeypatch.delenv("SGLANG_KDA_CAKE_ALLOW_UNBOUNDED_GATE", raising=False)
-    torch.manual_seed(0)
-    seq_lens = [64, 160]
-    data = _make_inputs(seq_lens, 16)
-    state_ref = data["state"].clone()
-    output_ref = _extend(TritonKDAKernel(), data, state_ref, seq_lens, lower_bound=None)
-    state = data["state"].clone()
+def test_kda_prefill_unbounded_gate_extreme_decay_matches_fp32_reference():
+    """Real Kimi-Linear activations drive per-token log2 gates far below -126 (the
+    exp2 normal range). The fused schedule anchors each 16-token tile separately,
+    so the per-sequence recurrent state and output must stay at the mild-gate
+    error against an exact FP32 recurrence (~0.004 / 0.005 rel L2).
+
+    Triton's ``chunk_kda`` is not the reference here: on these gates it drifts to
+    0.012-0.019 (state) / 0.10-0.12 (output) rel L2 from the exact recurrence, so
+    comparing the export against Triton would measure Triton's error."""
+    torch.manual_seed(1542)
+    seq_lens = [1542, 64]
+    num_heads = 8
+    data = _make_inputs(seq_lens, num_heads)
+    # Strongly negative gate logits with a wide spread; A_log/dt_bias scale the
+    # softplus so a handful of tokens per chunk decay by hundreds of log2 units.
+    data["g"] = (data["g"].float() * 6.0 - 12.0).to(torch.bfloat16).contiguous()
+    with torch.no_grad():
+        data["A_log"].fill_(3.0)
+    state_triton = data["state"].clone()
+    state_cake = data["state"].clone()
+    output_triton = _extend(
+        TritonKDAKernel(), data, state_triton, seq_lens, lower_bound=None
+    )
     with patch.object(
         CakeKDAKernel,
-        "_extend_cake_prepared_bf16",
-        side_effect=AssertionError("unbounded gate must stay on Triton by default"),
+        "_extend_triton",
+        side_effect=AssertionError("unbounded gate must not fall back to Triton"),
     ):
-        output = _extend(CakeKDAKernel(), data, state, seq_lens, lower_bound=None)
-    assert torch.equal(output, output_ref)
-    assert torch.equal(state, state_ref)
+        output_cake = _extend(
+            CakeKDAKernel(), data, state_cake, seq_lens, lower_bound=None
+        )
+    assert torch.isfinite(output_cake).all()
+    idx = data["cache_indices"].long()
+    for seq, length in enumerate(seq_lens):
+        start = sum(seq_lens[:seq])
+        out_ref, state_ref = _fp32_reference(data, seq, seq_lens)
+        state_err = _rel_l2(state_cake[idx[seq]], state_ref)
+        out_err = _rel_l2(output_cake[0, start : start + length], out_ref)
+        triton_state_err = _rel_l2(state_triton[idx[seq]], state_ref)
+        assert state_err < 1e-2, f"sequence {seq}: state rel L2 {state_err:.4g}"
+        assert out_err < 1e-2, f"sequence {seq}: output rel L2 {out_err:.4g}"
+        # Same order as (here: no worse than) the Triton prefill it replaces.
+        assert state_err <= max(triton_state_err, 1e-2), (
+            f"sequence {seq}: export {state_err:.4g} vs Triton {triton_state_err:.4g}"
+        )

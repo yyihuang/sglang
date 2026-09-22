@@ -254,21 +254,13 @@ def _cake_prefill_gate_bound_ok(
     serves the unbounded softplus gate (``lower_bound=None``, e.g. Kimi-Linear);
     the recurrent_kda facade does not."""
     if lower_bound is None:
-        # The exported BF16 schedules apply per-channel decays with a single
-        # "balanced" exp2 reference per 64-token chunk, clamped to +-126 (log2).
-        # Unbounded softplus gates on real Kimi-Linear activations exceed that
-        # range (per-token g_eff down to -560), which corrupts the recurrent
-        # states, so the unbounded path is opt-in until the kernel is fixed.
-        return allow_unbounded and _cake_prefill_unbounded_gate_opt_in()
+        # The exported BF16 schedules decay each 64-token chunk from
+        # tile-anchored floored gate prefixes (integer power-of-two anchors per
+        # 16-token tile, exact total in FP32), so real Kimi-Linear activations
+        # with per-token log2 gates far below -126 keep the recurrent state
+        # within the Triton reference error (per-chunk rel L2 ~3e-3).
+        return allow_unbounded
     return math.isfinite(float(lower_bound)) and float(lower_bound) < 0.0
-
-
-def _cake_prefill_unbounded_gate_opt_in() -> bool:
-    return os.environ.get("SGLANG_KDA_CAKE_ALLOW_UNBOUNDED_GATE", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
 
 
 def _cake_prefill_api_policy() -> str:
