@@ -158,13 +158,18 @@ def test_kda_prefill_prepared_export_matches_triton(num_heads, seq_lens):
     assert torch.equal(state_cake[untouched], data["state"][untouched])
 
 
-def _export_has_fp32_checkpoints() -> bool:
-    """Whether the installed FlashInfer exports FP32 intermediate states here."""
+def _export_has_fp32_checkpoints(lower_bound) -> bool:
+    """Whether the installed FlashInfer exports FP32 intermediate states here
+    for the gate kind selected by ``lower_bound`` (None = unbounded softplus)."""
     try:
         from flashinfer.kda_prefill import kda_prefill_supports_fp32_checkpoints
     except ImportError:
         return False
-    return bool(kda_prefill_supports_fp32_checkpoints(torch.device("cuda")))
+    return bool(
+        kda_prefill_supports_fp32_checkpoints(
+            torch.device("cuda"), lower_bound=lower_bound
+        )
+    )
 
 
 def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -246,7 +251,7 @@ def test_kda_prefill_prepared_export_native_checkpoints():
     idx = data["cache_indices"].long()
     assert _rel_l2(state_cake[idx], state_ref[idx]) < 1e-2
     starts = checkpoint_cu_starts.tolist()
-    fp32_rows = _export_has_fp32_checkpoints()
+    fp32_rows = _export_has_fp32_checkpoints(LOWER_BOUND)
     for seq in range(len(seq_lens)):
         first = starts[seq]
         # Checkpoint 0 of every sequence is its initial state.  FP32 exports
@@ -407,7 +412,7 @@ def test_kda_prefill_plan_cache_reuses_prepared_launch_bitwise():
 def test_kda_prefill_fp32_checkpoints_track_fp32_reference_per_chunk():
     """With the FP32 export, per-chunk intermediate states stay within the FP32
     reference budget across a long sequence (no BF16 carrier drift)."""
-    if not _export_has_fp32_checkpoints():
+    if not _export_has_fp32_checkpoints(None):
         pytest.skip("installed FlashInfer export writes BF16 checkpoint rows")
     torch.manual_seed(4321)
     seq_lens = [1024]

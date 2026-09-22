@@ -194,7 +194,9 @@ def _cuda_device_capability(device: torch.device) -> tuple:
 _flashinfer_prepared_bf16_available: Optional[bool] = None
 _flashinfer_prepare_bf16_kda_prefill = None
 _flashinfer_kda_prefill_plan_cache_cls = None
-_flashinfer_kda_prefill_fp32_checkpoints = False
+# FP32 intermediate-state rows are exported per gate kind: index 0 = unbounded
+# softplus gate (lower_bound=None), index 1 = bounded gate.
+_flashinfer_kda_prefill_fp32_checkpoints = (False, False)
 
 
 def _get_flashinfer_prepared_bf16_prefill():
@@ -222,11 +224,14 @@ def _get_flashinfer_prepared_bf16_prefill():
             probe = getattr(
                 _kda_prefill_module, "kda_prefill_supports_fp32_checkpoints", None
             )
-            _flashinfer_kda_prefill_fp32_checkpoints = bool(
-                probe(torch.device("cuda", torch.cuda.current_device()))
-                if callable(probe) and is_cuda()
-                else False
-            )
+            if callable(probe) and is_cuda():
+                device = torch.device("cuda", torch.cuda.current_device())
+                _flashinfer_kda_prefill_fp32_checkpoints = (
+                    bool(probe(device, lower_bound=None)),
+                    bool(probe(device, lower_bound=-1.0)),
+                )
+            else:
+                _flashinfer_kda_prefill_fp32_checkpoints = (False, False)
             try:
                 from flashinfer import KDAPrefillPlanCache
 
@@ -729,7 +734,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         # the pool's precision and removes the BF16 -> FP32 conversion below.
         checkpoint_dtype = (
             torch.float32
-            if _flashinfer_kda_prefill_fp32_checkpoints
+            if _flashinfer_kda_prefill_fp32_checkpoints[0 if lower_bound is None else 1]
             else torch.bfloat16
         )
         state_checkpoints = (
