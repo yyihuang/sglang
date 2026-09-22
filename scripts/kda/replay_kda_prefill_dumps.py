@@ -64,7 +64,7 @@ def main() -> None:
             query_start_loc=cu.to(torch.int32),
             A_log=d["A_log"],
             dt_bias=d["dt_bias"],
-            lower_bound=float(d["lower_bound"]),
+            lower_bound=None if d["lower_bound"] is None else float(d["lower_bound"]),
             extend_seq_lens_cpu=lengths,
         )
         ncp = int(d.get("num_state_checkpoints") or 0)

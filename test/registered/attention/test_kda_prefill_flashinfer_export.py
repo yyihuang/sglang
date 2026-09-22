@@ -202,8 +202,11 @@ def test_kda_prefill_prepared_export_native_checkpoints():
     starts = checkpoint_cu_starts.tolist()
     for seq in range(len(seq_lens)):
         first = starts[seq]
-        # Checkpoint 0 of every sequence is its initial state, bit for bit.
-        assert torch.equal(h[0, first], data["state"][idx[seq]])
+        # Checkpoint 0 of every sequence is its initial state; the export stores
+        # checkpoints in BF16, so it must equal the BF16-rounded initial state exactly.
+        initial = data["state"][idx[seq]]
+        assert torch.equal(h[0, first], initial.to(torch.bfloat16).to(h.dtype))
+        assert _rel_l2(h[0, first], initial) < 1e-2
         for j in range(first + 1, starts[seq + 1]):
             err = _rel_l2(h[0, j], h_ref[0, j])
             assert err < 1e-2, f"sequence {seq} chunk {j - first}: rel L2 {err:.4g}"
