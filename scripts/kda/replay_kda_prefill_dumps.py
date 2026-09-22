@@ -49,6 +49,16 @@ def main() -> None:
     for path in files:
         d = torch.load(path, map_location="cuda")
         q, k, v, g, beta = (d[n] for n in ("q", "k", "v", "g", "beta"))
+        if beta.is_contiguous():
+            # torch.save flattens the fused-projection slice into a contiguous copy;
+            # the serving call hands the export a row-strided view (pitch > H) and the
+            # export's schedule selection depends on that layout, so restore it.
+            num_heads = beta.shape[-1]
+            wide = torch.zeros(
+                (*beta.shape[:-1], num_heads + 24), device=beta.device, dtype=beta.dtype
+            )
+            wide[..., 8 : 8 + num_heads] = beta
+            beta = wide[..., 8 : 8 + num_heads]
         cu = d["cu_seqlens"].to(torch.int64)
         lengths = list(d["sequence_lengths"]) or (cu[1:] - cu[:-1]).tolist()
         n_seq = len(lengths)
@@ -78,6 +88,15 @@ def main() -> None:
                 state_checkpoint_every_n_tokens=int(d["checkpoint_every_n_tokens"]),
             )
         pool_t, pool_c = pool.clone(), pool.clone()
+        q_norm = q.float().norm(dim=-1)
+        stats = dict(
+            g_min=float(g.float().min()),
+            g_mean=float(g.float().mean()),
+            beta_logit_min=float(beta.float().min()),
+            beta_logit_max=float(beta.float().max()),
+            q_norm_cv=float(q_norm.std() / q_norm.mean().clamp_min(1e-12)),
+            init_state_abs_max=float(d["initial_state"].float().abs().max()),
+        )
         out_t = triton.extend(
             q.clone(),
             k.clone(),
@@ -88,7 +107,8 @@ def main() -> None:
             **common,
             **cp_kwargs,
         )
-        out_c = cake.extend(
+        try:
+            out_c = cake.extend(
             q.clone(),
             k.clone(),
             v.clone(),
@@ -98,7 +118,12 @@ def main() -> None:
             layer_id=int(d["layer_id"]),
             **common,
             **cp_kwargs,
-        )
+            )
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            err = dict(file=os.path.basename(path), layer=int(d["layer_id"]), lengths=lengths, heads=int(q.shape[2]), error=str(exc)[:300])
+            rows.append(err)
+            print(json.dumps(err), flush=True)
+            continue
         h_t = h_c = None
         if ncp:
             out_t, h_t = out_t
@@ -112,6 +137,7 @@ def main() -> None:
             output_rel_l2=rel_l2(out_c, out_t),
             final_state_max_abs=max_abs(pool_c[:n_seq], pool_t[:n_seq]),
             final_state_rel_l2=rel_l2(pool_c[:n_seq], pool_t[:n_seq]),
+            **stats,
         )
         if ncp:
             starts = d["checkpoint_cu_starts"].tolist()
