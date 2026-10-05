@@ -57,6 +57,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -542,6 +543,11 @@ class MiniMaxM2MoE(nn.Module):
             intermediate_size=config.intermediate_size,
             layer_id=layer_id,
             quant_config=quant_config,
+            # Sigmoid scores + e_score_correction_bias + renormalize over all
+            # experts (no expert groups): the in-kernel TRT-LLM routing must use
+            # the DeepSeekV3 method (ungrouped, n_group = topk_group = 1); the
+            # Default method (softmax -> top-k, bias ignored) picks wrong experts.
+            routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
         )
         self.topk = TopK(

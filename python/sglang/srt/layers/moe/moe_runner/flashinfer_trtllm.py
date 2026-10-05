@@ -1476,6 +1476,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         routing_method_type = quant_info.routing_method_type
 
         correction_bias = topk_config.correction_bias
+        n_group = topk_config.num_expert_group
+        topk_group = topk_config.topk_group
+        routed_scaling_factor = runner_config.routed_scaling_factor
+        if routing_method_type == RoutingMethodType.DeepSeekV3 and n_group is None:
+            # Ungrouped sigmoid + bias routing (MiniMax-M2 / Kimi-K2 style):
+            # one group spanning every expert; the kernel requires n_group,
+            # topk_group and a scaling factor to be set for this method.
+            n_group, topk_group = 1, 1
+            if routed_scaling_factor is None:
+                routed_scaling_factor = 1.0
         moe_kwargs = dict(
             routing_logits=router_logits,
             routing_bias=correction_bias,
@@ -1496,12 +1506,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
             top_k=topk_config.top_k,
-            n_group=topk_config.num_expert_group,
-            topk_group=topk_config.topk_group,
+            n_group=n_group,
+            topk_group=topk_group,
             intermediate_size=quant_info.intermediate_size_per_partition,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
-            routed_scaling_factor=runner_config.routed_scaling_factor,
+            routed_scaling_factor=routed_scaling_factor,
             routing_method_type=(
                 routing_method_type
                 if routing_method_type is not None
