@@ -689,6 +689,24 @@ def _stock_triton_reference(case, cu_seqlens, *, chunk_size, state_dtype):
     return out, varlen_states
 
 
+def _outlier_profile(mask):
+    """Where the entries outside the tolerance sit: for every non-singleton
+    axis, how many of its indices hold at least one such entry and the
+    largest count a single index holds -- e.g. for ``out`` (1, T, H, P) axis
+    1 is the token and axis 2 the head.  Correlated outliers (a few tokens
+    or heads holding most of them) show up as a small 'hit' count with a
+    large 'max'."""
+    parts = []
+    for axis in range(mask.ndim):
+        if mask.shape[axis] == 1:
+            continue
+        per = mask.movedim(axis, 0).reshape(mask.shape[axis], -1).sum(dim=1)
+        parts.append(
+            f"axis{axis}[{mask.shape[axis]}] hit={int((per > 0).sum())} max={int(per.max())}"
+        )
+    return f"{int(mask.sum())} outside; " + "; ".join(parts)
+
+
 def _assert_within_fixed_tolerance(name, actual, reference, comparison=None):
     """The fixed tolerance against the fp64 recurrence -- every value finite,
     at most ``_MAX_OUTSIDE_FRACTION`` of the entries outside ``atol = rtol =
@@ -703,11 +721,15 @@ def _assert_within_fixed_tolerance(name, actual, reference, comparison=None):
     assert tuple(actual.shape) == tuple(reference.shape), (name, tuple(actual.shape))
     assert torch.isfinite(actual.to(torch.float64)).all(), f"{name}: Cake output is not finite"
     budget = _MAX_OUTSIDE_FRACTION * reference.numel()
-    outside = int(_outside_tolerance(actual, reference).sum())
+    outside_mask = _outside_tolerance(actual, reference)
+    outside = int(outside_mask.sum())
+    print(f"[cake_ssd_combined] {name} Cake: {_outlier_profile(outside_mask)}")
     detail = ""
     if comparison is not None:
         assert tuple(comparison.shape) == tuple(reference.shape), name
-        comparison_outside = int(_outside_tolerance(comparison, reference).sum())
+        comparison_mask = _outside_tolerance(comparison, reference)
+        comparison_outside = int(comparison_mask.sum())
+        print(f"[cake_ssd_combined] {name} stock Triton(256): {_outlier_profile(comparison_mask)}")
         assert comparison_outside <= budget, (
             f"{name}: stock Triton(256) has {comparison_outside} of {reference.numel()} "
             f"entries outside atol=rtol={_ATOL} of the fp64 recurrence (limit {budget:.0f})"
@@ -878,13 +900,19 @@ def test_route_call_cu_seqlens_engine_chunk_size_checkpoint_unaligned_start():
     prefix_case = {
         **case,
         "tensors": tuple(
-            t[:, 300:boundary].contiguous() if t.ndim >= 2 and t.shape[1] == 1000 else t
+            t[:, 300:boundary].clone(memory_format=torch.contiguous_format)
+            if t.ndim >= 2 and t.shape[1] == 1000
+            else t
             for t in case["tensors"]
         ),
         "lengths": (256,),
         "run": {
             **run,
-            "z": run["z"][:, 300:boundary].contiguous(),
+            # fresh standard strides: a [:, 300:556] slice of a (1, T, ...) tensor
+            # counts as contiguous (size-1 leading dim) and keeps stride[0] = T*...,
+            # which stock Triton's out_x = empty_like(x) would inherit (its
+            # out_x.stride() == out.stride() assertion).
+            "z": run["z"][:, 300:boundary].clone(memory_format=torch.contiguous_format),
             "initial_states": run["initial_states"][1:2].contiguous(),
             # stock Triton requires seq_idx whenever cu_seqlens rides with
             # initial_states (ssd_state_passing: "continuous batching"); one
