@@ -450,11 +450,14 @@ def test_ssd_route_single_chunk_and_partial_chunk_batches_are_routed(lengths):
     assert cake.call_args.kwargs["out"] is inputs["out"]
 
 
-@pytest.mark.parametrize("lengths", [(8,), (64, 60), (127,)], ids=("8", "64+60", "127"))
-def test_ssd_route_batches_shorter_than_one_chunk_fall_back(lengths, caplog):
-    """A packed batch with fewer than 128 tokens stays on the stock kernel: the
-    FlashInfer host pins a 128-row TMA token box and rejects a shorter global
-    extent (a server's first short forward would otherwise crash)."""
+@pytest.mark.parametrize(
+    "lengths", [(1,), (8,), (64, 60), (127,)], ids=("1", "8", "64+60", "127")
+)
+def test_ssd_route_batches_shorter_than_one_chunk_are_routed(lengths, caplog):
+    """A packed batch with fewer than 128 tokens is routed like any other
+    (CAKE-1063): the FlashInfer host zero-pads such a call to one chunk and
+    stages its output, so the adapter has no token-count floor and logs no
+    fallback (a server's first short forward runs on the Cake kernel)."""
     caplog.set_level(logging.INFO, logger=mamba_mod.logger.name)
     stock = mock.Mock(side_effect=_stock_ssd)
     supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
@@ -464,9 +467,12 @@ def test_ssd_route_batches_shorter_than_one_chunk_fall_back(lengths, caplog):
         mock.patch.object(mamba_mod, "_cake_ssd_kernels", lambda: (supports, cake)),
     ):
         mamba_mod.ssd_prefill(stock, **inputs)
-    cake.assert_not_called()
-    stock.assert_called_once()
-    assert "fewer than 128 packed tokens" in caplog.text
+    cake.assert_called_once()
+    stock.assert_not_called()
+    assert cake.call_args.kwargs["num_seqs"] == len(lengths)
+    assert cake.call_args.kwargs["out"] is inputs["out"]
+    assert "fallback" not in caplog.text
+    assert not hasattr(mamba_mod, "SSD_MIN_TOKENS")
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])

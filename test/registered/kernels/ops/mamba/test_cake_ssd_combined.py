@@ -442,20 +442,25 @@ def test_runner_matches_flashinfer_functional_and_reference(varlen):
 
 @pytest.mark.parametrize(
     "lengths",
-    [(128,), (128, 128), (72, 128), (1000,), (128, 900)],
+    [(128,), (128, 128), (72, 128), (1000,), (128, 900), (1,), (8,), (64, 60)],
     ids=[
         "one-chunk",
         "two-one-chunk-seqs",
         "partial-chunk",
         "long-partial",
         "two-partial",
+        "short-1",
+        "short-8",
+        "short-64-60",
     ],
 )
 def test_runner_varlen_without_initial_states_any_length(lengths):
     """The engine's packed prefill call: no prefix (``initial_states=None``
     plus ``num_seqs``) on every sequence geometry, including the single-chunk
-    batches that returned NaN before (CAKE-950) and token counts off the 128
-    grid; the result lands in the caller's token-major buffer."""
+    batches that returned NaN before (CAKE-950), token counts off the 128
+    grid and packed batches shorter than one chunk (CAKE-1063: the
+    FlashInfer host zero-pads them to one chunk); the result lands in the
+    caller's token-major buffer."""
     _skip_unless_supported()
     device = torch.device("cuda")
     case = _case(
@@ -474,6 +479,46 @@ def test_runner_varlen_without_initial_states_any_length(lengths):
     assert tuple(final.shape) == (len(lengths), NHEADS, HEADDIM, DSTATE)
     assert torch.isfinite(out.float()).all() and torch.isfinite(final.float()).all()
     _assert_matches_reference(case, (out, final), _cute_reference(case))
+
+
+def test_runner_batched_shorter_than_one_chunk():
+    """Batched ``2 x 50``: fewer than 128 tokens per row (CAKE-1063).  The
+    FlashInfer host zero-pads x/B/C to one chunk and stages the output; the
+    CuTe oracle runs the same tokens as one packed stream of two sequences."""
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _case(device, varlen=False, seed=31, lengths=(50, 50))
+    x, dt, A, B, C = case["tensors"]
+    batch, seqlen = x.shape[:2]
+    assert seqlen < CHUNK
+    assert _supports(case, out=case["out"])
+    runner = cake_ssd_combined(**case["ctor"])
+    out, final = runner.run(*case["tensors"], out=case["out"], **case["run"])
+    torch.cuda.synchronize()
+    assert out.untyped_storage().data_ptr() == case["out"].untyped_storage().data_ptr()
+    assert tuple(out.shape) == tuple(x.shape)
+    assert tuple(final.shape) == (batch, NHEADS, HEADDIM, DSTATE)
+    assert torch.isfinite(out.float()).all() and torch.isfinite(final.float()).all()
+
+    def packed(tensor):
+        return tensor.reshape(1, batch * seqlen, *tensor.shape[2:]).contiguous()
+
+    seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(case["lengths"], device)
+    packed_case = {
+        **case,
+        "tensors": (packed(x), packed(dt), A, packed(B), packed(C)),
+        "run": {
+            **case["run"],
+            "z": packed(case["run"]["z"]),
+            "seq_idx": seq_idx,
+            "chunk_indices": chunk_indices,
+            "chunk_offsets": chunk_offsets,
+        },
+        "ctor": {**case["ctor"], "has_varlen": True},
+    }
+    cute_out, cute_final = _cute_reference(packed_case)
+    cute = (cute_out.reshape(x.shape), cute_final)
+    _assert_matches_reference(case, (out, final), cute)
 
 
 @pytest.mark.parametrize("varlen", [False, True], ids=["batched", "varlen"])

@@ -3,8 +3,10 @@
 FlashInfer entries (contract at FlashInfer ``58171ea83f32`` -- the
 ``flashinfer/mamba`` sources are unchanged since ``2a57c19bace5``, the
 exact-scan revision (PR #6051) of the ``46340689a5ab`` contract: one exact-scan kernel
-family with FP16 delta, FP32 cumsum, any ``seqlen`` >= 128 per call (host TMA token box), BF16 / FP16 / FP32
-state, token-major ``out``, varlen without ``initial_states``):
+family with FP16 delta, FP32 cumsum, any positive ``seqlen`` per call (a call
+shorter than one 128-token chunk is zero-padded to one chunk by the FlashInfer
+host, which stages its output; CAKE-1063), BF16 / FP16 / FP32 state,
+token-major ``out``, varlen without ``initial_states``):
 
 * ``flashinfer.mamba.SSDCombined(..., backend="cake")`` (inventory E1-31) ->
   ``flashinfer.mamba.cake_ssd_combined.CakeSSDCombined`` (E1-33), and the
