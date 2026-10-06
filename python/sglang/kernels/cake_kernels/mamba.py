@@ -11,22 +11,30 @@ token-major ``out``, varlen without ``initial_states``):
 * ``flashinfer.mamba.SSDCombined(..., backend="cake")`` (inventory E1-31) ->
   ``flashinfer.mamba.cake_ssd_combined.CakeSSDCombined`` (E1-33), and the
   functional ``flashinfer.mamba.ssd_combined_fwd`` (E1-32, Cake-only, runner
-  cached per device / stream / config). Locked domain: ``chunk_size=128``,
-  ``headdim=64``, ``dstate=128``, any ``seqlen > 0`` (the last physical chunk
-  may be partial); BF16 ``x [B, S, nheads, 64]``, ``B``/``C [B, S, ngroups,
-  128]`` (``nheads % ngroups == 0``), ``dt [B, S, nheads]`` BF16 or FP32, FP32
-  ``A [nheads]``, optional BF16 ``D [nheads]`` or ``[nheads, 64]``, ``z`` like
-  ``x``, ``dt_bias [nheads]`` BF16 or FP32; state dtype BF16, FP16 or FP32
-  (``initial_states [num_seqs, nheads, 64, 128]``); varlen needs ``seq_idx``
-  (int32/int64 ``[B, S]``, non-decreasing, every id in ``[0, num_seqs)``
-  owning a token) and int32 ``chunk_indices`` / ``chunk_offsets``, and takes
-  the packed sequence count from ``initial_states``, ``seq_chunk_cumsum`` or
-  the plain int ``num_seqs`` (at least one; they must agree -- ``num_seqs``
-  costs no device buffer, the preprocess derives ``seq_chunk_cumsum`` itself).
-  Only backend that writes selective ``checkpoint_states``
+  cached per device / stream / config). Locked domain: any positive
+  ``chunk_size`` (a caller convention: the Cake programs tile 128 tokens
+  internally and the result is chunk-size independent up to rounding, so the
+  engine's 256 is passed as is), ``headdim=64``, ``dstate=128``, any
+  ``seqlen > 0`` (the last physical chunk may be partial); BF16
+  ``x [B, S, nheads, 64]``, ``B``/``C [B, S, ngroups, 128]`` (``nheads %
+  ngroups == 0``), ``dt [B, S, nheads]`` BF16 or FP32, FP32 ``A [nheads]``,
+  optional BF16 ``D [nheads]`` or ``[nheads, 64]``, ``z`` like ``x``,
+  ``dt_bias [nheads]`` BF16 or FP32; state dtype BF16, FP16 or FP32
+  (``initial_states [num_seqs, nheads, 64, 128]``).  Packed varlen has two
+  forms: ``cu_seqlens`` (int32 ``[num_seqs + 1]`` on the device, ``cu[0] ==
+  0``, non-decreasing, ``cu[-1] == S``, ``B == 1``; the Cake preprocess
+  derives the 128-granularity segment metadata and the sequence count from
+  it, ``seq_idx`` is optional and never read -- the engine's form, valid for
+  any chunk size), or the chunk-128 triple ``seq_idx`` (int32/int64 ``[B,
+  S]``, non-decreasing, ids in ``[0, num_seqs)``) + int32 ``chunk_indices``
+  / ``chunk_offsets`` with the sequence count from ``initial_states``,
+  ``seq_chunk_cumsum`` or the plain int ``num_seqs`` (``chunk_size == 128``
+  only).  Only backend that writes selective ``checkpoint_states``
   (``checkpoint_token_indices`` + ``checkpoint_state_slots``, contiguous
   int32 ``[num_seqs]``, all three together; packed-varlen boundaries are
-  absolute exclusive token positions that must be logical chunk ends).
+  absolute exclusive token positions -- with ``cu_seqlens`` the preprocess
+  inserts a chunk-unaligned one as a segment boundary itself, with the triple
+  it must be a logical chunk end).
   ``out`` is caller-owned contiguous token-major BF16 ``[B, S, nheads, 64]``
   (the engine's own buffer, written directly by the kernels; no chunked
   layout, no copy); ``run`` returns it plus the final states ``[num_seqs,
@@ -94,7 +102,7 @@ caller-owned ``out`` for CUDA-graph stability; decode stays on
 ``--mamba-backend`` plumbing are call-site work, not part of this adapter.
 
 Not supported here (keep the existing SGLang path): SSD ``headdim != 64`` /
-``dstate != 128`` / other chunk sizes, FP16 I/O, SSU stochastic rounding
+``dstate != 128``, FP16 I/O, SSU stochastic rounding
 (``rand_seed``), ``state_scale``, varlen SSU (``cu_seqlens``),
 ``retrieve_parent_token`` tree verify, sm_90a / sm_120a / sm_121a.
 """
@@ -158,13 +166,17 @@ def supports_ssd_combined(
     out: Optional[torch.Tensor] = None,
     chunk_size: int = SSD_CHUNK_SIZE,
     state_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ) -> bool:
     """Admission mirroring ``CakeSSDCombined`` host validation; never raises.
 
     The same predicate serves the prepared runner (whose constructor flags
     ``has_d`` / ``has_z`` / ``has_initial_states`` / ``has_varlen`` must match
-    the runtime presence of ``D`` / ``z`` / ``initial_states`` / ``seq_idx``)
-    and the functional ``ssd_combined_fwd``.
+    the runtime presence of ``D`` / ``z`` / ``initial_states`` / the varlen
+    form) and the functional ``ssd_combined_fwd``.  Packed varlen is either
+    ``cu_seqlens`` (any ``chunk_size``; ``seq_idx`` optional, the triple
+    excluded) or the ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets``
+    triple (``chunk_size == 128`` only).
 
     ``state_dtype`` names the state dtype explicitly (see
     :func:`ssd_combined_fwd`); it must be BF16 / FP16 / FP32 and agree with
@@ -178,7 +190,9 @@ def supports_ssd_combined(
     if not (
         flashinfer_module_available(FI_MODULE, FI_SSD_MODULE)
         and cuda_tensor_on(x, ARCHS)
-        and chunk_size == SSD_CHUNK_SIZE
+        and isinstance(chunk_size, int)
+        and not isinstance(chunk_size, bool)
+        and chunk_size > 0
         and (state_dtype is None or state_dtype in state_dtypes)
         and x.ndim == 4
         and B.ndim == 4
@@ -236,24 +250,42 @@ def supports_ssd_combined(
         and tuple(dt_bias.shape) == (nheads,)
     ):
         return False
-    varlen = seq_idx is not None
+    varlen = seq_idx is not None or cu_seqlens is not None
     metadata = (seq_idx, chunk_indices, chunk_offsets)
     if varlen:
-        if any(t is None for t in metadata):
-            return False
-        if not (
+        if cu_seqlens is not None:
+            # cu_seqlens form: the kernels derive the segment tables; the
+            # chunk-128 triple is excluded, seq_idx may ride along (unread).
+            if chunk_indices is not None or chunk_offsets is not None:
+                return False
+            if not (
+                _contiguous(cu_seqlens, torch.int32, device, ndim=1)
+                and cu_seqlens.numel() >= 2
+                and batch == 1
+            ):
+                return False
+        else:
+            if chunk_size != SSD_CHUNK_SIZE or any(t is None for t in metadata):
+                return False
+            if not (
+                _contiguous(chunk_indices, torch.int32, device, ndim=1)
+                and _contiguous(chunk_offsets, torch.int32, device, ndim=1)
+                and tuple(chunk_indices.shape) == tuple(chunk_offsets.shape)
+            ):
+                return False
+        if seq_idx is not None and not (
             seq_idx.is_cuda
             and seq_idx.device == device
             and seq_idx.dtype in (torch.int32, torch.int64)
             and tuple(seq_idx.shape) == (batch, seqlen)
-            and _contiguous(chunk_indices, torch.int32, device, ndim=1)
-            and _contiguous(chunk_offsets, torch.int32, device, ndim=1)
-            and tuple(chunk_indices.shape) == tuple(chunk_offsets.shape)
         ):
             return False
-        # The packed sequence count comes from whichever of initial_states /
-        # seq_chunk_cumsum / num_seqs the caller gives; they must agree.
+        # The packed sequence count comes from whichever of cu_seqlens /
+        # initial_states / seq_chunk_cumsum / num_seqs the caller gives; they
+        # must agree.
         counts = set()
+        if cu_seqlens is not None:
+            counts.add(int(cu_seqlens.numel()) - 1)
         if initial_states is not None:
             counts.add(int(initial_states.shape[0]))
         if seq_chunk_cumsum is not None:
@@ -297,11 +329,14 @@ def supports_ssd_combined(
         # FlashInfer: "initial_states dtype must match state_dtype" /
         # "checkpoint_states must be ... with state dtype".
         return False
-    if seq_chunk_cumsum is not None and not (
-        seq_chunk_cumsum.is_cuda
-        and seq_chunk_cumsum.device == device
-        and seq_chunk_cumsum.dtype == torch.int32
-        and tuple(seq_chunk_cumsum.shape) == (num_sequences + 1,)
+    if seq_chunk_cumsum is not None and (
+        cu_seqlens is not None  # with cu_seqlens the preprocess derives it
+        or not (
+            seq_chunk_cumsum.is_cuda
+            and seq_chunk_cumsum.device == device
+            and seq_chunk_cumsum.dtype == torch.int32
+            and tuple(seq_chunk_cumsum.shape) == (num_sequences + 1,)
+        )
     ):
         return False
     checkpoint_args = (
@@ -350,10 +385,11 @@ def ssd_combined(
     Returns the prepared runner; call ``.run(x, dt, A, B, C, D=, z=, dt_bias=,
     dt_softplus=, dt_limit=, initial_states=, seq_idx=, chunk_indices=,
     chunk_offsets=, seq_chunk_cumsum=, update_seq_chunk_cumsum=, num_seqs=,
-    checkpoint_token_indices=, checkpoint_state_slots=, checkpoint_states=,
-    out=, return_final_states=)`` per batch. One runner per stream (its
-    workspaces are mutable). Dtype defaults: BF16 I/O and state, int64
-    ``seq_idx``.
+    cu_seqlens=, checkpoint_token_indices=, checkpoint_state_slots=,
+    checkpoint_states=, out=, return_final_states=)`` per batch. One runner
+    per stream (its workspaces are mutable). ``chunk_size`` is the caller's
+    convention (any positive value; the kernels tile 128 tokens). Dtype
+    defaults: BF16 I/O and state, int64 ``seq_idx``.
     """
     import torch
     from flashinfer.mamba import SSDCombined
@@ -400,12 +436,19 @@ def ssd_combined_fwd(
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
     state_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_size: int = SSD_CHUNK_SIZE,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the Cake SSD combined forward.
 
     Returns ``(token-major output [B, S, nheads, 64], final_states or None)``;
-    ``out`` is written in place and returned. A varlen call without
-    ``initial_states`` names its packed sequence count through ``num_seqs``.
+    ``out`` is written in place and returned. A varlen call passes
+    ``cu_seqlens`` (the engine's ``query_start_loc``; the kernels derive the
+    segment metadata and the sequence count) or the chunk-128 triple, in
+    which case a call without ``initial_states`` names its packed sequence
+    count through ``num_seqs``.  ``chunk_size`` is the caller's convention
+    (any positive value; it selects the prepared runner's configuration and
+    nothing else).
 
     ``state_dtype=None`` forwards to ``flashinfer.mamba.ssd_combined_fwd``,
     whose state dtype is inferred from ``initial_states`` /
@@ -432,9 +475,10 @@ def ssd_combined_fwd(
                 D is not None,
                 D is not None and D.ndim == 2,
                 initial_states is not None,
-                seq_idx is not None,
+                seq_idx is not None or cu_seqlens is not None,
                 z is not None,
                 seq_idx.dtype if seq_idx is not None else torch.int64,
+                int(chunk_size),
             )
         return runner.run(
             x,
@@ -454,6 +498,7 @@ def ssd_combined_fwd(
             seq_chunk_cumsum=seq_chunk_cumsum,
             update_seq_chunk_cumsum=update_seq_chunk_cumsum,
             num_seqs=num_seqs,
+            cu_seqlens=cu_seqlens,
             checkpoint_token_indices=checkpoint_token_indices,
             checkpoint_state_slots=checkpoint_state_slots,
             checkpoint_states=checkpoint_states,
@@ -481,6 +526,7 @@ def ssd_combined_fwd(
         seq_chunk_cumsum=seq_chunk_cumsum,
         update_seq_chunk_cumsum=update_seq_chunk_cumsum,
         num_seqs=num_seqs,
+        cu_seqlens=cu_seqlens,
         checkpoint_token_indices=checkpoint_token_indices,
         checkpoint_state_slots=checkpoint_state_slots,
         checkpoint_states=checkpoint_states,
@@ -502,6 +548,7 @@ def _cached_ssd_runner(
     has_varlen: bool,
     has_z: bool,
     seq_idx_dtype: torch.dtype,
+    chunk_size: int = SSD_CHUNK_SIZE,
 ):
     """Prepared Cake runner per device / stream / configuration.
 
@@ -512,7 +559,7 @@ def _cached_ssd_runner(
     current device's capability at construction.
     """
     return ssd_combined(
-        SSD_CHUNK_SIZE,
+        chunk_size,
         nheads,
         SSD_HEADDIM,
         SSD_DSTATE,

@@ -8,8 +8,10 @@ capacity-bound launcher, refusals, NVSHMEM selection) is covered by
 Everything is mocked: the route switch, the adapter admission, the Cake
 forwarders and the stock kernels. The tests only check *which* callable
 receives the engine's tensors, that the Cake branch is handed the contract
-arguments (chunk-128 metadata, the explicit pool state dtype, the plain-int
-sequence count, the engine's token-major buffer; the engine's raw BF16 /
+arguments (the engine's ``cu_seqlens`` and chunk size -- no chunk-128
+metadata, no ``seq_idx`` / ``num_seqs``: the Cake preprocess derives its
+segment tables on the device (CAKE-934 item 2, option B) -- the explicit
+pool state dtype, the engine's token-major buffer; the engine's raw BF16 /
 int32 storage on the rows whose programs read it and FP32 broadcasts / int64
 indices on the others) and that its return contract matches the stock branch.
 CPU tensors; no FlashInfer, Triton, CUDA or process group involved.
@@ -64,29 +66,26 @@ def _capturing():
 
 
 # ---------------------------------------------------------------------------
-# chunk-128 metadata
+# no route-side chunk metadata (the Cake preprocess derives it from cu_seqlens)
 # ---------------------------------------------------------------------------
 
 
-def test_cake_chunk_metadata_matches_flashinfer_packed_shape():
-    ci, co = mamba_mod.cake_ssd_chunk_metadata(LENGTHS, torch.device("cpu"))
-    assert ci.dtype == torch.int32 and co.dtype == torch.int32
-    assert ci.tolist() == [0, 0, 1] and co.tolist() == [0, 96, 0]
-    ci, co = mamba_mod.cake_ssd_chunk_metadata((128, 128), torch.device("cpu"))
-    assert ci.tolist() == [0, 1] and co.tolist() == [0, 0]
-    ci, co = mamba_mod.cake_ssd_chunk_metadata((40, 40, 48, 128), torch.device("cpu"))
-    assert ci.tolist() == [0, 0, 0, 1] and co.tolist() == [0, 40, 80, 0]
+def test_route_builds_no_chunk_metadata_of_its_own():
+    """CAKE-934 item 2 option B: the chunk-128 metadata set and its builder
+    are gone from the route and from ``Mamba2Metadata``; the engine's chunk
+    size is a label the adapter passes through."""
+    from sglang.srt.layers.attention.mamba import mamba2_metadata as md_mod
 
-
-def test_cake_chunk_metadata_exposes_track_boundaries():
-    cpu = torch.device("cpu")
-    # A boundary inside physical chunk 1 (the oracle case of the kernel test:
-    # packed [0, 96) + [96, 256), checkpoint of sequence 1 at absolute 224).
-    ci, co = mamba_mod.cake_ssd_chunk_metadata(LENGTHS, cpu, extra_boundaries=(224,))
-    assert ci.tolist() == [0, 0, 1, 1] and co.tolist() == [0, 96, 0, 96]
-    # On the 128 grid or at a sequence start: nothing added.
-    ci, co = mamba_mod.cake_ssd_chunk_metadata(LENGTHS, cpu, extra_boundaries=(128, 96))
-    assert ci.tolist() == [0, 0, 1] and co.tolist() == [0, 96, 0]
+    assert not hasattr(mamba_mod, "cake_ssd_chunk_metadata")
+    assert not hasattr(mamba_mod, "SSD_CHUNK_SIZE")
+    fields = md_mod.Mamba2Metadata.MixedMetadata.__dataclass_fields__
+    assert "cake_chunk_indices" not in fields
+    assert "cake_chunk_offsets" not in fields
+    assert "cake_track_checkpoints" in fields
+    assert set(mamba_mod.CakeTrackCheckpoints.__dataclass_fields__) == {
+        "token_indices",
+        "state_slots",
+    }
 
 
 def test_cake_ssd_track_checkpoints_maps_unaligned_rows_only():
@@ -105,7 +104,6 @@ def test_cake_ssd_track_checkpoints_maps_unaligned_rows_only():
         cpu,
     )
     assert mapped is not None
-    assert mapped.boundaries == (256, 812)
     assert mapped.token_indices.dtype == torch.int32
     assert mapped.token_indices.tolist() == [256, 812, -1, -1]
     assert mapped.state_slots.dtype == torch.int32
@@ -114,7 +112,7 @@ def test_cake_ssd_track_checkpoints_maps_unaligned_rows_only():
     mapped = mamba_mod.cake_ssd_track_checkpoints(
         [True], [1000], [400], [600], 256, torch.tensor([3]), cpu
     )
-    assert mapped.boundaries == (256,) and mapped.token_indices.tolist() == [256]
+    assert mapped.token_indices.tolist() == [256]
     # A tracked row whose last boundary is its own start (chunk 0) is not
     # expressible as a Cake checkpoint: the batch stays on the stock path.
     assert (
@@ -130,7 +128,7 @@ def test_cake_ssd_track_checkpoints_maps_unaligned_rows_only():
         mapped = mamba_mod.cake_ssd_track_checkpoints(
             mask, [512, 160], [512, 160], [0, 0], 256, torch.tensor([1, 2]), cpu
         )
-        assert mapped == mamba_mod.CakeTrackCheckpoints((), None, None)
+        assert mapped == mamba_mod.CakeTrackCheckpoints(None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +149,6 @@ def _ssd_inputs(seqlen=S, lengths=LENGTHS, state_dtype=torch.bfloat16):
         torch.arange(len(lengths), dtype=torch.int32),
         torch.tensor(lengths, dtype=torch.int64),
     ).unsqueeze(0)
-    ci, co = mamba_mod.cake_ssd_chunk_metadata(lengths, torch.device("cpu"))
     return dict(
         x=x_cols.view(1, seqlen, H, HEADDIM),  # strided column view like the mixer
         dt=torch.randn(seqlen, H).bfloat16().unsqueeze(0),
@@ -170,8 +167,6 @@ def _ssd_inputs(seqlen=S, lengths=LENGTHS, state_dtype=torch.bfloat16):
         track_end_locs=None,
         out=torch.zeros(1, seqlen, H, HEADDIM, dtype=torch.bfloat16),
         state_dtype=state_dtype,
-        cake_chunk_indices=ci,
-        cake_chunk_offsets=co,
     )
 
 
@@ -251,24 +246,28 @@ def test_ssd_route_on_admitted_uses_cake_with_contract_args(caplog):
     assert kw["D"] is inputs["D"] and kw["dt_bias"] is inputs["dt_bias"]
     assert kw["z"] is None and kw["dt_softplus"] is True
     assert kw["dt_limit"] == (0.0, float("inf")) and kw["return_final_states"]
-    assert kw["seq_idx"] is inputs["seq_idx"]
-    # Chunk-128 metadata, not the engine's chunk-256 metadata.
-    assert kw["chunk_indices"] is inputs["cake_chunk_indices"]
-    assert kw["chunk_offsets"] is inputs["cake_chunk_offsets"]
-    # Varlen without a prefix: ``None`` initial states plus the sequence count
-    # (no zero buffer); the engine's token-major buffer is the kernel's out;
-    # the engine's pool dtype is the kernel's state dtype (explicit).
-    assert kw["initial_states"] is None and kw["num_seqs"] == 2
+    # The engine's cu_seqlens and chunk size as they are; no chunk-128 triple,
+    # no seq_idx, no plain-int sequence count (the Cake preprocess derives
+    # the segment tables and the count from cu_seqlens).
+    assert kw["cu_seqlens"] is inputs["cu_seqlens"] and kw["chunk_size"] == 256
+    for absent in ("seq_idx", "chunk_indices", "chunk_offsets", "num_seqs"):
+        assert absent not in kw, absent
+    # Varlen without a prefix: ``None`` initial states (no zero buffer); the
+    # engine's token-major buffer is the kernel's out; the engine's pool
+    # dtype is the kernel's state dtype (explicit).
+    assert kw["initial_states"] is None
     assert kw["out"] is inputs["out"]
     assert kw["state_dtype"] is torch.bfloat16
-    # Admission saw the same tensors at chunk 128.
+    # Admission saw the same tensors at the engine's chunk size.
     s_args, s_kw = supports.call_args
     assert s_args[0] is inputs["x"] and s_args[3] is inputs["B"]
-    assert s_kw["chunk_size"] == 128 and s_kw["out"] is inputs["out"]
-    assert s_kw["initial_states"] is None and s_kw["num_seqs"] == 2
+    assert s_kw["chunk_size"] == 256 and s_kw["out"] is inputs["out"]
+    assert s_kw["cu_seqlens"] is inputs["cu_seqlens"]
+    assert s_kw["initial_states"] is None
     assert s_kw["state_dtype"] is torch.bfloat16
-    assert s_kw["chunk_indices"] is inputs["cake_chunk_indices"]
-    assert s_kw["seq_idx"] is inputs["seq_idx"] and s_kw["z"] is None
+    for absent in ("seq_idx", "chunk_indices", "chunk_offsets", "num_seqs"):
+        assert absent not in s_kw, absent
+    assert s_kw["z"] is None
     # Stock return contract: (None, varlen_state, None) and the engine out filled.
     assert result[0] is None and result[2] is None
     assert tuple(result[1].shape) == (2, H, HEADDIM, DSTATE) and torch.all(
@@ -283,7 +282,6 @@ def _tracked_inputs(**overrides):
     inputs["track_seq_idx"] = torch.zeros(0, dtype=torch.int64)
     inputs["track_end_locs"] = torch.zeros(0, dtype=torch.int64)
     inputs["cake_track_checkpoints"] = mamba_mod.CakeTrackCheckpoints(
-        (224,),
         torch.tensor([-1, 224], dtype=torch.int32),
         torch.tensor([-1, 2], dtype=torch.int32),
     )
@@ -315,7 +313,7 @@ def test_ssd_route_tracked_batch_passes_checkpoints_and_returns_sentinel():
     # arguments (no pool needed), still the sentinel for the backend.
     cake.reset_mock()
     inputs = _tracked_inputs(
-        cake_track_checkpoints=mamba_mod.CakeTrackCheckpoints((), None, None),
+        cake_track_checkpoints=mamba_mod.CakeTrackCheckpoints(None, None),
         track_states_out=None,
     )
     with (
@@ -407,7 +405,8 @@ def test_ssd_route_passes_engine_initial_states_through():
     ):
         mamba_mod.ssd_prefill(stock, **inputs)
     assert cake.call_args.kwargs["initial_states"] is inputs["initial_states"]
-    assert cake.call_args.kwargs["num_seqs"] == 2
+    assert cake.call_args.kwargs["cu_seqlens"] is inputs["cu_seqlens"]
+    assert "num_seqs" not in cake.call_args.kwargs
 
 
 def test_ssd_route_on_rejected_falls_back_and_logs_once(caplog):
@@ -446,7 +445,9 @@ def test_ssd_route_single_chunk_and_partial_chunk_batches_are_routed(lengths):
         mamba_mod.ssd_prefill(stock, **inputs)
     cake.assert_called_once()
     stock.assert_not_called()
-    assert cake.call_args.kwargs["num_seqs"] == len(lengths)
+    cu = cake.call_args.kwargs["cu_seqlens"]
+    assert cu is inputs["cu_seqlens"] and cu.numel() - 1 == len(lengths)
+    assert cake.call_args.kwargs["chunk_size"] == 256
     assert cake.call_args.kwargs["out"] is inputs["out"]
 
 
@@ -469,7 +470,8 @@ def test_ssd_route_batches_shorter_than_one_chunk_are_routed(lengths, caplog):
         mamba_mod.ssd_prefill(stock, **inputs)
     cake.assert_called_once()
     stock.assert_not_called()
-    assert cake.call_args.kwargs["num_seqs"] == len(lengths)
+    cu = cake.call_args.kwargs["cu_seqlens"]
+    assert cu is inputs["cu_seqlens"] and cu.numel() - 1 == len(lengths)
     assert cake.call_args.kwargs["out"] is inputs["out"]
     assert "fallback" not in caplog.text
     assert not hasattr(mamba_mod, "SSD_MIN_TOKENS")
@@ -531,10 +533,8 @@ def test_adapter_explicit_state_dtype_uses_a_prepared_runner_once_per_config():
         D=inputs["D"],
         dt_bias=inputs["dt_bias"],
         dt_softplus=True,
-        seq_idx=inputs["seq_idx"],
-        chunk_indices=inputs["cake_chunk_indices"],
-        chunk_offsets=inputs["cake_chunk_offsets"],
-        num_seqs=2,
+        cu_seqlens=inputs["cu_seqlens"],
+        chunk_size=256,
         out=inputs["out"],
     )
     positional = (inputs["x"], inputs["dt"], inputs["A"], inputs["B"], inputs["C"])
@@ -564,30 +564,35 @@ def test_adapter_explicit_state_dtype_uses_a_prepared_runner_once_per_config():
         # One prepared runner for the configuration, reused by the second call.
         assert len(runners) == 1
         runner = runners[0]
-        assert runner.args == (128, H, HEADDIM, DSTATE, G)
+        # The engine's chunk size is the runner's configuration label.
+        assert runner.args == (256, H, HEADDIM, DSTATE, G)
         assert runner.kwargs["backend"] == "cake"
         assert runner.kwargs["state_dtype"] is torch.float32
         assert runner.kwargs["io_dtype"] is torch.bfloat16
         assert runner.kwargs["has_d"] and not runner.kwargs["d_has_hdim"]
         assert runner.kwargs["has_varlen"] and not runner.kwargs["has_initial_states"]
         assert not runner.kwargs["has_z"]
-        assert runner.kwargs["seq_idx_dtype"] is torch.int32
+        assert runner.kwargs["seq_idx_dtype"] is torch.int64  # no seq_idx given
         assert runner.run.call_count == 2
         run_kw = runner.run.call_args.kwargs
-        assert run_kw["num_seqs"] == 2 and run_kw["out"] is inputs["out"]
+        assert run_kw["cu_seqlens"] is inputs["cu_seqlens"]
+        assert run_kw["out"] is inputs["out"]
         assert run_kw["initial_states"] is None and run_kw["dt_softplus"] is True
-        assert run_kw["chunk_indices"] is inputs["cake_chunk_indices"]
+        assert run_kw["seq_idx"] is None and run_kw["chunk_indices"] is None
+        assert run_kw["num_seqs"] is None
         assert "state_dtype" not in run_kw  # a constructor argument, not a run one
+        assert "chunk_size" not in run_kw  # a constructor argument, not a run one
         # Without an explicit dtype the functional entry is used unchanged.
         module.ssd_combined_fwd.assert_called_once()
         fn_kw = module.ssd_combined_fwd.call_args.kwargs
-        assert fn_kw["num_seqs"] == 2 and fn_kw["out"] is inputs["out"]
+        assert fn_kw["cu_seqlens"] is inputs["cu_seqlens"]
+        assert fn_kw["chunk_size"] == 256 and fn_kw["out"] is inputs["out"]
         assert "state_dtype" not in fn_kw
     finally:
         cake_mamba._cached_ssd_runner.cache_clear()
 
 
-@pytest.mark.parametrize("case", ["tracking", "no_metadata", "fp64_state"])
+@pytest.mark.parametrize("case", ["tracking", "fp64_state"])
 def test_ssd_route_static_fallbacks_skip_adapter(case):
     stock = mock.Mock(side_effect=_stock_ssd)
     supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
@@ -596,8 +601,6 @@ def test_ssd_route_static_fallbacks_skip_adapter(case):
         # tracked batch whose rows were not mapped onto Cake checkpoints
         inputs["track_seq_idx"] = torch.zeros(1, S, dtype=torch.int32)
         inputs["track_end_locs"] = torch.tensor([96], dtype=torch.int32)
-    elif case == "no_metadata":
-        inputs["cake_chunk_indices"] = inputs["cake_chunk_offsets"] = None
     elif case == "fp64_state":
         inputs["state_dtype"] = torch.float64
     with (
@@ -609,6 +612,155 @@ def test_ssd_route_static_fallbacks_skip_adapter(case):
     supports.assert_not_called()
     cake.assert_not_called()
     assert stock.call_args.kwargs["out"] is inputs["out"]
+
+
+@pytest.mark.parametrize("chunk_size", [128, 256, 512])
+def test_ssd_route_passes_the_engine_chunk_size_through(chunk_size):
+    """The engine's ``mamba_chunk_size`` (256 for Nemotron-H) reaches the
+    adapter and the Cake call unchanged; the route keys its rejection cache
+    on it and builds no chunk metadata (CAKE-934 item 2 option B)."""
+    stock = mock.Mock(side_effect=_stock_ssd)
+    supports, cake = mock.Mock(return_value=True), mock.Mock(side_effect=_cake_ssd)
+    inputs = _ssd_inputs()
+    inputs["chunk_size"] = chunk_size
+    with (
+        _routes(mamba_mod, "mamba_ssd_prefill"),
+        mock.patch.object(mamba_mod, "_cake_ssd_kernels", lambda: (supports, cake)),
+    ):
+        mamba_mod.ssd_prefill(stock, **inputs)
+    stock.assert_not_called()
+    assert supports.call_args.kwargs["chunk_size"] == chunk_size
+    assert cake.call_args.kwargs["chunk_size"] == chunk_size
+    assert cake.call_args.kwargs["cu_seqlens"] is inputs["cu_seqlens"]
+    assert "chunk_indices" not in cake.call_args.kwargs
+
+
+class _FakeCudaTensor:
+    """A CPU tensor that reports itself as living on ``cuda:0`` (the adapter's
+    admission predicate reads shapes, dtypes, contiguity and the device; no
+    kernel runs on a CPU-only host)."""
+
+    def __init__(self, tensor):
+        self._tensor = tensor
+
+    is_cuda = True
+    device = torch.device("cuda:0")
+
+    def __getattr__(self, name):
+        return getattr(self._tensor, name)
+
+
+def _fake_cuda_admission_inputs(lengths=LENGTHS):
+    seqlen = sum(lengths)
+    cu = [0]
+    for n in lengths:
+        cu.append(cu[-1] + n)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(len(lengths), dtype=torch.int32),
+        torch.tensor(lengths, dtype=torch.int64),
+    ).unsqueeze(0)
+    chunk_indices, chunk_offsets = [], []
+    starts = set(cu[:-1])
+    for chunk in range(-(-seqlen // 128)):
+        lo, hi = chunk * 128, (chunk + 1) * 128
+        for offset in sorted({0} | {b - lo for b in starts if lo < b < hi}):
+            chunk_indices.append(chunk)
+            chunk_offsets.append(offset)
+    f = _FakeCudaTensor
+    return dict(
+        x=f(torch.zeros(1, seqlen, H, HEADDIM, dtype=torch.bfloat16)),
+        dt=f(torch.zeros(1, seqlen, H, dtype=torch.bfloat16)),
+        A=f(torch.zeros(H, dtype=torch.float32)),
+        B=f(torch.zeros(1, seqlen, G, DSTATE, dtype=torch.bfloat16)),
+        C=f(torch.zeros(1, seqlen, G, DSTATE, dtype=torch.bfloat16)),
+        D=f(torch.zeros(H, dtype=torch.bfloat16)),
+        dt_bias=f(torch.zeros(H, dtype=torch.bfloat16)),
+        out=f(torch.zeros(1, seqlen, H, HEADDIM, dtype=torch.bfloat16)),
+        cu_seqlens=f(torch.tensor(cu, dtype=torch.int32)),
+        seq_idx=f(seq_idx),
+        chunk_indices=f(torch.tensor(chunk_indices, dtype=torch.int32)),
+        chunk_offsets=f(torch.tensor(chunk_offsets, dtype=torch.int32)),
+    )
+
+
+def test_adapter_admits_the_cu_seqlens_form_at_any_chunk_size_cpu():
+    """``supports_ssd_combined`` (the route's admission): the ``cu_seqlens``
+    form is admitted at every positive chunk size with ``seq_idx`` optional
+    and the chunk-128 triple excluded; the triple itself only at chunk 128;
+    ``seq_chunk_cumsum`` is derived with ``cu_seqlens`` (rejected when
+    given); a non-int32 or wrong-length ``cu_seqlens`` is rejected."""
+    from sglang.kernels.cake_kernels import mamba as cake_mamba
+
+    inputs = _fake_cuda_admission_inputs()
+    positional = (inputs["x"], inputs["dt"], inputs["A"], inputs["B"], inputs["C"])
+    common = dict(
+        D=inputs["D"],
+        dt_bias=inputs["dt_bias"],
+        out=inputs["out"],
+        state_dtype=torch.float32,
+    )
+    with (
+        mock.patch.object(cake_mamba, "flashinfer_module_available", lambda *_: True),
+        mock.patch.object(cake_mamba, "cuda_tensor_on", lambda *_: True),
+    ):
+        supports = cake_mamba.supports_ssd_combined
+        for chunk_size in (64, 128, 256, 512, 1024):
+            assert supports(
+                *positional, cu_seqlens=inputs["cu_seqlens"], chunk_size=chunk_size, **common
+            ), chunk_size
+        # seq_idx may ride along; the triple's chunk vectors may not.
+        assert supports(
+            *positional,
+            cu_seqlens=inputs["cu_seqlens"],
+            seq_idx=inputs["seq_idx"],
+            chunk_size=256,
+            **common,
+        )
+        assert not supports(
+            *positional,
+            cu_seqlens=inputs["cu_seqlens"],
+            chunk_indices=inputs["chunk_indices"],
+            chunk_offsets=inputs["chunk_offsets"],
+            chunk_size=256,
+            **common,
+        )
+        # Agreeing / disagreeing sequence counts.
+        assert supports(
+            *positional, cu_seqlens=inputs["cu_seqlens"], num_seqs=2, chunk_size=256, **common
+        )
+        assert not supports(
+            *positional, cu_seqlens=inputs["cu_seqlens"], num_seqs=3, chunk_size=256, **common
+        )
+        # The chunk-128 triple: chunk 128 only.
+        triple = dict(
+            seq_idx=inputs["seq_idx"],
+            chunk_indices=inputs["chunk_indices"],
+            chunk_offsets=inputs["chunk_offsets"],
+            num_seqs=2,
+        )
+        assert supports(*positional, chunk_size=128, **triple, **common)
+        assert not supports(*positional, chunk_size=256, **triple, **common)
+        # seq_chunk_cumsum is derived on the cu_seqlens path.
+        cumsum = _FakeCudaTensor(torch.zeros(3, dtype=torch.int32))
+        assert supports(*positional, chunk_size=128, seq_chunk_cumsum=cumsum, **triple, **common)
+        assert not supports(
+            *positional,
+            cu_seqlens=inputs["cu_seqlens"],
+            seq_chunk_cumsum=cumsum,
+            chunk_size=256,
+            **common,
+        )
+        # Malformed cu_seqlens / chunk sizes.
+        bad = _FakeCudaTensor(inputs["cu_seqlens"]._tensor.to(torch.int64))
+        assert not supports(*positional, cu_seqlens=bad, chunk_size=256, **common)
+        one = _FakeCudaTensor(torch.zeros(1, dtype=torch.int32))
+        assert not supports(*positional, cu_seqlens=one, chunk_size=256, **common)
+        for chunk_size in (0, -128, True, 128.0):
+            assert not supports(
+                *positional, cu_seqlens=inputs["cu_seqlens"], chunk_size=chunk_size, **common
+            ), chunk_size
+        # Batched (no varlen form) is admitted at any chunk size as before.
+        assert supports(*positional, chunk_size=256, **common)
 
 
 def test_ssd_flashinfer_refusal_falls_back_and_is_cached():

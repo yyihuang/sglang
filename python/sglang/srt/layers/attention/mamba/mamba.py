@@ -636,8 +636,6 @@ class MambaMixer2(torch.nn.Module):
                     1, num_prefill_tokens, -1, self.head_dim
                 ),
                 state_dtype=ssm_state.dtype,
-                cake_chunk_indices=mixed_metadata.cake_chunk_indices,
-                cake_chunk_offsets=mixed_metadata.cake_chunk_offsets,
                 track_states_out=ssm_state,
                 cake_track_checkpoints=mixed_metadata.cake_track_checkpoints,
             )

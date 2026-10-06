@@ -8,7 +8,8 @@ output and final states are bitwise identical to constructing the FlashInfer
 runner directly and to the functional ``cake_ssd_combined_fwd``; and that
 output, final states and selective checkpoint rows (PR #35444's compact
 checkpoints) match FlashInfer's own validated oracle for this kernel, in
-batched mode and in packed-varlen mode (``seq_idx`` + chunk metadata).
+batched mode and in packed-varlen mode (``seq_idx`` + chunk metadata, or the
+engine's ``cu_seqlens`` + its chunk size: the route's call, CAKE-934 item 2).
 
 CAKE-956 revision of the contract (FlashInfer ``flashinfer/mamba/cake_ssd_combined.py``):
 any packed token count (the last physical chunk may be partial), BF16 / FP16 /
@@ -64,7 +65,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-CHUNK = cake_mamba.SSD_CHUNK_SIZE
+CHUNK = cake_mamba.SSD_CHUNK_SIZE  # the kernels' internal tiling (triple form)
+ENGINE_CHUNK = 256  # Nemotron-H ``mamba_chunk_size``: the route's chunk_size label
 HEADDIM = cake_mamba.SSD_HEADDIM
 DSTATE = cake_mamba.SSD_DSTATE
 NHEADS, NGROUPS = 16, 8
@@ -633,6 +635,243 @@ def test_runner_writes_selective_checkpoint_states(varlen):
     )
     torch.cuda.synchronize()
     assert torch.isnan(unaligned).all()
+
+
+def _cu_seqlens(lengths, device):
+    cu = [0]
+    for n in lengths:
+        cu.append(cu[-1] + int(n))
+    return torch.tensor(cu, dtype=torch.int32, device=device)
+
+
+def _stock_triton_reference(case, cu_seqlens, *, chunk_size, state_dtype):
+    """The engine's own call: stock Triton ``mamba_chunk_scan_combined`` at the
+    model chunk size with ``cu_seqlens`` and, when a prefix is given, the
+    engine's chunk-``chunk_size`` metadata (``Mamba2Metadata``). Returns
+    ``(out, varlen_states)``."""
+    from sglang.kernels.ops.mamba.triton_ops.ssd_combined import (
+        mamba_chunk_scan_combined,
+    )
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
+
+    x, dt, A, B, C = case["tensors"]
+    run = case["run"]
+    chunk_indices = chunk_offsets = None
+    if run["initial_states"] is not None:
+        chunk_indices, chunk_offsets = (
+            Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+                cu_seqlens, chunk_size, int(x.shape[1])
+            )
+        )
+    out = torch.empty_like(case["out"])
+    varlen_states = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size=chunk_size,
+        D=run["D"],
+        z=run["z"],
+        dt_bias=run["dt_bias"],
+        initial_states=run["initial_states"],
+        seq_idx=run["seq_idx"],
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        cu_seqlens=cu_seqlens,
+        dt_softplus=run["dt_softplus"],
+        dt_limit=run["dt_limit"],
+        out=out,
+        return_varlen_states=True,
+        return_final_states=False,
+        state_dtype=state_dtype,
+    )
+    return out, varlen_states
+
+
+@pytest.mark.parametrize(
+    "state_dtype", [torch.bfloat16, torch.float32], ids=["bf16-pool", "fp32-pool"]
+)
+@pytest.mark.parametrize("initial", [True, False], ids=["prefix", "no-prefix"])
+@pytest.mark.parametrize(
+    "lengths",
+    [(96, 160), (1000,), (64, 60), (300, 700), (128, 896), (2048, 2048)],
+    ids=["96+160", "1000", "64+60", "300+700", "128+896", "2048x2"],
+)
+def test_route_call_cu_seqlens_at_engine_chunk_size_matches_triple_and_stock(
+    lengths, initial, state_dtype
+):
+    """The route's call (CAKE-934 item 2 option B): ``cu_seqlens`` + the
+    engine's chunk size (256), no ``seq_idx`` / chunk-128 triple / ``num_seqs``.
+    Admitted by the adapter at chunk 256 (the triple is not); bitwise equal
+    to the chunk-128 triple call of the same inputs (the preprocess derives
+    the same segment tables); within the fixed BF16 tolerance of the fp64
+    recurrence with stock Triton(256) -- the engine's own kernel -- as the
+    comparison arm, for a BF16 and an FP32 state pool, with and without a
+    prefix state."""
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _case(
+        device,
+        varlen=True,
+        seed=40 + sum(lengths) % 97 + int(initial),
+        lengths=lengths,
+        initial_states=initial,
+        state_dtype=state_dtype,
+    )
+    x, dt, A, B, C = case["tensors"]
+    run = case["run"]
+    cu = _cu_seqlens(lengths, device)
+    common = dict(
+        D=run["D"],
+        z=run["z"],
+        dt_bias=run["dt_bias"],
+        initial_states=run["initial_states"],
+        state_dtype=state_dtype,
+    )
+    # Admission: the cu_seqlens form at the engine's chunk size, no triple.
+    assert cake_mamba.supports_ssd_combined(
+        x, dt, A, B, C, cu_seqlens=cu, chunk_size=ENGINE_CHUNK, out=case["out"], **common
+    )
+    assert not cake_mamba.supports_ssd_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        seq_idx=run["seq_idx"],
+        chunk_indices=run["chunk_indices"],
+        chunk_offsets=run["chunk_offsets"],
+        num_seqs=run["num_seqs"],
+        chunk_size=ENGINE_CHUNK,
+        out=case["out"],
+        **common,
+    )
+    scan = dict(dt_softplus=True, dt_limit=run["dt_limit"], return_final_states=True)
+    out_cu, final_cu = cake_ssd_combined_fwd(
+        x, dt, A, B, C, cu_seqlens=cu, chunk_size=ENGINE_CHUNK, out=case["out"], **common, **scan
+    )
+    assert out_cu.untyped_storage().data_ptr() == case["out"].untyped_storage().data_ptr()
+    triple_out = torch.empty_like(case["out"])
+    out_tr, final_tr = cake_ssd_combined_fwd(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        seq_idx=run["seq_idx"],
+        chunk_indices=run["chunk_indices"],
+        chunk_offsets=run["chunk_offsets"],
+        num_seqs=run["num_seqs"],
+        out=triple_out,
+        **common,
+        **scan,
+    )
+    torch.cuda.synchronize()
+    assert final_cu.dtype == state_dtype and tuple(final_cu.shape) == (
+        len(lengths),
+        NHEADS,
+        HEADDIM,
+        DSTATE,
+    )
+    assert torch.equal(out_cu, out_tr), "cu_seqlens form differs from the chunk-128 triple"
+    assert torch.equal(final_cu, final_tr)
+    stock_out, stock_final = _stock_triton_reference(
+        case, cu, chunk_size=ENGINE_CHUNK, state_dtype=state_dtype
+    )
+    torch.cuda.synchronize()
+    reference = _fp64_reference(case)
+    _assert_accuracy("out", out_cu, stock_out, reference[0])
+    _assert_accuracy(
+        "final_states", final_cu, stock_final.to(state_dtype), reference[1]
+    )
+
+
+def test_route_call_cu_seqlens_engine_chunk_size_checkpoint_unaligned_start():
+    """A radix-cache track row of a sequence that starts at a packed offset
+    off the 128 grid (packed [0, 300) + [300, 1000), track position 256
+    tokens into sequence 1 = absolute 556): with ``cu_seqlens`` the Cake
+    preprocess makes the checkpoint token a segment boundary itself, so the
+    route passes the checkpoint pair without any chunk metadata.  The slot
+    holds the fp64 state after 556 tokens (stock Triton's chunk-256 final
+    state of the same prefix as the comparison arm); an unused slot stays
+    untouched."""
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    lengths = (300, 700)
+    case = _case(device, varlen=True, seed=91, lengths=lengths)
+    x, dt, A, B, C = case["tensors"]
+    run = case["run"]
+    cu = _cu_seqlens(lengths, device)
+    boundary = 300 + 256
+    token_indices = torch.tensor([-1, boundary], device=device, dtype=torch.int32)
+    slot_indices = torch.tensor([-1, 2], device=device, dtype=torch.int32)
+    checkpoint_states = torch.full(
+        (3, NHEADS, HEADDIM, DSTATE), float("nan"), device=device
+    ).bfloat16()
+    common = dict(
+        D=run["D"],
+        z=run["z"],
+        dt_bias=run["dt_bias"],
+        initial_states=run["initial_states"],
+        state_dtype=torch.bfloat16,
+        checkpoint_token_indices=token_indices,
+        checkpoint_state_slots=slot_indices,
+        checkpoint_states=checkpoint_states,
+    )
+    assert cake_mamba.supports_ssd_combined(
+        x, dt, A, B, C, cu_seqlens=cu, chunk_size=ENGINE_CHUNK, out=case["out"], **common
+    )
+    out, final = cake_ssd_combined_fwd(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        cu_seqlens=cu,
+        chunk_size=ENGINE_CHUNK,
+        out=case["out"],
+        dt_softplus=True,
+        dt_limit=run["dt_limit"],
+        return_final_states=True,
+        **common,
+    )
+    torch.cuda.synchronize()
+    reference = _fp64_reference(case, checkpoints={boundary})
+    stock_out, stock_final = _stock_triton_reference(
+        case, cu, chunk_size=ENGINE_CHUNK, state_dtype=torch.bfloat16
+    )
+    _assert_accuracy("out", out, stock_out, reference[0])
+    _assert_accuracy("final_states", final, stock_final, reference[1])
+    # The checkpoint: stock Triton's final state of sequence 1's first 256
+    # tokens (a batched chunk-256 call on that prefix) is the comparison arm.
+    prefix_case = {
+        **case,
+        "tensors": tuple(
+            t[:, 300:boundary].contiguous() if t.ndim >= 2 and t.shape[1] == 1000 else t
+            for t in case["tensors"]
+        ),
+        "lengths": (256,),
+        "run": {
+            **run,
+            "z": run["z"][:, 300:boundary].contiguous(),
+            "initial_states": run["initial_states"][1:2].contiguous(),
+            "seq_idx": None,
+            "chunk_indices": None,
+            "chunk_offsets": None,
+        },
+        "out": torch.empty(1, 256, NHEADS, HEADDIM, device=device, dtype=torch.bfloat16),
+    }
+    _, prefix_final = _stock_triton_reference(
+        prefix_case, _cu_seqlens((256,), device), chunk_size=ENGINE_CHUNK, state_dtype=torch.bfloat16
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(checkpoint_states[2].float()).all()
+    _assert_accuracy(
+        "checkpoint[2]", checkpoint_states[2], prefix_final[0], reference[2][boundary]
+    )
+    assert torch.isnan(checkpoint_states[UNTOUCHED_SLOT]).all()
+    assert torch.isnan(checkpoint_states[0]).all()
 
 
 if __name__ == "__main__":

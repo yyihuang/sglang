@@ -18,12 +18,16 @@ executed and why a batch did not take the Cake kernel.
 FlashInfer contract constraints that shape the wiring (see the adapter
 :mod:`sglang.kernels.cake_kernels.mamba` for the full list):
 
-* SSD: chunk 128 (the engine builds its chunk metadata for the model's
-  ``mamba_chunk_size``, 256 for Nemotron-H, so :class:`Mamba2Metadata`
-  carries a second, chunk-128 ``chunk_indices`` / ``chunk_offsets`` pair when
-  the route is on), any packed token count (the kernel handles a partial last
-  chunk; no 128-multiple admission and no single-chunk guard: both were
-  workarounds for kernel bugs fixed in the exact-scan family). The engine's
+* SSD: any chunk size (the Cake programs tile 128 tokens internally and the
+  result does not depend on the caller's chunk size, so the engine's
+  ``mamba_chunk_size`` -- 256 for Nemotron-H -- is passed as is) with the
+  ``cu_seqlens`` varlen form (``query_start_loc``, int32 ``[num_seqs + 1]``
+  on the device; the Cake preprocess derives its 128-granularity segment
+  metadata from it, so the route builds no chunk metadata of its own and
+  passes no ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets``), any packed
+  token count (the kernel handles a partial last chunk; no 128-multiple
+  admission and no single-chunk guard: both were workarounds for kernel bugs
+  fixed in the exact-scan family). The engine's
   SSM pool dtype (``--mamba-ssm-dtype``: FP32 by default, BF16 / FP16
   selectable) is passed explicitly as ``state_dtype`` so the final states
   come back in the pool dtype and the engine's scatter does not cast -- a
@@ -32,10 +36,12 @@ FlashInfer contract constraints that shape the wiring (see the adapter
   BF16 state). The engine's token-major ``[1, S, H, 64]`` output buffer is
   the kernel's ``out`` (written directly, no copy).
 * SSD radix-cache tracking (``track_seq_idx`` / ``track_end_locs``): the
-  Cake runner exposes selective checkpoints only at logical chunk ends
-  (``checkpoint_token_indices`` + ``checkpoint_state_slots``); the mapping
-  from the engine's track end locations onto that contract is not wired
-  here, so a batch that requests track states keeps the stock kernel.
+  Cake runner writes selective checkpoints (``checkpoint_token_indices`` +
+  ``checkpoint_state_slots``, absolute exclusive token boundaries) straight
+  into the state pool; with ``cu_seqlens`` the preprocess inserts a
+  chunk-unaligned checkpoint as a segment boundary itself, so the engine's
+  256-grid track positions of a sequence starting at an odd packed offset
+  need no host-side metadata (:func:`cake_ssd_track_checkpoints`).
 * SSU: Cake runs only on its promoted rows. The ``T = 1`` decode of a
   ``headdim = 64`` model (Nemotron-H, granite; BF16 or FP32 state) and the
   BF16-state MTP cache row ``(64, 128, T=6)`` with ``disable_state_update``
@@ -72,7 +78,6 @@ logger = logging.getLogger(__name__)
 
 CAKE_ROUTE_SSD_PREFILL = "mamba_ssd_prefill"
 CAKE_ROUTE_SSU = "mamba_ssu"
-SSD_CHUNK_SIZE = 128
 SSD_HEADDIM = 64
 SSD_DSTATE = 128
 _CAKE_LOG_PREFIX = "[cake-route]"
@@ -173,15 +178,15 @@ SSD_TRACK_STATES_IN_PLACE = _TrackStatesInPlace()
 class CakeTrackCheckpoints:
     """The engine's prefill track rows expressed for the Cake SSD runner.
 
-    ``boundaries`` are the absolute packed token positions the chunk-128
-    metadata must expose as logical chunk ends; ``token_indices`` /
-    ``state_slots`` the runner's per-sequence int32 checkpoint pair (``-1``
-    where no checkpoint is wanted), both ``None`` when no row needs a
-    checkpoint (every tracked row is chunk-aligned and takes the engine's
-    final-state slot copy, the default-configuration case).
+    ``token_indices`` / ``state_slots`` are the runner's per-sequence int32
+    checkpoint pair (absolute exclusive packed token boundaries; ``-1`` where
+    no checkpoint is wanted), both ``None`` when no row needs a checkpoint
+    (every tracked row is chunk-aligned and takes the engine's final-state
+    slot copy, the default-configuration case).  The Cake preprocess derives
+    the segment boundary for a chunk-unaligned checkpoint from
+    ``cu_seqlens`` + these tokens itself.
     """
 
-    boundaries: tuple[int, ...]
     token_indices: Optional[torch.Tensor]
     state_slots: Optional[torch.Tensor]
 
@@ -202,10 +207,10 @@ def cake_ssd_track_checkpoints(
     rows take the sequence's final state through the engine's slot copy (no
     checkpoint). For chunk-unaligned rows the stock kernel reads its chunk grid
     or runs a recompute pass; the Cake runner instead writes one checkpoint per
-    sequence at an exclusive absolute token boundary, provided that boundary
-    is a logical chunk end of the chunk-128 metadata.  ``None`` when a tracked
-    row wants the state before its first token (chunk index 0): the stock
-    kernel owns that case, so the batch stays on the stock path.
+    sequence at an exclusive absolute token boundary (the preprocess makes it
+    a segment end).  ``None`` when a tracked row wants the state before its
+    first token (chunk index 0): the stock kernel owns that case, so the batch
+    stays on the stock path.
     """
     from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
         build_prefill_track_plan,
@@ -227,8 +232,7 @@ def cake_ssd_track_checkpoints(
             return None
         tokens[row] = starts[row] + chunk * state_chunk_size
     if not plan.unaligned_rows:
-        return CakeTrackCheckpoints((), None, None)
-    boundaries = tuple(t for t in tokens if t >= 0)
+        return CakeTrackCheckpoints(None, None)
     token_indices = torch.tensor(tokens, dtype=torch.int32).to(
         device, non_blocking=True
     )
@@ -237,43 +241,7 @@ def cake_ssd_track_checkpoints(
         device, non_blocking=True
     )
     slots[rows] = track_slots.index_select(0, rows).to(torch.int32)
-    return CakeTrackCheckpoints(boundaries, token_indices, slots)
-
-
-def cake_ssd_chunk_metadata(
-    extend_seq_lens: Sequence[int],
-    device: torch.device,
-    extra_boundaries: Sequence[int] = (),
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Logical-chunk metadata of a packed prefill batch for the Cake chunk size.
-
-    Same semantics as ``Mamba2Metadata._query_start_loc_to_chunk_indices_offsets``
-    (a logical chunk starts at every physical 128-token chunk start and at
-    every sequence start) computed from the host-side sequence lengths, so
-    the metadata build does not synchronise the stream.  ``extra_boundaries``
-    are further absolute token positions that must be logical chunk ends (the
-    radix-cache track positions the Cake runner checkpoints; see
-    :func:`cake_ssd_track_checkpoints`); one already on the 128 grid or at a
-    sequence start adds nothing.  Returns int32 ``(chunk_indices,
-    chunk_offsets)`` on ``device``.
-    """
-    starts: set[int] = {int(b) for b in extra_boundaries}
-    start = 0
-    for length in extend_seq_lens:
-        starts.add(start)
-        start += int(length)
-    total = start
-    chunk_indices: list[int] = []
-    chunk_offsets: list[int] = []
-    for chunk in range(-(-total // SSD_CHUNK_SIZE)):
-        lo, hi = chunk * SSD_CHUNK_SIZE, (chunk + 1) * SSD_CHUNK_SIZE
-        for offset in sorted({0} | {b - lo for b in starts if lo < b < hi}):
-            chunk_indices.append(chunk)
-            chunk_offsets.append(offset)
-    return (
-        torch.tensor(chunk_indices, dtype=torch.int32).to(device, non_blocking=True),
-        torch.tensor(chunk_offsets, dtype=torch.int32).to(device, non_blocking=True),
-    )
+    return CakeTrackCheckpoints(token_indices, slots)
 
 
 def ssd_prefill(
@@ -296,19 +264,18 @@ def ssd_prefill(
     track_end_locs: Optional[torch.Tensor],
     out: torch.Tensor,
     state_dtype: torch.dtype,
-    cake_chunk_indices: Optional[torch.Tensor],
-    cake_chunk_offsets: Optional[torch.Tensor],
     track_states_out: Optional[torch.Tensor] = None,
     cake_track_checkpoints: Optional[CakeTrackCheckpoints] = None,
 ) -> tuple:
     """Run the prefill SSD scan; ``mamba_ssd_prefill`` may take the Cake kernel.
 
     Returns the stock ``(intermediate_states, varlen_state, track_states)``
-    triple.  ``cake_chunk_indices`` / ``cake_chunk_offsets`` are the chunk-128
-    metadata prepared once per forward by :class:`Mamba2Metadata`;
-    ``cake_track_checkpoints`` the radix-cache track rows mapped onto Cake
-    checkpoints (same place) and ``track_states_out`` the layer's SSM state
-    pool they are written into.  For a tracked batch the Cake path returns
+    triple.  The Cake path takes the engine's ``cu_seqlens`` and
+    ``chunk_size`` as they are (the Cake preprocess derives its own segment
+    metadata); ``cake_track_checkpoints`` are the radix-cache track rows
+    mapped onto Cake checkpoints once per forward by :class:`Mamba2Metadata`
+    and ``track_states_out`` the layer's SSM state pool they are written
+    into.  For a tracked batch the Cake path returns
     :data:`SSD_TRACK_STATES_IN_PLACE` in the ``track_states`` slot: the
     chunk-unaligned rows (if any) were checkpointed in-kernel and only the
     engine's aligned slot copies remain.  Everything else is the stock call's
@@ -344,14 +311,12 @@ def ssd_prefill(
         C,
         D=D,
         dt_bias=dt_bias,
-        seq_idx=seq_idx,
+        chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         initial_states=initial_states,
         track_seq_idx=track_seq_idx,
         out=out,
         state_dtype=state_dtype,
-        cake_chunk_indices=cake_chunk_indices,
-        cake_chunk_offsets=cake_chunk_offsets,
         track_states_out=track_states_out,
         cake_track_checkpoints=cake_track_checkpoints,
     )
@@ -369,14 +334,12 @@ def _cake_ssd_prefill(
     *,
     D: torch.Tensor,
     dt_bias: torch.Tensor,
-    seq_idx: torch.Tensor,
+    chunk_size: int,
     cu_seqlens: torch.Tensor,
     initial_states: Optional[torch.Tensor],
     track_seq_idx: Optional[torch.Tensor],
     out: torch.Tensor,
     state_dtype: torch.dtype,
-    cake_chunk_indices: Optional[torch.Tensor],
-    cake_chunk_offsets: Optional[torch.Tensor],
     track_states_out: Optional[torch.Tensor] = None,
     cake_track_checkpoints: Optional[CakeTrackCheckpoints] = None,
 ) -> Optional[tuple]:
@@ -384,9 +347,8 @@ def _cake_ssd_prefill(
     route = CAKE_ROUTE_SSD_PREFILL
     seqlen = x.shape[1]
     nheads = x.shape[2]
-    detail = _tensor_summary(x=x, dt=dt, B=B, seq_idx=seq_idx, out=out)
-    detail += f" state={str(state_dtype).removeprefix('torch.')}"
-    num_seqs = int(cu_seqlens.shape[0]) - 1
+    detail = _tensor_summary(x=x, dt=dt, B=B, cu_seqlens=cu_seqlens, out=out)
+    detail += f" state={str(state_dtype).removeprefix('torch.')} chunk={chunk_size}"
     # ``track_seq_idx`` is set for every forward of a radix-cache-tracked batch
     # (even with no row to recompute); the mapped checkpoints decide whether
     # the Cake runner can write the tracked rows itself.
@@ -421,11 +383,6 @@ def _cake_ssd_prefill(
                 checkpoint_state_slots=cake_track_checkpoints.state_slots,
                 checkpoint_states=track_states_out,
             )
-    if cake_chunk_indices is None or cake_chunk_offsets is None:
-        _log_cake_route_once(
-            route, "fallback", f"no chunk-128 metadata for this batch: {detail}"
-        )
-        return None
     if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         _log_cake_route_once(
             route,
@@ -442,15 +399,17 @@ def _cake_ssd_prefill(
         state_dtype,
         initial_states is None,
         bool(checkpoints),
+        chunk_size,
     )
     if key in _cake_route_rejected:
         return None
     supports, cake_fwd = _cake_ssd_kernels()
     # ``initial_states=None`` is the stock "no prefix" call; the Cake runner
-    # takes it as such and learns the packed sequence count from ``num_seqs``.
-    # The engine's token-major output buffer is the kernel's ``out``; the
-    # engine's pool dtype is the kernel's state dtype (explicit, so a
-    # prefix-less batch does not fall back to FlashInfer's BF16 inference).
+    # takes it as such and learns the packed sequence count from
+    # ``cu_seqlens`` (a host shape).  The engine's token-major output buffer
+    # is the kernel's ``out``; the engine's pool dtype is the kernel's state
+    # dtype (explicit, so a prefix-less batch does not fall back to
+    # FlashInfer's BF16 inference); the engine's chunk size is a label.
     dt_limit = (0.0, float("inf"))
     admitted = supports(
         x,
@@ -463,12 +422,9 @@ def _cake_ssd_prefill(
         dt_bias=dt_bias,
         dt_limit=dt_limit,
         initial_states=initial_states,
-        seq_idx=seq_idx,
-        chunk_indices=cake_chunk_indices,
-        chunk_offsets=cake_chunk_offsets,
+        cu_seqlens=cu_seqlens,
         out=out,
-        num_seqs=num_seqs,
-        chunk_size=SSD_CHUNK_SIZE,
+        chunk_size=chunk_size,
         state_dtype=state_dtype,
         **checkpoints,
     )
@@ -488,11 +444,9 @@ def _cake_ssd_prefill(
             dt_softplus=True,
             dt_limit=dt_limit,
             initial_states=initial_states,
-            seq_idx=seq_idx,
-            chunk_indices=cake_chunk_indices,
-            chunk_offsets=cake_chunk_offsets,
+            cu_seqlens=cu_seqlens,
             out=out,
-            num_seqs=num_seqs,
+            chunk_size=chunk_size,
             return_final_states=True,
             state_dtype=state_dtype,
             **checkpoints,
