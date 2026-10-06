@@ -689,6 +689,36 @@ def _stock_triton_reference(case, cu_seqlens, *, chunk_size, state_dtype):
     return out, varlen_states
 
 
+def _assert_within_fixed_tolerance(name, actual, reference, comparison=None):
+    """The fixed tolerance against the fp64 recurrence -- every value finite,
+    at most ``_MAX_OUTSIDE_FRACTION`` of the entries outside ``atol = rtol =
+    1e-2`` -- for the Cake result and, when given, for the stock Triton(256)
+    comparison arm.  ``_assert_accuracy``'s parity rule (no more outliers than
+    the comparison arm up to Poisson slack) is a CuTe rule: CuTe runs the same
+    bf16 algorithm, stock Triton keeps the per-token delta in fp32 where the
+    Cake kernels store it in fp16 (CAKE-942: 0.66 % vs 0.62 % outliers on the
+    realistic distribution), so Triton is the more accurate arm by
+    construction and a Poisson slack does not cover that systematic gap.  Both
+    counts are reported; the tolerance itself is the fixed one."""
+    assert tuple(actual.shape) == tuple(reference.shape), (name, tuple(actual.shape))
+    assert torch.isfinite(actual.to(torch.float64)).all(), f"{name}: Cake output is not finite"
+    budget = _MAX_OUTSIDE_FRACTION * reference.numel()
+    outside = int(_outside_tolerance(actual, reference).sum())
+    detail = ""
+    if comparison is not None:
+        assert tuple(comparison.shape) == tuple(reference.shape), name
+        comparison_outside = int(_outside_tolerance(comparison, reference).sum())
+        assert comparison_outside <= budget, (
+            f"{name}: stock Triton(256) has {comparison_outside} of {reference.numel()} "
+            f"entries outside atol=rtol={_ATOL} of the fp64 recurrence (limit {budget:.0f})"
+        )
+        detail = f"; stock Triton(256): {comparison_outside}"
+    assert outside <= budget, (
+        f"{name}: {outside} of {reference.numel()} Cake entries outside "
+        f"atol=rtol={_ATOL} of the fp64 recurrence (limit {budget:.0f}{detail})"
+    )
+
+
 @pytest.mark.parametrize(
     "state_dtype", [torch.bfloat16, torch.float32], ids=["bf16-pool", "fp32-pool"]
 )
@@ -706,9 +736,9 @@ def test_route_call_cu_seqlens_at_engine_chunk_size_matches_triple_and_stock(
     Admitted by the adapter at chunk 256 (the triple is not); bitwise equal
     to the chunk-128 triple call of the same inputs (the preprocess derives
     the same segment tables); within the fixed BF16 tolerance of the fp64
-    recurrence with stock Triton(256) -- the engine's own kernel -- as the
-    comparison arm, for a BF16 and an FP32 state pool, with and without a
-    prefix state."""
+    recurrence, with stock Triton(256) -- the engine's own kernel -- held to
+    the same tolerance on the same inputs, for a BF16 and an FP32 state pool,
+    with and without a prefix state."""
     _skip_unless_supported()
     device = torch.device("cuda")
     case = _case(
@@ -781,9 +811,9 @@ def test_route_call_cu_seqlens_at_engine_chunk_size_matches_triple_and_stock(
     )
     torch.cuda.synchronize()
     reference = _fp64_reference(case)
-    _assert_accuracy("out", out_cu, stock_out, reference[0])
-    _assert_accuracy(
-        "final_states", final_cu, stock_final.to(state_dtype), reference[1]
+    _assert_within_fixed_tolerance("out", out_cu, reference[0], stock_out)
+    _assert_within_fixed_tolerance(
+        "final_states", final_cu, reference[1], stock_final.to(state_dtype)
     )
 
 
@@ -793,9 +823,9 @@ def test_route_call_cu_seqlens_engine_chunk_size_checkpoint_unaligned_start():
     tokens into sequence 1 = absolute 556): with ``cu_seqlens`` the Cake
     preprocess makes the checkpoint token a segment boundary itself, so the
     route passes the checkpoint pair without any chunk metadata.  The slot
-    holds the fp64 state after 556 tokens (stock Triton's chunk-256 final
-    state of the same prefix as the comparison arm); an unused slot stays
-    untouched."""
+    holds the fp64 state after 556 tokens within the fixed tolerance (stock
+    Triton's chunk-256 final state of the same prefix held to the same
+    tolerance); an unused slot stays untouched."""
     _skip_unless_supported()
     device = torch.device("cuda")
     lengths = (300, 700)
@@ -841,8 +871,8 @@ def test_route_call_cu_seqlens_engine_chunk_size_checkpoint_unaligned_start():
     stock_out, stock_final = _stock_triton_reference(
         case, cu, chunk_size=ENGINE_CHUNK, state_dtype=torch.bfloat16
     )
-    _assert_accuracy("out", out, stock_out, reference[0])
-    _assert_accuracy("final_states", final, stock_final, reference[1])
+    _assert_within_fixed_tolerance("out", out, reference[0], stock_out)
+    _assert_within_fixed_tolerance("final_states", final, reference[1], stock_final)
     # The checkpoint: stock Triton's final state of sequence 1's first 256
     # tokens (a batched chunk-256 call on that prefix) is the comparison arm.
     prefix_case = {
@@ -867,8 +897,8 @@ def test_route_call_cu_seqlens_engine_chunk_size_checkpoint_unaligned_start():
     )
     torch.cuda.synchronize()
     assert torch.isfinite(checkpoint_states[2].float()).all()
-    _assert_accuracy(
-        "checkpoint[2]", checkpoint_states[2], prefix_final[0], reference[2][boundary]
+    _assert_within_fixed_tolerance(
+        "checkpoint[2]", checkpoint_states[2], reference[2][boundary], prefix_final[0]
     )
     assert torch.isnan(checkpoint_states[UNTOUCHED_SLOT]).all()
     assert torch.isnan(checkpoint_states[0]).all()
