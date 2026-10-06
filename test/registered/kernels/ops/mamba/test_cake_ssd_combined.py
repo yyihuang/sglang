@@ -886,7 +886,10 @@ def test_route_call_cu_seqlens_engine_chunk_size_checkpoint_unaligned_start():
             **run,
             "z": run["z"][:, 300:boundary].contiguous(),
             "initial_states": run["initial_states"][1:2].contiguous(),
-            "seq_idx": None,
+            # stock Triton requires seq_idx whenever cu_seqlens rides with
+            # initial_states (ssd_state_passing: "continuous batching"); one
+            # sequence of 256 tokens.
+            "seq_idx": torch.zeros((1, 256), dtype=torch.int32, device=device),
             "chunk_indices": None,
             "chunk_offsets": None,
         },
