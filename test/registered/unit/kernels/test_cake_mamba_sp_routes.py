@@ -586,8 +586,11 @@ def test_adapter_explicit_state_dtype_uses_a_prepared_runner_once_per_config():
         module.ssd_combined_fwd.assert_called_once()
         fn_kw = module.ssd_combined_fwd.call_args.kwargs
         assert fn_kw["cu_seqlens"] is inputs["cu_seqlens"]
-        assert fn_kw["chunk_size"] == 256 and fn_kw["out"] is inputs["out"]
+        assert fn_kw["out"] is inputs["out"]
         assert "state_dtype" not in fn_kw
+        # FlashInfer's functional entry has no chunk-size label (the kernels
+        # tile 128 tokens whatever the caller's chunk size).
+        assert "chunk_size" not in fn_kw
     finally:
         cake_mamba._cached_ssd_runner.cache_clear()
 
