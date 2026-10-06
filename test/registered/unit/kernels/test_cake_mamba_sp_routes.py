@@ -1204,6 +1204,45 @@ def test_route_names_exist_in_route_table():
     assert sp_mod.CAKE_ROUTE_SP_ALL_GATHER_MATMUL in ROUTES
 
 
+def test_registry_ssd_wrapper_forwards_cu_seqlens_and_chunk_size():
+    """The route calls the registry op ``sglang.kernels.ops.mamba.cake.
+    cake_ssd_combined_fwd``; it must carry the engine's ``cu_seqlens`` and
+    ``chunk_size`` through to the adapter unchanged (the sglang GPU test
+    first found the wrapper without them)."""
+    import inspect
+
+    from sglang.kernels.ops.mamba import cake as cake_ops
+
+    parameters = inspect.signature(cake_ops.cake_ssd_combined_fwd).parameters
+    assert "cu_seqlens" in parameters and parameters["cu_seqlens"].default is None
+    assert "chunk_size" in parameters and parameters["chunk_size"].default == 128
+    recorded = {}
+
+    def fake_kernel(*args, **kwargs):
+        recorded["args"], recorded["kwargs"] = args, kwargs
+        return kwargs["out"], None
+
+    inputs = _ssd_inputs()
+    with mock.patch.object(cake_ops, "get_kernel", lambda *_: fake_kernel):
+        cake_ops.cake_ssd_combined_fwd(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            cu_seqlens=inputs["cu_seqlens"],
+            chunk_size=256,
+            out=inputs["out"],
+            state_dtype=torch.float32,
+        )
+    assert recorded["kwargs"]["cu_seqlens"] is inputs["cu_seqlens"]
+    assert recorded["kwargs"]["chunk_size"] == 256
+    assert recorded["kwargs"]["seq_idx"] is None and recorded["kwargs"]["num_seqs"] is None
+    assert recorded["kwargs"]["state_dtype"] is torch.float32
+
+
 def test_route_modules_import_no_flashinfer():
     for name in (
         "sglang.srt.layers.attention.mamba.cake_routes",

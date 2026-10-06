@@ -148,11 +148,17 @@ def cake_ssd_combined_fwd(
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
     state_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_size: int = 128,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Explicit Cake entry point; gate on ``supports_ssd_combined``.
 
     ``state_dtype`` names the state dtype explicitly (prepared runner); without
     it FlashInfer infers it from ``initial_states`` / ``checkpoint_states``.
+    ``cu_seqlens`` is the engine's packed-varlen form (the kernels derive the
+    segment metadata; no ``seq_idx`` / chunk triple / ``num_seqs`` needed) and
+    ``chunk_size`` the caller's convention (any positive value; the kernels
+    tile 128 tokens).
     """
     return get_kernel("mamba.ssd_combined_fwd", KernelBackend.FLASHINFER)(
         x,
@@ -178,6 +184,8 @@ def cake_ssd_combined_fwd(
         out=out,
         return_final_states=return_final_states,
         state_dtype=state_dtype,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
     )
 
 
