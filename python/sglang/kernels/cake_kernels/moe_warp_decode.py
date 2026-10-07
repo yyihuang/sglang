@@ -10,7 +10,9 @@ backend config, ``api.py``), ``flashinfer.fused_moe.CakeWarpDecodeRunner``
 scale layout, no per-token scale; ``1 <= num_tokens <= 32``;
 ``RoutingInputMode.UnpackedPrecomputed`` only; ``do_finalize=True``,
 ``enable_pdl=True``, ``local_expert_offset=0``, ``local_num_experts=E``;
-calibrated (activation, H, I, E, top_k) tuples listed in ``GEOMETRIES``.
+calibrated (activation, H, I, E, top_k) tuples listed in ``GEOMETRIES``
+(FlashInfer ``d4b19b87dec8``, PR #6067, adds the sharded Qwen3.5-397B TP2 / TP4
+and MiniMax-M2 TP2 / TP4 slices: I = 512 / 256 and 768 / 384).
 
 Usage: build ``MoEConfig(..., backend=BackendOptions((cake_warp_decode_config(),)),
 execution=ExecutionConfig(enable_pdl=True))`` and hand it to
@@ -59,7 +61,11 @@ GEOMETRIES: Tuple[Tuple[str, int, int, int, int], ...] = (
     ("swiglu", 4096, 1536, 128, 8),
     ("swiglu", 2048, 512, 256, 8),
     ("swiglu", 4096, 1024, 512, 10),
+    ("swiglu", 4096, 512, 512, 10),
+    ("swiglu", 4096, 256, 512, 10),
     ("swiglu", 3072, 1536, 256, 8),
+    ("swiglu", 3072, 768, 256, 8),
+    ("swiglu", 3072, 384, 256, 8),
     ("swiglu_1.702_1.0_7.0", 6144, 3072, 128, 4),
     ("situ_4.0_25.0", 3584, 3072, 896, 16),
 )
