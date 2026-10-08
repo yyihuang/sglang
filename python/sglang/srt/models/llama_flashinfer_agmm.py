@@ -23,6 +23,8 @@ routed batch and never grows afterwards.
 
 from __future__ import annotations
 
+import os
+import time
 import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, MutableMapping, Optional
@@ -44,6 +46,111 @@ _EXPECTED_MODEL = {
     "num_key_value_heads": 8,
 }
 _FULL_ROWS = 4096
+
+# --- Harness-only diagnostics (not part of the route; inert unless AGMM_DIAG_MODE is set) ---
+# AGMM_DIAG_MODE=compare : run the fused all-gather matmul AND the unfused all_gather_into_tensor +
+#                          GEMM on the same input; accumulate per-layer difference statistics in
+#                          memory (no per-call file I/O) and write them once at exit to AGMM_DIAG_DIR.
+# AGMM_DIAG_MODE=unfused : return the unfused all-gather + GEMM result instead of the fused kernel's
+#                          (same sequence-parallel structure, no FlashInfer kernel on the QKV path).
+_DIAG_MODE = os.environ.get("AGMM_DIAG_MODE", "")
+_DIAG_STATS: dict = {}
+_DIAG_ORDER: dict = {}
+
+
+def _diag_unfused(inp, weight, group, tp_size):
+    import torch
+    import torch.distributed as dist
+
+    full = inp.new_empty((inp.shape[0] * tp_size, inp.shape[1]))
+    dist.all_gather_into_tensor(full, inp, group=group)
+    return full, torch.matmul(full, weight)
+
+
+def _diag_dump():
+    import json
+    import socket
+
+    directory = os.environ.get("AGMM_DIAG_DIR")
+    if not directory:
+        return
+    try:
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"{socket.gethostname()}-{os.getpid()}.json")
+        layers = {str(k): v for k, v in sorted(_DIAG_STATS.items())}
+        calls = sum(v["calls"] for v in _DIAG_STATS.values())
+        summary = {
+            "mode": _DIAG_MODE,
+            "layers": len(layers),
+            "calls": calls,
+            "max_abs_diff": max((v["max_abs_diff"] for v in _DIAG_STATS.values()), default=None),
+            "max_ulp": max((v["max_ulp"] for v in _DIAG_STATS.values()), default=None),
+            "elements": sum(v["elements"] for v in _DIAG_STATS.values()),
+            "nonzero_elements": sum(v["nonzero_elements"] for v in _DIAG_STATS.values()),
+            "ulp_hist": [sum(v["ulp_hist"][i] for v in _DIAG_STATS.values()) for i in range(6)],
+            "ulp_hist_bins": ["0", "(0,1]", "(1,2]", "(2,4]", "(4,8]", ">8"],
+        }
+        with open(path + ".tmp", "w") as handle:
+            json.dump({"summary": summary, "layers": layers}, handle)
+        os.replace(path + ".tmp", path)
+    except Exception:  # noqa: BLE001 - diagnostics must never take the server down
+        pass
+
+
+def _diag_qkv(route, key, inp, weight, qkv, group, binding):
+    import torch
+
+    tp_size = route._topology.tp_size
+    full, unfused = _diag_unfused(inp, weight, group, tp_size)
+    if _DIAG_MODE == "unfused":
+        return unfused
+    fused = binding.launcher(inp)
+    if key not in _DIAG_ORDER:
+        _DIAG_ORDER[key] = len(_DIAG_ORDER)
+        if len(_DIAG_ORDER) == 1:
+            import atexit
+            import threading
+
+            atexit.register(_diag_dump)
+
+            def _writer():
+                while True:
+                    time.sleep(2.0)
+                    _diag_dump()
+
+            threading.Thread(target=_writer, name="agmm-diag-writer", daemon=True).start()
+    layer = _DIAG_ORDER[key]
+    with torch.no_grad():
+        ref = unfused.float()
+        diff = (fused.float() - ref).abs()
+        scale = torch.maximum(ref.abs(), fused.float().abs()).clamp_min(2.0**-126)
+        ulp = torch.ldexp(torch.ones_like(ref), torch.floor(torch.log2(scale)) - 7)
+        ulps = diff / ulp
+        edges = torch.tensor([0.0, 1.0, 2.0, 4.0, 8.0], device=ulps.device)
+        hist = torch.bucketize(ulps.reshape(-1), edges, right=False)
+        counts = torch.bincount(hist, minlength=6)[:6]
+        native = torch.nn.functional.linear(full, qkv.weight).float()
+        diff_native = (fused.float() - native).abs()
+        values = torch.stack(
+            [diff.max(), ulps.max(), (diff > 0).sum().float(), diff_native.max(), (native - ref).abs().max()]
+        ).tolist()
+    stat = _DIAG_STATS.setdefault(
+        key,
+        {"layer": layer, "calls": 0, "elements": 0, "nonzero_elements": 0, "max_abs_diff": 0.0,
+         "max_ulp": 0.0, "ulp_hist": [0] * 6, "max_abs_diff_vs_native_linear": 0.0,
+         "max_abs_native_linear_vs_matmul": 0.0, "rows": int(fused.shape[0]), "cols": int(fused.shape[1])},
+    )
+    stat["calls"] += 1
+    stat["elements"] += int(fused.numel())
+    stat["nonzero_elements"] += int(values[2])
+    stat["max_abs_diff"] = max(stat["max_abs_diff"], values[0])
+    stat["max_ulp"] = max(stat["max_ulp"], values[1])
+    stat["max_abs_diff_vs_native_linear"] = max(stat["max_abs_diff_vs_native_linear"], values[3])
+    stat["max_abs_native_linear_vs_matmul"] = max(stat["max_abs_native_linear_vs_matmul"], values[4])
+    for i, c in enumerate(counts.tolist()):
+        stat["ulp_hist"][i] += int(c)
+    return fused
+
 _SYMM_MEM_BACKEND_ENV = "TORCH_SYMMMEM"
 _SYMM_MEM_BACKEND = "NVSHMEM"
 
@@ -481,6 +588,8 @@ class LlamaFlashInferAgmmTrueSP:
             self._bindings[key] = binding
         elif binding.weight is not weight or binding.group is not group:
             raise RuntimeError("FlashInfer AGMM prepared binding changed")
+        if _DIAG_MODE:
+            return _diag_qkv(self, key, inp, weight, qkv, group, binding)
         return binding.launcher(inp)
 
     def _all_gather_rows(self, coordinator: Any, local: Any):
