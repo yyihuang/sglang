@@ -237,8 +237,19 @@ def _model_contract_reason(
     return None
 
 
+_DIAG_NO_MAX_ROWS = [False]
+
+
 def _validate_prepare_signature(prepare: Callable[..., Any]) -> None:
     parameters = inspect.signature(prepare).parameters
+    # DIAGNOSTIC ONLY (not for the PR): accept the pre-#6054 FlashInfer signature
+    # without ``max_rows`` so the current route can be measured against the
+    # FlashInfer revisions the description's parity results were taken with.
+    if tuple(parameters) == ("inp", "w", "group", "backend", "verbose"):
+        _DIAG_NO_MAX_ROWS[0] = True
+        if parameters["backend"].kind is not inspect.Parameter.KEYWORD_ONLY:
+            raise RuntimeError("FlashInfer prepared AGMM backend must be keyword-only")
+        return
     if tuple(parameters) != ("inp", "w", "group", "backend", "max_rows", "verbose"):
         raise RuntimeError("FlashInfer prepared AGMM API has an incompatible signature")
     if parameters["backend"].kind is not inspect.Parameter.KEYWORD_ONLY:
@@ -467,13 +478,14 @@ class LlamaFlashInferAgmmTrueSP:
         key = id(weight)
         binding = self._bindings.get(key)
         if binding is None:
+            prepare_kwargs = {"backend": "auto", "verbose": False}
+            if not _DIAG_NO_MAX_ROWS[0]:
+                prepare_kwargs["max_rows"] = max_rows
             launcher = self._prepare_all_gather_matmul(
                 inp,
                 weight,
                 group,
-                backend="auto",
-                max_rows=max_rows,
-                verbose=False,
+                **prepare_kwargs,
             )
             if not callable(launcher):
                 raise RuntimeError("FlashInfer AGMM preparation returned no launcher")
