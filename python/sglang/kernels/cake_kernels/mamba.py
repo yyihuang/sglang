@@ -1,8 +1,13 @@
 """Cake Mamba2 SSD combined prefill and selective state update via FlashInfer.
 
-FlashInfer entries (contract at FlashInfer ``9eb882ad346d``, the merge
-commit of PR #6100 -- CAKE-956 round 2 of the exact-scan family of PR #6051
-(``2a57c19bace5``) on the ``46340689a5ab`` contract: one exact-scan kernel family with FP16 delta, FP32 cumsum, any positive ``seqlen`` per call (a call
+FlashInfer entries (contract at FlashInfer ``d217e8915e32``, the merge
+commit of PR #6206 -- round 3 of the exact-scan family of PR #6051
+(``2a57c19bace5``) and PR #6100 (``9eb882ad346d``) on the ``46340689a5ab``
+contract: one exact-scan kernel family with FP16 delta, FP32 cumsum, plus a
+chunk-parallel program family that the FlashInfer host selects for long
+sequences with few (segment, head) work items (same numerics as the exact
+scan; ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` forces or disables it), any
+positive ``seqlen`` per call (a call
 shorter than one 128-token chunk is zero-padded to one chunk by the FlashInfer
 host, which stages its output; CAKE-1063), BF16 / FP16 / FP32 state,
 token-major ``out``, varlen without ``initial_states``):
