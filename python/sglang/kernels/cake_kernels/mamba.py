@@ -1,13 +1,19 @@
 """Cake Mamba2 SSD combined prefill and selective state update via FlashInfer.
 
-FlashInfer entries (contract at FlashInfer ``817555dd1f92``, the merge
-commit of PR #6291 -- round 4 of the exact-scan family of PR #6051
-(``2a57c19bace5``), PR #6100 (``9eb882ad346d``) and PR #6206
-(``d217e8915e32``) on the ``46340689a5ab`` contract: one exact-scan kernel
-family with FP16 delta, FP32 cumsum, plus a chunk-parallel program family
-that the FlashInfer host selects for long sequences with few (segment, head)
-work items (same numerics as the exact scan; the round-4 re-fitted selection
-constants also route 32-item x 16-chunk calls there;
+FlashInfer entries (contract at FlashInfer ``36fd76859292``, the merge
+commit of PR #6330 -- round 5 of the exact-scan family of PR #6051
+(``2a57c19bace5``), PR #6100 (``9eb882ad346d``), PR #6206 (``d217e8915e32``)
+and PR #6291 (``817555dd1f92``) on the ``46340689a5ab`` contract: one
+exact-scan kernel family with FP16 delta, FP32 cumsum, whose epilogue now
+stores each output stage as per-warp TMA slabs through a four-slab ring
+(bitwise identical to the round-4 programs), plus a ``_noring`` twin of the
+round-4 schedule that the FlashInfer host selects for the measured losing
+windows (packed varlen with z at an average of 64 tokens per sequence --
+strictly between 63 and 65 -- and at least 256 (BF16 / FP16 state) or 512
+(FP32 state) sequence-head items; batch-2 calls without z of 26-89 tokens),
+plus a chunk-parallel program family that the FlashInfer host selects for
+long sequences with few (segment, head) work items (same numerics as the
+exact scan; selection constants re-fitted in round 5;
 ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` forces or disables it), any positive
 ``seqlen`` per call (a call shorter than one 128-token chunk is read through
 the TMA out-of-bounds token box and written to the caller's ``out`` directly;
