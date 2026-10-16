@@ -51,6 +51,7 @@ must happen eagerly before any CUDA-graph capture. Skips with the reason when
 FlashInfer lacks the module or the GPU is outside sm_100a / sm_103a.
 """
 
+import importlib
 import math
 import sys
 
@@ -751,16 +752,24 @@ def _assert_within_fixed_tolerance(name, actual, reference, comparison=None):
     ids=["96+160", "1000", "64+60", "300+700", "128+896", "2048x2"],
 )
 def test_route_call_cu_seqlens_at_engine_chunk_size_matches_triple_and_stock(
-    lengths, initial, state_dtype
+    monkeypatch, lengths, initial, state_dtype
 ):
     """The route's call (CAKE-934 item 2 option B): ``cu_seqlens`` + the
     engine's chunk size (256), no ``seq_idx`` / chunk-128 triple / ``num_seqs``.
-    Admitted by the adapter at chunk 256 (the triple is not); bitwise equal
-    to the chunk-128 triple call of the same inputs (the preprocess derives
-    the same segment tables); within the fixed BF16 tolerance of the fp64
-    recurrence, with stock Triton(256) -- the engine's own kernel -- held to
-    the same tolerance on the same inputs, for a BF16 and an FP32 state pool,
-    with and without a prefix state."""
+    Admitted by the adapter at chunk 256 (the triple is not).  Bitwise equal
+    to the chunk-128 triple call of the same inputs where both forms run the
+    same program: since FlashInfer round 6 the host routes the ``cu_seqlens``
+    form of a call inside the fused shape window to the fused single-launch
+    program and the derived chunk-128 triple of one-chunk work items to the
+    retained round-5 two-kernel program, which differ in the last rounding of
+    the state update.  So (1) the two production routes are compared at the
+    state-dtype tolerance as a sanity check, (2) each form is held to the
+    fixed BF16 tolerance of the fp64 recurrence, with stock Triton(256) -- the
+    engine's own kernel -- held to the same tolerance on the same inputs, and
+    (3) with both forms pinned to the two-kernel family (fused window closed
+    on fresh runners, as FlashInfer's own tests pin a family) the bitwise
+    clause is asserted; for a BF16 and an FP32 state pool, with and without a
+    prefix state."""
     _skip_unless_supported()
     device = torch.device("cuda")
     case = _case(
@@ -826,17 +835,57 @@ def test_route_call_cu_seqlens_at_engine_chunk_size_matches_triple_and_stock(
         HEADDIM,
         DSTATE,
     )
-    assert torch.equal(out_cu, out_tr), "cu_seqlens form differs from the chunk-128 triple"
-    assert torch.equal(final_cu, final_tr)
+    # (1) The production routes of the two forms, at the state-dtype tolerance
+    # (FlashInfer's own cross-form reading): the fused program and the
+    # retained two-kernel program differ only in the last rounding.
+    for name, cu_t, tr_t in (("out", out_cu, out_tr), ("final_states", final_cu, final_tr)):
+        tolerance = {torch.float32: 1e-5}.get(cu_t.dtype, 1e-2)
+        assert torch.allclose(cu_t.float(), tr_t.float(), atol=tolerance, rtol=tolerance), (
+            f"{name}: cu_seqlens form vs chunk-128 triple beyond {tolerance}"
+        )
     stock_out, stock_final = _stock_triton_reference(
         case, cu, chunk_size=ENGINE_CHUNK, state_dtype=state_dtype
     )
     torch.cuda.synchronize()
     reference = _fp64_reference(case)
+    # (2) Each form on its own against the fp64 recurrence (fixed tolerance).
     _assert_within_fixed_tolerance("out", out_cu, reference[0], stock_out)
     _assert_within_fixed_tolerance(
         "final_states", final_cu, reference[1], stock_final.to(state_dtype)
     )
+    _assert_within_fixed_tolerance("out (triple)", out_tr, reference[0])
+    _assert_within_fixed_tolerance("final_states (triple)", final_tr, reference[1])
+    # (3) Same-program bitwise clause: close the fused shape window, so both
+    # forms take the two-kernel family from the same host quantities (packed
+    # token count, sequence count).  Fresh runners: a runner caches the
+    # program it chose for a call shape.
+    fi_loader = importlib.import_module(cake_mamba.FI_SSD_MODULE)
+    monkeypatch.setattr(fi_loader, "fused_selected", lambda **_: False)
+    run_common = {key: value for key, value in common.items() if key != "state_dtype"}
+    pinned_cu = cake_ssd_combined(**case["ctor"])
+    pinned_tr = cake_ssd_combined(**case["ctor"])
+    out_cu_p, final_cu_p = pinned_cu.run(
+        x, dt, A, B, C, cu_seqlens=cu, out=torch.empty_like(case["out"]), **run_common, **scan
+    )
+    out_tr_p, final_tr_p = pinned_tr.run(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        seq_idx=run["seq_idx"],
+        chunk_indices=run["chunk_indices"],
+        chunk_offsets=run["chunk_offsets"],
+        num_seqs=run["num_seqs"],
+        out=torch.empty_like(case["out"]),
+        **run_common,
+        **scan,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out_cu_p, out_tr_p), (
+        "pinned two-kernel family: cu_seqlens form differs from the chunk-128 triple"
+    )
+    assert torch.equal(final_cu_p, final_tr_p)
 
 
 def test_route_call_cu_seqlens_engine_chunk_size_checkpoint_unaligned_start():

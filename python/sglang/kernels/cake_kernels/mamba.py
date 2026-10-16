@@ -1,26 +1,36 @@
 """Cake Mamba2 SSD combined prefill and selective state update via FlashInfer.
 
-FlashInfer entries (contract at FlashInfer ``36fd76859292``, the merge
-commit of PR #6330 -- round 5 of the exact-scan family of PR #6051
-(``2a57c19bace5``), PR #6100 (``9eb882ad346d``), PR #6206 (``d217e8915e32``)
-and PR #6291 (``817555dd1f92``) on the ``46340689a5ab`` contract: one
-exact-scan kernel family with FP16 delta, FP32 cumsum, whose epilogue now
-stores each output stage as per-warp TMA slabs through a four-slab ring
-(bitwise identical to the round-4 programs), plus a ``_noring`` twin of the
-round-4 schedule that the FlashInfer host selects for the measured losing
-windows (packed varlen with z at an average of 64 tokens per sequence --
-strictly between 63 and 65 -- and at least 256 (BF16 / FP16 state) or 512
-(FP32 state) sequence-head items; batch-2 calls without z of 26-89 tokens),
-plus a chunk-parallel program family that the FlashInfer host selects for
-long sequences with few (segment, head) work items (same numerics as the
-exact scan; selection constants re-fitted in round 5;
-``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` forces or disables it), any positive
+FlashInfer entries (contract at FlashInfer ``5c5c44c314a6``, the merge
+commit of PR #6582 -- round 6 of the exact-scan family of PR #6051
+(``2a57c19bace5``), PR #6100 (``9eb882ad346d``), PR #6206 (``d217e8915e32``),
+PR #6291 (``817555dd1f92``) and PR #6330 (``36fd76859292``) on the
+``46340689a5ab`` contract: three exact-scan program forms that the FlashInfer
+host selects per call -- a fused single-launch form that derives the chunk
+metadata inside the main kernel (batched calls, the ``cu_seqlens`` form and
+the ``seq_idx`` triple with a caller-supplied ``seq_chunk_cumsum``, inside
+the fused shape window), the round-6 two-launch form (standalone metadata
+preprocess, then the main kernel) for calls with two or more 128-token
+chunks per work item, and the round-5 two-launch programs, retained byte
+for byte, for one-chunk work items; the round-6 programs read a per-chunk
+prescaled decay factor table and update the state with one fused
+multiply-add rounding (same algorithm, validated against an FP64 oracle;
+not bitwise identical to the round-5 programs, and the two packed-varlen
+metadata forms are bitwise equal only where they run the same program);
+the batched programs issue the first operand TMA loads before the metadata
+stage; the ``_noring`` twin stays selected for the measured BF16 / FP16
+losing windows (packed varlen with z at an average of 64 tokens per
+sequence -- strictly between 63 and 65 -- and at least 256 sequence-head
+items; batch-2 calls without z of 26-89 tokens) and is no longer selected
+for FP32 state on the varlen path (the batched window does not depend on
+the state dtype); the chunk-parallel family is now a single-pass program with
+decoupled look-back (the round-5 three-phase program is retained;
+``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` forces or disables the family) for
+long sequences with few (segment, head) work items; any positive
 ``seqlen`` per call (a call shorter than one 128-token chunk is read through
-the TMA out-of-bounds token box and written to the caller's ``out`` directly;
-the FlashInfer host no longer zero-pads it or stages its output), an
-additive graph-capturable prepared submission (``CakeSSDCombined.prepare`` /
-replay; not used by this adapter), BF16 / FP16 / FP32 state, token-major
-``out``, varlen without ``initial_states``):
+the TMA out-of-bounds token box and written to the caller's ``out``
+directly), an additive graph-capturable prepared submission
+(``CakeSSDCombined.prepare`` / replay; not used by this adapter), BF16 /
+FP16 / FP32 state, token-major ``out``, varlen without ``initial_states``):
 
 * ``flashinfer.mamba.SSDCombined(..., backend="cake")`` (inventory E1-31) ->
   ``flashinfer.mamba.cake_ssd_combined.CakeSSDCombined`` (E1-33), and the
