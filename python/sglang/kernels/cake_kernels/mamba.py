@@ -1,36 +1,52 @@
 """Cake Mamba2 SSD combined prefill and selective state update via FlashInfer.
 
-FlashInfer entries (contract at FlashInfer ``5c5c44c314a6``, the merge
-commit of PR #6582 -- round 6 of the exact-scan family of PR #6051
+FlashInfer entries (contract at FlashInfer ``f41bfa18fcee``, the merge
+commit of PR #6746 -- round 8 of the exact-scan family of PR #6051
 (``2a57c19bace5``), PR #6100 (``9eb882ad346d``), PR #6206 (``d217e8915e32``),
-PR #6291 (``817555dd1f92``) and PR #6330 (``36fd76859292``) on the
-``46340689a5ab`` contract: three exact-scan program forms that the FlashInfer
-host selects per call -- a fused single-launch form that derives the chunk
-metadata inside the main kernel (batched calls, the ``cu_seqlens`` form and
-the ``seq_idx`` triple with a caller-supplied ``seq_chunk_cumsum``, inside
-the fused shape window), the round-6 two-launch form (standalone metadata
-preprocess, then the main kernel) for calls with two or more 128-token
-chunks per work item, and the round-5 two-launch programs, retained byte
-for byte, for one-chunk work items; the round-6 programs read a per-chunk
-prescaled decay factor table and update the state with one fused
+PR #6291 (``817555dd1f92``), PR #6330 (``36fd76859292``), PR #6582
+(``5c5c44c314a6``) and PR #6715 (``2a2fa514203f``) on the ``46340689a5ab``
+contract: the exact-scan program forms that the FlashInfer host selects per
+call -- a fused single-launch form that derives the chunk metadata inside
+the main kernel (batched calls, the ``cu_seqlens`` form and the ``seq_idx``
+triple with a caller-supplied ``seq_chunk_cumsum``, inside the fused shape
+window); since round 7 the ``seq_idx`` triple without a caller cumsum
+inside that window is routed by compute capability: on sm_100a a light
+packed-varlen metadata kernel publishes the sequence table ahead of the
+same fused main kernel (two launches), on sm_103a the fused main kernel
+derives a private table in its CTA prologue (one launch) unless the table
+must be published into the caller's buffer, which keeps the two-launch form
+there; the round-6 two-launch form (standalone metadata preprocess, then
+the main kernel) for calls with two or more 128-token chunks per work item,
+which since round 7 runs as 2-CTA pair programs (bitwise the same outputs)
+when a call of at least 16 chunks per item has more (sequence, head) items
+than SMs, its balanced persistent grid leaves a tail wave and the pair plan
+has the shorter makespan; and the round-5 two-launch programs, retained
+byte for byte, for one-chunk work items; the round-6 programs read a
+per-chunk prescaled decay factor table and update the state with one fused
 multiply-add rounding (same algorithm, validated against an FP64 oracle;
 not bitwise identical to the round-5 programs, and the two packed-varlen
 metadata forms are bitwise equal only where they run the same program);
 the batched programs issue the first operand TMA loads before the metadata
-stage; the ``_noring`` twin stays selected for the measured BF16 / FP16
-losing windows (packed varlen with z at an average of 64 tokens per
-sequence -- strictly between 63 and 65 -- and at least 256 sequence-head
-items; batch-2 calls without z of 26-89 tokens) and is no longer selected
-for FP32 state on the varlen path (the batched window does not depend on
-the state dtype); the chunk-parallel family is now a single-pass program with
-decoupled look-back (the round-5 three-phase program is retained;
+stage; the round-7 device programs release the auxiliary ring's empty
+barrier per reader (racecheck-clean; no routing or numerics change); the
+``_noring`` twin stays selected for the measured BF16 / FP16 losing windows
+(packed varlen with z at an average of 64 tokens per sequence -- strictly
+between 63 and 65 -- and at least 256 sequence-head items; batch-2 calls
+without z of 26-89 tokens) and is no longer selected for FP32 state on the
+varlen path (the batched window does not depend on the state dtype); the
+chunk-parallel family is a single-pass program with decoupled look-back
+(the round-5 three-phase program is retained;
 ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` forces or disables the family) for
-long sequences with few (segment, head) work items; any positive
-``seqlen`` per call (a call shorter than one 128-token chunk is read through
-the TMA out-of-bounds token box and written to the caller's ``out``
-directly), an additive graph-capturable prepared submission
-(``CakeSSDCombined.prepare`` / replay; not used by this adapter), BF16 /
-FP16 / FP32 state, token-major ``out``, varlen without ``initial_states``):
+long sequences with few (segment, head) work items; round 8 adds sm_107a
+(Rubin) programs to the FlashInfer loader -- the triple form routed as on
+sm_103a, Rubin-calibrated chunk-parallel cost constants and a Rubin
+three-phase rule -- which this adapter does not admit (``ARCHS`` stays
+sm_100a / sm_103a); any positive ``seqlen`` per call (a call shorter than
+one 128-token chunk is read through the TMA out-of-bounds token box and
+written to the caller's ``out`` directly), an additive graph-capturable
+prepared submission (``CakeSSDCombined.prepare`` / replay; not used by
+this adapter), BF16 / FP16 / FP32 state, token-major ``out``, varlen
+without ``initial_states``):
 
 * ``flashinfer.mamba.SSDCombined(..., backend="cake")`` (inventory E1-31) ->
   ``flashinfer.mamba.cake_ssd_combined.CakeSSDCombined`` (E1-33), and the
@@ -116,7 +132,8 @@ FP16 / FP32 state, token-major ``out``, varlen without ``initial_states``):
     destination table ``[B, T]`` -> ``dynamic`` (device-side table; no host
     read, graph-capturable).
 
-Both families are built for sm_100a / sm_103a only.
+Both families are built for sm_100a / sm_103a; since round 8 FlashInfer also
+builds the SSD family for sm_107a (Rubin), outside this adapter's ``ARCHS``.
 
 Admission rules absorbed from PR #35444: strict opt-in Cake SSD prefill
 (selecting Cake never falls back), compact checkpoints emitted in the main
@@ -128,7 +145,7 @@ caller-owned ``out`` for CUDA-graph stability; decode stays on
 Not supported here (keep the existing SGLang path): SSD ``headdim != 64`` /
 ``dstate != 128``, FP16 I/O, SSU stochastic rounding
 (``rand_seed``), ``state_scale``, varlen SSU (``cu_seqlens``),
-``retrieve_parent_token`` tree verify, sm_90a / sm_120a / sm_121a.
+``retrieve_parent_token`` tree verify, sm_90a / sm_107a / sm_120a / sm_121a.
 """
 
 from __future__ import annotations
