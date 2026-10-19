@@ -1,32 +1,33 @@
 """Cake Mamba2 SSD combined prefill and selective state update via FlashInfer.
 
-FlashInfer entries (contract at FlashInfer ``f41bfa18fcee``, the merge
-commit of PR #6746 -- round 8 of the exact-scan family of PR #6051
-(``2a57c19bace5``), PR #6100 (``9eb882ad346d``), PR #6206 (``d217e8915e32``),
-PR #6291 (``817555dd1f92``), PR #6330 (``36fd76859292``), PR #6582
-(``5c5c44c314a6``) and PR #6715 (``2a2fa514203f``) on the ``46340689a5ab``
-contract: the exact-scan program forms that the FlashInfer host selects per
-call -- a fused single-launch form that derives the chunk metadata inside
-the main kernel (batched calls, the ``cu_seqlens`` form and the ``seq_idx``
-triple with a caller-supplied ``seq_chunk_cumsum``, inside the fused shape
-window); since round 7 the ``seq_idx`` triple without a caller cumsum
-inside that window is routed by compute capability: on sm_100a a light
-packed-varlen metadata kernel publishes the sequence table ahead of the
-same fused main kernel (two launches), on sm_103a the fused main kernel
-derives a private table in its CTA prologue (one launch) unless the table
-must be published into the caller's buffer, which keeps the two-launch form
-there; the round-6 two-launch form (standalone metadata preprocess, then
-the main kernel) for calls with two or more 128-token chunks per work item,
-which since round 7 runs as 2-CTA pair programs (bitwise the same outputs)
-when a call of at least 16 chunks per item has more (sequence, head) items
-than SMs, its balanced persistent grid leaves a tail wave and the pair plan
-has the shorter makespan; and the round-5 two-launch programs, retained
-byte for byte, for one-chunk work items; the round-6 programs read a
-per-chunk prescaled decay factor table and update the state with one fused
-multiply-add rounding (same algorithm, validated against an FP64 oracle;
-not bitwise identical to the round-5 programs, and the two packed-varlen
-metadata forms are bitwise equal only where they run the same program);
-the batched programs issue the first operand TMA loads before the metadata
+FlashInfer entries (contract at FlashInfer ``816db6625da0``, the merge
+commit of PR #6775 -- round 9 of the exact-scan family of PR #6051
+(``2a57c19bace5``), PR #6100 (``9eb882ad346d``), PR #6206
+(``d217e8915e32``), PR #6291 (``817555dd1f92``), PR #6330
+(``36fd76859292``), PR #6582 (``5c5c44c314a6``), PR #6715 (``2a2fa514203f``)
+and PR #6746 (``f41bfa18fcee``) on the ``46340689a5ab`` contract: the
+exact-scan program forms that the FlashInfer host selects per call -- a
+fused single-launch form that derives the chunk metadata inside the main
+kernel (batched calls, the ``cu_seqlens`` form and the ``seq_idx`` triple
+with a caller-supplied ``seq_chunk_cumsum``, inside the fused shape window);
+since round 7 the ``seq_idx`` triple without a caller cumsum inside that
+window is routed by compute capability: on sm_100a a light packed-varlen
+metadata kernel publishes the sequence table ahead of the same fused main
+kernel (two launches), on sm_103a the fused main kernel derives a private
+table in its CTA prologue (one launch) unless the table must be published
+into the caller's buffer, which keeps the two-launch form there; the round-6
+two-launch form (standalone metadata preprocess, then the main kernel) for
+calls with two or more 128-token chunks per work item, which since round 7
+runs as 2-CTA pair programs (bitwise the same outputs) when a call of at
+least 16 chunks per item has more (sequence, head) items than SMs, its
+balanced persistent grid leaves a tail wave and the pair plan has the
+shorter makespan; and the round-5 two-launch programs, retained byte for
+byte, for one-chunk work items; the round-6 programs read a per-chunk
+prescaled decay factor table and update the state with one fused
+multiply-add rounding (same algorithm, validated against an FP64 oracle; not
+bitwise identical to the round-5 programs, and the two packed-varlen
+metadata forms are bitwise equal only where they run the same program); the
+batched programs issue the first operand TMA loads before the metadata
 stage; the round-7 device programs release the auxiliary ring's empty
 barrier per reader (racecheck-clean; no routing or numerics change); the
 ``_noring`` twin stays selected for the measured BF16 / FP16 losing windows
@@ -34,19 +35,31 @@ barrier per reader (racecheck-clean; no routing or numerics change); the
 between 63 and 65 -- and at least 256 sequence-head items; batch-2 calls
 without z of 26-89 tokens) and is no longer selected for FP32 state on the
 varlen path (the batched window does not depend on the state dtype); the
-chunk-parallel family is a single-pass program with decoupled look-back
-(the round-5 three-phase program is retained;
+chunk-parallel family is a single-pass program with decoupled look-back (the
+round-5 three-phase program is retained;
 ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` forces or disables the family) for
 long sequences with few (segment, head) work items; round 8 adds sm_107a
 (Rubin) programs to the FlashInfer loader -- the triple form routed as on
 sm_103a, Rubin-calibrated chunk-parallel cost constants and a Rubin
-three-phase rule -- which this adapter does not admit (``ARCHS`` stays
-sm_100a / sm_103a); any positive ``seqlen`` per call (a call shorter than
-one 128-token chunk is read through the TMA out-of-bounds token box and
-written to the caller's ``out`` directly), an additive graph-capturable
-prepared submission (``CakeSSDCombined.prepare`` / replay; not used by
-this adapter), BF16 / FP16 / FP32 state, token-major ``out``, varlen
-without ``initial_states``):
+three-phase rule -- and round 9 (PR #6775) changes only that target: its 13
+varlen exact-scan programs are re-exported with the input stage passing each
+chunk's segment bounds to the consumer roles (no reload of the chunk table),
+a two-kernel call whose balanced persistent grid is already the full device
+takes the pair programs under a Rubin-measured rule (chunk floor 16 batched
+/ 8 varlen; the pair makespan grown by the pair render's penalty, plus the
+split item's hand-off step, must stay below the persistent program's item
+waves -- Blackwell never routes a full grid to the pair), and the
+chunk-parallel workspace cap is 512 MiB there (256 MiB on Blackwell); this
+adapter admits none of it (``ARCHS`` stays sm_100a / sm_103a); between those
+two rounds PR #6739 (``2c8f0e38f763``) dropped the ``_noring`` programs no
+route selects (the two-kernel family's twins and the FP32 varlen ones) and
+renders the two-kernel programs' launcher from the fused host template (the
+same two launches; no kernel of a kept program changed); any positive
+``seqlen`` per call (a call shorter than one 128-token chunk is read through
+the TMA out-of-bounds token box and written to the caller's ``out``
+directly), an additive graph-capturable prepared submission
+(``CakeSSDCombined.prepare`` / replay; not used by this adapter), BF16 /
+FP16 / FP32 state, token-major ``out``, varlen without ``initial_states``):
 
 * ``flashinfer.mamba.SSDCombined(..., backend="cake")`` (inventory E1-31) ->
   ``flashinfer.mamba.cake_ssd_combined.CakeSSDCombined`` (E1-33), and the
