@@ -1,11 +1,12 @@
 """Cake Mamba2 SSD combined prefill and selective state update via FlashInfer.
 
-FlashInfer entries (contract at FlashInfer ``816db6625da0``, the merge
-commit of PR #6775 -- round 9 of the exact-scan family of PR #6051
+FlashInfer entries (contract at FlashInfer ``dba1c88900d8``, the merge
+commit of PR #6808 -- round 10 of the exact-scan family of PR #6051
 (``2a57c19bace5``), PR #6100 (``9eb882ad346d``), PR #6206
 (``d217e8915e32``), PR #6291 (``817555dd1f92``), PR #6330
-(``36fd76859292``), PR #6582 (``5c5c44c314a6``), PR #6715 (``2a2fa514203f``)
-and PR #6746 (``f41bfa18fcee``) on the ``46340689a5ab`` contract: the
+(``36fd76859292``), PR #6582 (``5c5c44c314a6``), PR #6715
+(``2a2fa514203f``), PR #6746 (``f41bfa18fcee``) and PR #6775
+(``816db6625da0``) on the ``46340689a5ab`` contract: the
 exact-scan program forms that the FlashInfer host selects per call -- a
 fused single-launch form that derives the chunk metadata inside the main
 kernel (batched calls, the ``cu_seqlens`` form and the ``seq_idx`` triple
@@ -54,7 +55,25 @@ adapter admits none of it (``ARCHS`` stays sm_100a / sm_103a); between those
 two rounds PR #6739 (``2c8f0e38f763``) dropped the ``_noring`` programs no
 route selects (the two-kernel family's twins and the FP32 varlen ones) and
 renders the two-kernel programs' launcher from the fused host template (the
-same two launches; no kernel of a kept program changed); any positive
+same two launches; no kernel of a kept program changed); round 10 (PR
+#6808) regenerates 80 of the family's 93 device sources (the 40 shared by
+sm_100a / sm_103a and the 40 sm_107a ones) -- on Blackwell every program
+this adapter can reach except the round-5 one-chunk programs and the two
+metadata preprocess kernels: the fused one-launch forms and their
+``_noring`` twins, the sm_103a one-launch triple form, the round-6
+two-launch main kernels and their tail-wave pair programs, and both
+chunk-parallel programs -- with ``tcgen05.fence::before_thread_sync`` /
+``::after_thread_sync`` around every thread synchronization that an
+asynchronous tcgen05 operation reaches (the ordering the PTX ISA memory
+model requires for tcgen05); apart from the fences the exact-scan sources
+only swap the order of two guards in the B / C refill path and drop two
+bare scope blocks, and the chunk-parallel sources are otherwise unchanged;
+the regenerated sources carry new content hashes, so the loader's
+module-name tables are renamed with them, while the 13 retained sources,
+the host bindings, the routing rules, the fused window, the pair rule, the
+workspace caps and the loader's host logic are unchanged (the PR measured
+the fence cost on Blackwell within about 2% per shape, geomean 0.999x on
+B200 and 0.998x on GB300); any positive
 ``seqlen`` per call (a call shorter than one 128-token chunk is read through
 the TMA out-of-bounds token box and written to the caller's ``out``
 directly), an additive graph-capturable prepared submission
